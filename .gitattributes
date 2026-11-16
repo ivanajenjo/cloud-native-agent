@@ -1,0 +1,4 @@
+# Force LF everywhere: shell scripts copied into Linux images break with CRLF
+# (e.g. a Windows checkout with core.autocrlf=true).
+* text=auto eol=lf
+*.sh text eol=lf

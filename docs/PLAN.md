@@ -14,7 +14,7 @@ ejecutar tests y subir los cambios. Se controla por API REST, una web UI sencill
 | Git | Solo GitHub |
 | Stacks | Java, Node, Python, Go |
 | Interacción | Conversación multi-turno, web UI sencilla + CLI básico |
-| Despliegue | Local: Docker en Raspberry Pi 4 (8 GB, arm64), MacBook (Docker Desktop), y k8s local (k3s/kind) |
+| Despliegue | Local: Docker en Raspberry Pi 4 (8 GB, arm64), MacBook y PC con Windows (Docker Desktop; en Windows con WSL2), y k8s local (k3s/kind) |
 | Lenguaje | TypeScript |
 | Uso | Personal, mono-usuario |
 | Concurrencia | **1 sesión por réplica**; más sesiones = más réplicas |

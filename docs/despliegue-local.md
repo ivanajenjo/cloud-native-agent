@@ -1,12 +1,22 @@
 # Despliegue local con Docker Compose
 
-Cómo levantar una réplica (`agent` + `edge`) en una máquina con Docker (MacBook o
-Raspberry Pi 4) y cómo comprobar que la salida a internet pasa solo por `edge`.
+Cómo levantar una réplica (`agent` + `edge`) en una máquina con Docker (MacBook,
+PC con Windows o Raspberry Pi 4) y cómo comprobar que la salida a internet pasa solo por `edge`.
 
 ## Requisitos
 - Docker con BuildKit y el plugin `compose` (Docker Desktop o Docker Engine ≥ 24).
 - Para la Raspberry Pi: mejor construir la imagen en el MacBook y copiarla
   (ver "Construir en el Mac para la Raspberry" más abajo).
+
+### Windows
+- Docker Desktop con el backend **WSL2**. Las imágenes se construyen para amd64.
+- Clona el repo **dentro de WSL** (p. ej. `~/src` en Ubuntu, no en `/mnt/c/...`) y ejecuta
+  ahí `docker compose` y `scripts/verify-egress.sh` (es bash). Es mucho más rápido y evita
+  problemas de permisos.
+- `.gitattributes` fuerza finales de línea LF: un checkout con CRLF rompería
+  `docker/agent-entrypoint.sh` dentro de la imagen.
+- Para la Raspberry no lo uses como máquina de build: construir arm64 en un PC amd64 va por
+  emulación (QEMU) y es muy lento. Usa el Mac.
 
 ## Levantar la réplica
 
