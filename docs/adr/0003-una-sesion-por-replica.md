@@ -28,3 +28,7 @@ Docker (equivale a dar root al agente) o usando la API de Kubernetes (no funcion
 Una réplica pasa a estar formada por dos contenedores: `agent` (gateway + Pi + toolchains)
 y `edge` (proxy de entrada/salida). Sigue siendo una unidad de despliegue con una sesión
 como máximo.
+
+## Actualización (ADR-0006)
+El contenedor `agent` entero, gateway incluido, se considera no fiable. La autenticación,
+los secretos y las aprobaciones de red y de push/PR viven en `edge`.

@@ -29,7 +29,7 @@ entregado sea correcto. `AGENTS.md`, `docs/PLAN.md` y los ADR mandan sobre todo 
    - ficheros a crear o tocar, y los que no debe tocar;
    - contratos exactos: tipos, firmas, nombres, códigos HTTP, forma de los eventos;
    - qué leer antes: secciones concretas del plan o ADR y, si toca Pi, la ruta exacta en
-     `node_modules/@mariozechner/pi-coding-agent/docs/` o `examples/extensions/`;
+     `node_modules/@earendil-works/pi-coding-agent/docs/` o `examples/extensions/`;
    - las trampas de Pi y los invariantes de seguridad de `AGENTS.md` que apliquen a esa
      tarea, copiados literalmente, no por referencia;
    - tests que debe escribir, con los casos límite nombrados uno a uno;

@@ -16,7 +16,7 @@ es todo tu contexto: no has visto la conversación anterior.
 3. Usa los contratos del encargo (tipos, firmas, nombres) tal cual. Los tipos compartidos
    viven en `@cna/shared`: impórtalos, no los dupliques.
 4. Sobre Pi no supongas nada: lee su documentación instalada en
-   `node_modules/@mariozechner/pi-coding-agent/docs/` y los ejemplos de
+   `node_modules/@earendil-works/pi-coding-agent/docs/` y los ejemplos de
    `examples/extensions/`.
 5. Escribe los tests que pide el encargo. Nunca llames a un LLM real en un test.
 6. Ejecuta `npm run typecheck`, `npm run lint` y `npm test`, y arregla lo que falle en tu

@@ -39,3 +39,15 @@ eventos SSE, y un proxy `CONNECT` propio es pequeño y queda en el mismo stack.
   posible en teoría (la resolución la hace Docker).
 - En Kubernetes, `edge` irá en un Deployment aparte con NetworkPolicy (como sidecar
   compartiría la red del pod y podría esquivarse).
+
+## Actualización (ADR-0006)
+- El flujo `ask` ya no pasa por el gateway: `edge` crea la aprobación, la expone en su
+  propia API (`/approvals`, `/edge/events`) y la aplica. Desaparece el secreto compartido
+  edge ↔ gateway.
+- La política, *permitir siempre* y el registro de red se guardan en el volumen de `edge`,
+  no en `/data` (el agente podría editarlos).
+- El proxy atiende también peticiones HTTP sin `CONNECT`, aplica la política por host y
+  puerto, y deniega siempre los destinos que resuelvan a direcciones internas.
+- Los proveedores LLM, el buscador y GitHub (git y API) dejan de estar en la allowlist:
+  se llega a ellos por upstreams de `edge` que inyectan las credenciales. La inyección de
+  credenciales deja de ser trabajo futuro y no requiere interceptar TLS.

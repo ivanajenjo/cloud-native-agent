@@ -26,3 +26,8 @@ Lanzar `pi --mode rpc` como subproceso y hablar con él mediante un cliente RPC 
 - El cliente RPC incluido en Pi no se exporta desde el paquete ni gestiona los diálogos de
   extensiones, así que mantenemos el nuestro.
 - Pequeño coste de arranque del proceso por sesión (aceptable con 1 sesión por réplica).
+
+## Actualización (ADR-0005)
+Desde Pi 1.x el paquete sí exporta `RpcClient` y los tipos del protocolo, pero ese cliente
+no permite responder a `extension_ui_request`. Seguimos con cliente propio y reutilizamos
+los tipos exportados (`RpcCommand`, `RpcResponse`, `RpcExtensionUIRequest`…).

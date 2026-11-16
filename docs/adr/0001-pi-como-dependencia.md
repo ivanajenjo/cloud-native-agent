@@ -19,3 +19,6 @@ extensiones, prompt de sistema adicional y `models.json`. No hacemos fork.
 - (−) Dependemos de la estabilidad de la API de extensiones y del protocolo RPC: hay que
   fijar versión y tener tests de integración que detecten roturas al actualizar.
 - Si alguna necesidad no se puede cubrir con extensiones, se reevaluará (fork o PR upstream).
+
+## Actualización (ADR-0005)
+El paquete pasa a ser `@earendil-works/pi-coding-agent`, fijado en `1.5.2`.
