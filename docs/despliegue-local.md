@@ -5,8 +5,9 @@ PC con Windows o Raspberry Pi 4) y cómo comprobar que la salida a internet pasa
 
 ## Requisitos
 - Docker con BuildKit y el plugin `compose` (Docker Desktop o Docker Engine ≥ 24).
-- Para la Raspberry Pi: mejor construir la imagen en el MacBook y copiarla
-  (ver "Construir en el Mac para la Raspberry" más abajo).
+- Cada equipo construye su propia imagen con `--build` (amd64 o arm64 según la máquina).
+  En la Raspberry Pi el primer build tarda (instala los toolchains con mise); mejor con
+  `/var/lib/docker` en el SSD y no en la microSD.
 
 ### Windows
 - Docker Desktop con el backend **WSL2**. Las imágenes se construyen para amd64.
@@ -15,8 +16,6 @@ PC con Windows o Raspberry Pi 4) y cómo comprobar que la salida a internet pasa
   problemas de permisos.
 - `.gitattributes` fuerza finales de línea LF: un checkout con CRLF rompería
   `docker/agent-entrypoint.sh` dentro de la imagen.
-- Para la Raspberry no lo uses como máquina de build: construir arm64 en un PC amd64 va por
-  emulación (QEMU) y es muy lento. Usa el Mac.
 
 ## Levantar la réplica
 
@@ -79,15 +78,3 @@ docker compose -f deploy/compose/docker-compose.yml exec edge cat /edge-data/net
   puertos 80/443 y deniega los destinos internos. El modo `ask` llega en la fase 1.
 - No hay CI: la construcción de las imágenes y `scripts/verify-egress.sh` se comprueban
   en local, con un daemon de Docker.
-
-## Construir en el Mac para la Raspberry
-
-Un Mac con Apple Silicon ya construye `linux/arm64`. Sin registro de imágenes, se copian
-por SSH:
-
-```sh
-docker compose -f deploy/compose/docker-compose.yml build
-docker save cna-agent cna-edge | ssh pi 'docker load'
-```
-
-En la Pi, `docker compose ... up -d` usa las imágenes cargadas (no añadas `--build`).

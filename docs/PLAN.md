@@ -291,8 +291,9 @@ Detalle en ADR-0004.
 ### Consideraciones Raspberry Pi 4 (8 GB)
 - Limitar la JVM de los tests (`MAVEN_OPTS`/`GRADLE_OPTS` con `-Xmx`), Gradle daemon desactivado.
 - Usar SSD por USB para `/data` mejor que la microSD.
-- Builds de la imagen en el MacBook (Apple Silicon ya es arm64) y copia a la Pi con
-  `docker save | ssh … docker load`. No hay CI ni registro de imágenes.
+- Cada equipo construye su propia imagen (`docker compose up --build`); la Pi la construye
+  en arm64 nativo. No hay CI ni registro de imágenes. El primer build en la Pi es lento
+  (toolchains de mise) y conviene hacerlo con `/var/lib/docker` en el SSD.
 
 ## Estructura del repositorio
 
