@@ -1,4 +1,4 @@
-import type { NetworkMode, ProviderEndpoint } from "@cna/shared";
+import type { NetworkMode, ProviderEndpoint, ServiceEndpoint } from "@cna/shared";
 import { describe, expect, it, vi } from "vitest";
 import { parseAllowlistEntry } from "../src/egress/allowlist.js";
 import type { AskResult } from "../src/egress/ask.js";
@@ -27,6 +27,7 @@ function fixture(
     mode?: NetworkMode;
     allow?: string[];
     providers?: ProviderEndpoint[];
+    services?: ServiceEndpoint[];
     answer?: AskResult;
   } = {},
 ): Fixture {
@@ -50,6 +51,7 @@ function fixture(
     store,
     baseAllowlist: ["github.com", "*.npmjs.org"].map((text) => parseAllowlistEntry(text)),
     providers: options.providers ?? [],
+    services: options.services,
     ask: { ask },
     onPersistError,
   });
@@ -96,6 +98,46 @@ describe("createNetworkPolicy", () => {
       f.policy({ host: "ollama.lan", port: 11434, addresses: [PRIVATE] }),
     ).resolves.toEqual({ decision: "allow", reason: "provider" });
     expect(f.ask).not.toHaveBeenCalled();
+  });
+
+  it("allows a service endpoint on an internal address without asking, reason service", async () => {
+    const services: ServiceEndpoint[] = [{ service: "web_search", host: "searxng", port: 8080 }];
+    const f = fixture({ services });
+    await expect(
+      f.policy({ host: "searxng", port: 8080, addresses: ["172.18.0.5"] }),
+    ).resolves.toEqual({ decision: "allow", reason: "service" });
+    expect(f.ask).not.toHaveBeenCalled();
+  });
+
+  it("does not allow a service host on another port: it follows the normal policy", async () => {
+    const services: ServiceEndpoint[] = [{ service: "web_search", host: "searxng", port: 8080 }];
+    const f = fixture({ services });
+    await expect(
+      f.policy({ host: "searxng", port: 9090, addresses: ["172.18.0.5"] }),
+    ).resolves.toEqual({ decision: "deny", reason: "internal_destination" });
+    expect(f.ask).not.toHaveBeenCalled();
+  });
+
+  it("allows an external service endpoint on 443 in allowlist mode, reason service", async () => {
+    const services: ServiceEndpoint[] = [
+      { service: "notifications", host: "api.telegram.org", port: 443 },
+    ];
+    const f = fixture({ mode: "allowlist", services });
+    await expect(
+      f.policy({ host: "api.telegram.org", port: 443, addresses: [PUBLIC] }),
+    ).resolves.toEqual({ decision: "allow", reason: "service" });
+    expect(f.ask).not.toHaveBeenCalled();
+  });
+
+  it("gives the provider reason priority when host and port are both a provider and a service", async () => {
+    const providers: ProviderEndpoint[] = [{ provider: "ollama", host: PRIVATE_LAN, port: 11434 }];
+    const services: ServiceEndpoint[] = [
+      { service: "notifications", host: PRIVATE_LAN, port: 11434 },
+    ];
+    const f = fixture({ providers, services });
+    await expect(
+      f.policy({ host: PRIVATE_LAN, port: 11434, addresses: [PRIVATE_LAN] }),
+    ).resolves.toEqual({ decision: "allow", reason: "provider" });
   });
 
   it("allows a public allowlisted host without asking", async () => {

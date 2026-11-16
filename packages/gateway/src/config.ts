@@ -9,6 +9,10 @@ export interface GatewayConfig {
   dataDir: string;
   /** CNA_PROVIDERS_FILE, default "/config/providers.yaml". Absolute. */
   providersFile: string;
+  /** CNA_NOTIFICATIONS_FILE, default "/config/notifications.yaml". Absolute. */
+  notificationsFile: string;
+  /** CNA_WEB_FILE, default "/config/web.yaml". Absolute. */
+  webFile: string;
   /** CNA_EXTENSIONS_DIR, default: the folder of the @cna/extensions package. Absolute. */
   extensionsDir: string;
   /** CNA_GIT_USER_NAME. Empty or absent means undefined. */
@@ -25,6 +29,8 @@ export interface GatewayPaths {
   agentDir: string;
   /** <dataDir>/sessions */
   sessionDir: string;
+  /** <dataDir>/logs/tools.jsonl (tool execution log). */
+  toolLogFile: string;
   /** Extension files passed to Pi with -e, in order. */
   extensions: string[];
   /** Passed to Pi with --append-system-prompt. */
@@ -35,6 +41,8 @@ export interface GatewayPaths {
 
 const DEFAULT_DATA_DIR = "/data";
 const DEFAULT_PROVIDERS_FILE = "/config/providers.yaml";
+const DEFAULT_NOTIFICATIONS_FILE = "/config/notifications.yaml";
+const DEFAULT_WEB_FILE = "/config/web.yaml";
 /** Resolved from this module, so it is the same from src/ (tests) and from dist/ (production). */
 const DEFAULT_EXTENSIONS_DIR = fileURLToPath(new URL("../../extensions", import.meta.url));
 
@@ -50,6 +58,11 @@ export function loadGatewayConfig(env: Record<string, string | undefined>): Gate
       "CNA_PROVIDERS_FILE",
       env.CNA_PROVIDERS_FILE ?? DEFAULT_PROVIDERS_FILE,
     ),
+    notificationsFile: parseAbsolutePath(
+      "CNA_NOTIFICATIONS_FILE",
+      env.CNA_NOTIFICATIONS_FILE ?? DEFAULT_NOTIFICATIONS_FILE,
+    ),
+    webFile: parseAbsolutePath("CNA_WEB_FILE", env.CNA_WEB_FILE ?? DEFAULT_WEB_FILE),
     extensionsDir: parseAbsolutePath(
       "CNA_EXTENSIONS_DIR",
       env.CNA_EXTENSIONS_DIR ?? DEFAULT_EXTENSIONS_DIR,
@@ -68,7 +81,15 @@ export function gatewayPaths(config: GatewayConfig): GatewayPaths {
     workspaceDir: join(dataDir, "workspace", "repo"),
     agentDir: join(dataDir, "config", "pi"),
     sessionDir: join(dataDir, "sessions"),
-    extensions: [join(srcDir, "ask-user.ts"), join(srcDir, "git.ts")],
+    toolLogFile: join(dataDir, "logs", "tools.jsonl"),
+    extensions: [
+      join(srcDir, "ask-user.ts"),
+      join(srcDir, "git.ts"),
+      join(srcDir, "todo.ts"),
+      join(srcDir, "plan-mode.ts"),
+      join(srcDir, "guard.ts"),
+      join(srcDir, "web.ts"),
+    ],
     systemPromptFile: join(assetsDir, "system-prompt.md"),
     globalAgentsFile: join(assetsDir, "AGENTS.md"),
   };

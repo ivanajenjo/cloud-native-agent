@@ -1,6 +1,7 @@
 import { existsSync } from "node:fs";
-import { copyFile, mkdir } from "node:fs/promises";
+import { copyFile, mkdir, readFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
+import { parseWebConfig, resolveSecretRef } from "@cna/shared";
 import type { Hono } from "hono";
 import { createApp } from "./app.js";
 import {
@@ -11,6 +12,12 @@ import {
 } from "./config/models.js";
 import { type GatewayConfig, gatewayPaths } from "./config.js";
 import { EventLog } from "./events/event-log.js";
+import { createToolLog } from "./logs/tool-log.js";
+import {
+  createNotifier,
+  loadNotificationsConfig,
+  notificationSecrets,
+} from "./notifications/notifier.js";
 import { resolvePiCli } from "./pi/launch.js";
 import { createRedactor, secretsFromEnv } from "./redact.js";
 import { RpcBridge, type RpcBridgeHandlers } from "./rpc/bridge.js";
@@ -55,6 +62,8 @@ export async function createGatewayRuntime(options: GatewayWiringOptions): Promi
   }
 
   const providers = await loadProvidersConfig(config.providersFile);
+  const webSecrets = await loadWebSecrets(config.webFile, env);
+  const notifications = await loadNotificationsConfig(config.notificationsFile);
 
   await mkdir(paths.agentDir, { recursive: true, mode: 0o700 });
   await mkdir(paths.sessionDir, { recursive: true });
@@ -62,12 +71,19 @@ export async function createGatewayRuntime(options: GatewayWiringOptions): Promi
   await writeModelsJson(paths.agentDir, providers);
   await copyFile(paths.globalAgentsFile, join(paths.agentDir, "AGENTS.md"));
 
-  // The redactor sees every secret in env (API token included) and the keys of providers.yaml.
-  const redactor = createRedactor([...secretsFromEnv(env), ...providerSecrets(providers, env)]);
+  // The redactor sees every secret in env (API token included), the keys of providers.yaml and the
+  // tokens of notifications.yaml.
+  const redactor = createRedactor([
+    ...secretsFromEnv(env),
+    ...providerSecrets(providers, env),
+    ...webSecrets,
+    ...(notifications === undefined ? [] : notificationSecrets(notifications, env)),
+  ]);
   // Git and Pi get the environment without the API token.
   const childEnv = withoutApiToken(env);
   const events = new EventLog();
   const git = createGitRunner(childEnv);
+  const toolLog = createToolLog({ filePath: paths.toolLogFile, redactor });
 
   const manager = new SessionManager({
     events,
@@ -82,12 +98,23 @@ export async function createGatewayRuntime(options: GatewayWiringOptions): Promi
       sessionDir: paths.sessionDir,
       extensions: paths.extensions,
       systemPromptFile: paths.systemPromptFile,
+      webConfigFile: config.webFile,
       env: childEnv,
     },
+    toolLog,
     workspaceDir: paths.workspaceDir,
     defaultModel: providers.default,
     gitIdentity: { name: config.gitUserName, email: config.gitUserEmail },
     remoteBase: options.remoteBase,
+    ...(notifications === undefined
+      ? {}
+      : {
+          notifier: createNotifier({
+            config: notifications,
+            env,
+            logError: (message) => console.error(message),
+          }),
+        }),
   });
 
   const app = createApp({
@@ -99,8 +126,34 @@ export async function createGatewayRuntime(options: GatewayWiringOptions): Promi
 
   return {
     app,
-    close: () => manager.shutdown(),
+    close: async () => {
+      await manager.shutdown();
+      await toolLog.close();
+    },
   };
+}
+
+/**
+ * Secret values of web.yaml (the search API key), so they never reach logs or events. A missing
+ * file means no web search. Other read errors and invalid files propagate: the gateway must not
+ * start with a configuration it does not understand.
+ */
+async function loadWebSecrets(
+  file: string,
+  env: Record<string, string | undefined>,
+): Promise<string[]> {
+  let text: string;
+  try {
+    text = await readFile(file, "utf8");
+  } catch (error) {
+    if (error instanceof Error && (error as NodeJS.ErrnoException).code === "ENOENT") {
+      return [];
+    }
+    throw error;
+  }
+  const apiKey = parseWebConfig(text).search?.apiKey;
+  const value = apiKey === undefined ? undefined : resolveSecretRef(apiKey, env);
+  return value === undefined ? [] : [value];
 }
 
 function withoutApiToken(

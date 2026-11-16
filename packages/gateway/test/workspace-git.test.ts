@@ -266,6 +266,26 @@ describe("createGitRunner", () => {
   });
 });
 
+describe("GitRunner env option", () => {
+  it("passes the per-call env to the git process without changing the base env", async () => {
+    const repo = join(root, "env-repo");
+    await mkdir(repo);
+    await git(["init"], { cwd: repo });
+    await writeFile(join(repo, "tracked.txt"), "x\n");
+    await git(["add", "tracked.txt"], { cwd: repo });
+
+    // An empty alternative index: git ls-files must see it instead of the real one.
+    const altIndex = join(root, "alt-index");
+    await git(["read-tree", "--empty"], { cwd: repo, env: { GIT_INDEX_FILE: altIndex } });
+
+    const withEnv = await git(["ls-files"], { cwd: repo, env: { GIT_INDEX_FILE: altIndex } });
+    const withoutEnv = await git(["ls-files"], { cwd: repo });
+
+    expect(withEnv.stdout).toBe("");
+    expect(withoutEnv.stdout.trim()).toBe("tracked.txt");
+  });
+});
+
 describe("gitEnv", () => {
   it("always sets GIT_TERMINAL_PROMPT=0, overriding the caller", () => {
     expect(gitEnv({ GIT_TERMINAL_PROMPT: "1" }).GIT_TERMINAL_PROMPT).toBe("0");

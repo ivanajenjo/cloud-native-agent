@@ -128,6 +128,8 @@ function gatewayConfig(): GatewayConfig {
     port: 8090,
     dataDir: join(root, "data"),
     providersFile: join(root, "providers.yaml"),
+    notificationsFile: join(root, "notifications.yaml"),
+    webFile: join(root, "web.yaml"),
     extensionsDir: loadGatewayConfig({}).extensionsDir,
     gitUserName: "Agent",
     gitUserEmail: "agent@example.invalid",
@@ -142,6 +144,8 @@ function edgeConfig(askTimeoutMs: number): EdgeConfig {
     apiPort: 8080,
     proxyPort: 8128,
     providersFile: join(root, "no-providers.yaml"),
+    notificationsFile: join(root, "no-notifications.yaml"),
+    webFile: join(root, "no-web.yaml"),
     askTimeoutMs,
   };
 }

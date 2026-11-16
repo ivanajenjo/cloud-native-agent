@@ -10,6 +10,8 @@ describe("loadGatewayConfig", () => {
     expect(config.port).toBe(8090);
     expect(config.dataDir).toBe("/data");
     expect(config.providersFile).toBe("/config/providers.yaml");
+    expect(config.notificationsFile).toBe("/config/notifications.yaml");
+    expect(config.webFile).toBe("/config/web.yaml");
     expect(config.extensionsDir.endsWith("/packages/extensions")).toBe(true);
     expect(existsSync(join(config.extensionsDir, "src", "ask-user.ts"))).toBe(true);
   });
@@ -19,6 +21,8 @@ describe("loadGatewayConfig", () => {
       GATEWAY_PORT: "9000",
       CNA_DATA_DIR: "/srv/cna",
       CNA_PROVIDERS_FILE: "/etc/cna/providers.yaml",
+      CNA_NOTIFICATIONS_FILE: "/etc/cna/notifications.yaml",
+      CNA_WEB_FILE: "/etc/cna/web.yaml",
       CNA_EXTENSIONS_DIR: "/opt/cna/extensions",
       CNA_GIT_USER_NAME: "Agent",
       CNA_GIT_USER_EMAIL: "agent@example.invalid",
@@ -28,6 +32,8 @@ describe("loadGatewayConfig", () => {
       port: 9000,
       dataDir: "/srv/cna",
       providersFile: "/etc/cna/providers.yaml",
+      notificationsFile: "/etc/cna/notifications.yaml",
+      webFile: "/etc/cna/web.yaml",
       extensionsDir: "/opt/cna/extensions",
       gitUserName: "Agent",
       gitUserEmail: "agent@example.invalid",
@@ -47,6 +53,21 @@ describe("loadGatewayConfig", () => {
     expect(() => loadGatewayConfig({ CNA_EXTENSIONS_DIR: "rel-ext-value" })).toThrow(
       "CNA_EXTENSIONS_DIR must be an absolute path",
     );
+  });
+
+  it("rejects relative notifications and web files without repeating their values", () => {
+    try {
+      loadGatewayConfig({ CNA_NOTIFICATIONS_FILE: "rel-notify-value.yaml" });
+      expect.unreachable();
+    } catch (error) {
+      expect((error as Error).message).toBe("CNA_NOTIFICATIONS_FILE must be an absolute path");
+    }
+    try {
+      loadGatewayConfig({ CNA_WEB_FILE: "rel-web-value.yaml" });
+      expect.unreachable();
+    } catch (error) {
+      expect((error as Error).message).toBe("CNA_WEB_FILE must be an absolute path");
+    }
   });
 
   it("rejects an invalid port", () => {
@@ -80,6 +101,8 @@ describe("gatewayPaths", () => {
       port: 8090,
       dataDir: "/data",
       providersFile: "/config/providers.yaml",
+      notificationsFile: "/config/notifications.yaml",
+      webFile: "/config/web.yaml",
       extensionsDir: "/app/packages/extensions",
     };
 
@@ -87,9 +110,14 @@ describe("gatewayPaths", () => {
       workspaceDir: "/data/workspace/repo",
       agentDir: "/data/config/pi",
       sessionDir: "/data/sessions",
+      toolLogFile: "/data/logs/tools.jsonl",
       extensions: [
         "/app/packages/extensions/src/ask-user.ts",
         "/app/packages/extensions/src/git.ts",
+        "/app/packages/extensions/src/todo.ts",
+        "/app/packages/extensions/src/plan-mode.ts",
+        "/app/packages/extensions/src/guard.ts",
+        "/app/packages/extensions/src/web.ts",
       ],
       systemPromptFile: "/app/packages/extensions/assets/system-prompt.md",
       globalAgentsFile: "/app/packages/extensions/assets/AGENTS.md",

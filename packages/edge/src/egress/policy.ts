@@ -1,6 +1,11 @@
 import { lookup } from "node:dns/promises";
 import { isIP } from "node:net";
-import type { NetworkDecision, NetworkDecisionReason, ProviderEndpoint } from "@cna/shared";
+import type {
+  NetworkDecision,
+  NetworkDecisionReason,
+  ProviderEndpoint,
+  ServiceEndpoint,
+} from "@cna/shared";
 import { isInternalAddress } from "./address.js";
 import { type AllowlistEntry, matchesAllowlist } from "./allowlist.js";
 import type { AskCoordinator } from "./ask.js";
@@ -62,6 +67,8 @@ export interface NetworkPolicyOptions {
   baseAllowlist: readonly AllowlistEntry[];
   /** Endpoints of providers.yaml. */
   providers: readonly ProviderEndpoint[];
+  /** Endpoints of notifications.yaml and web.yaml (ADR-0009). Default []. */
+  services?: readonly ServiceEndpoint[];
   ask: Pick<AskCoordinator, "ask">;
   /** Default DEFAULT_ALLOWED_PORTS ([80, 443]). */
   allowedPorts?: readonly number[];
@@ -79,17 +86,19 @@ function normalizeHost(host: string): string {
  * Network policy for modes `ask` (default), `allowlist` and `audit`. Evaluation order:
  * 1. No addresses → deny `dns_error`.
  * 2. Host and port are a provider endpoint → allow `provider` (even if internal or on another port).
- * 3. Any address is internal → deny `internal_destination`.
- * 4. Mode `audit`: allowed port → allow `audit`; otherwise deny `port_not_allowed`.
- * 5. Matches the base allowlist or the stored entries → allow `allowlist`.
- * 6. Port not in `allowedPorts` → deny `port_not_allowed`.
- * 7. Mode `allowlist` → deny `not_allowed`.
- * 8. Mode `ask` → ask the user: `allow_once` → allow `user_once`; `allow_always` → persist the
+ * 3. Host and port are a service endpoint → allow `service` (even if internal or on another port).
+ * 4. Any address is internal → deny `internal_destination`.
+ * 5. Mode `audit`: allowed port → allow `audit`; otherwise deny `port_not_allowed`.
+ * 6. Matches the base allowlist or the stored entries → allow `allowlist`.
+ * 7. Port not in `allowedPorts` → deny `port_not_allowed`.
+ * 8. Mode `allowlist` → deny `not_allowed`.
+ * 9. Mode `ask` → ask the user: `allow_once` → allow `user_once`; `allow_always` → persist the
  *    host and allow `user_always`; `deny` → deny `user_denied`; timeout → deny `ask_timeout`;
  *    no session → deny `no_session`.
  */
 export function createNetworkPolicy(options: NetworkPolicyOptions): Policy {
   const allowedPorts = new Set(options.allowedPorts ?? DEFAULT_ALLOWED_PORTS);
+  const services = options.services ?? [];
   const onPersistError = options.onPersistError ?? (() => undefined);
   const allow = (reason: NetworkDecisionReason): PolicyResult => ({ decision: "allow", reason });
   const deny = (reason: NetworkDecisionReason): PolicyResult => ({ decision: "deny", reason });
@@ -101,6 +110,9 @@ export function createNetworkPolicy(options: NetworkPolicyOptions): Policy {
     if (addresses.length === 0) return deny("dns_error");
     if (options.providers.some((endpoint) => host === endpoint.host && port === endpoint.port)) {
       return allow("provider");
+    }
+    if (services.some((endpoint) => host === endpoint.host && port === endpoint.port)) {
+      return allow("service");
     }
     if (addresses.some((address) => isInternalAddress(address))) {
       return deny("internal_destination");

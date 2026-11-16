@@ -8,6 +8,8 @@ export type NetworkDecision = "allow" | "deny";
  * - `audit`: allowed because the policy mode is `audit`.
  * - `allowlist`: the destination matches an allowlist entry (base, configured or "allow always").
  * - `provider`: the destination is the endpoint of a provider in `providers.yaml`.
+ * - `service`: the destination is the endpoint of a configured service (notifications.yaml,
+ *   web.yaml; ADR-0009).
  * - `user_once` / `user_always`: the user allowed it in a network question.
  * - `user_denied`: the user denied it in a network question.
  * - `ask_timeout`: nobody answered the network question in time.
@@ -22,6 +24,7 @@ export const NETWORK_DECISION_REASONS = [
   "audit",
   "allowlist",
   "provider",
+  "service",
   "user_once",
   "user_always",
   "user_denied",

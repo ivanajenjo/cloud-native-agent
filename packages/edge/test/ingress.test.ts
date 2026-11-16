@@ -1,3 +1,4 @@
+import { Hono } from "hono";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { AnswerResult } from "../src/egress/ask.js";
 import {
@@ -496,5 +497,121 @@ describe("isInternalPath", () => {
     ["/session/..%2finternal", false],
   ])("%s -> %s", (path, expected) => {
     expect(isInternalPath(path)).toBe(expected);
+  });
+});
+
+describe("network API (/network/*, answered by edge)", () => {
+  /** Stub network API that records what it receives and answers with its own path and query. */
+  function stubNetworkApi() {
+    const received: Array<{
+      url: string;
+      method: string;
+      authorization: string | null;
+      body: string;
+    }> = [];
+    const api = new Hono();
+    api.all("*", async (c) => {
+      received.push({
+        url: c.req.url,
+        method: c.req.method,
+        authorization: c.req.header("authorization") ?? null,
+        body: await c.req.text(),
+      });
+      return c.json({ path: new URL(c.req.url).pathname });
+    });
+    return { api, received };
+  }
+
+  function setupWithApi(respond?: () => Response | Promise<Response>) {
+    const stub = stubNetworkApi();
+    const gateway = fakeGateway(respond);
+    const app = createIngressApp({
+      token: TOKEN,
+      gatewayUrl: GATEWAY,
+      version: VERSION,
+      fetch: gateway.fetch,
+      networkApi: stub.api,
+    });
+    return { app, calls: gateway.calls, received: stub.received };
+  }
+
+  it("GET /network/policy without Bearer gets 401 and touches nothing", async () => {
+    const { app, calls, received } = setupWithApi();
+    const res = await app.request("/network/policy");
+    expect(res.status).toBe(401);
+    expect(await res.json()).toEqual({ error: "unauthorized" });
+    expect(calls).toHaveLength(0);
+    expect(received).toHaveLength(0);
+  });
+
+  it("PUT /network/policy without Bearer gets 401", async () => {
+    const { app, calls, received } = setupWithApi();
+    const res = await app.request("/network/policy", { method: "PUT", body: "{}" });
+    expect(res.status).toBe(401);
+    expect(calls).toHaveLength(0);
+    expect(received).toHaveLength(0);
+  });
+
+  it("with Bearer, networkApi answers and the gateway is not called", async () => {
+    const { app, calls, received } = setupWithApi();
+    const res = await app.request("/network/policy", { headers: auth });
+    expect(res.status).toBe(200);
+    expect(await res.json()).toEqual({ path: "/network/policy" });
+    expect(calls).toHaveLength(0);
+    expect(received).toHaveLength(1);
+    expect(received[0]?.method).toBe("GET");
+    expect(received[0]?.authorization).toBeNull();
+  });
+
+  it("the original query is passed on, and the body of a PUT too", async () => {
+    const { app, calls, received } = setupWithApi();
+    await app.request("/network/log?limit=5", { headers: auth });
+    const body = JSON.stringify({ mode: "audit" });
+    const put = await app.request("/network/policy", {
+      method: "PUT",
+      headers: { ...auth, "content-type": "application/json" },
+      body,
+    });
+    expect(put.status).toBe(200);
+    expect(received[0]?.url).toBe("http://edge/network/log?limit=5");
+    expect(received[1]?.method).toBe("PUT");
+    expect(received[1]?.body).toBe(body);
+    expect(calls).toHaveLength(0);
+  });
+
+  it.each([
+    "/network/../network/policy",
+    "/%6eetwork/policy",
+    "/network//policy",
+    "/network/%2e%2e/network/policy",
+  ])("%s is answered by edge and never reaches the gateway", async (path) => {
+    const { app, calls, received } = setupWithApi();
+    const res = await app.request(path, { headers: auth });
+    expect(res.status).toBe(200);
+    expect(received).toHaveLength(1);
+    expect(received[0]?.url).toBe("http://edge/network/policy");
+    expect(calls).toHaveLength(0);
+  });
+
+  it("an upper-case /NETWORK path is still handled by edge, never forwarded", async () => {
+    const { app, calls, received } = setupWithApi();
+    await app.request("/NETWORK/policy", { headers: auth });
+    expect(received).toHaveLength(1);
+    expect(calls).toHaveLength(0);
+  });
+
+  it("paths that only start with the same letters are still forwarded to the gateway", async () => {
+    const { app, calls, received } = setupWithApi();
+    expect((await app.request("/networkx", { headers: auth })).status).toBe(200);
+    expect(calls.map((call) => call.url)).toEqual([`${GATEWAY}/networkx`]);
+    expect(received).toHaveLength(0);
+  });
+
+  it("without networkApi, /network/policy gets 404 and the gateway is not called", async () => {
+    const { app, calls } = setup();
+    const res = await app.request("/network/policy", { headers: auth });
+    expect(res.status).toBe(404);
+    expect(await res.json()).toEqual({ error: "not_found" });
+    expect(calls).toHaveLength(0);
   });
 });

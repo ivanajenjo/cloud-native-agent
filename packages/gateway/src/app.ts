@@ -2,8 +2,10 @@ import {
   type AnswerRequest,
   AnswerRequestSchema,
   type ApiErrorCode,
+  type CheckpointsResponse,
   type CreateSessionRequest,
   CreateSessionRequestSchema,
+  type DiffResponse,
   type HealthResponse,
   type MessagesResponse,
   type ModelsResponse,
@@ -13,10 +15,14 @@ import {
   PublishNetworkEntryRequestSchema,
   type PublishQuestionRequest,
   PublishQuestionRequestSchema,
+  parseCheckpointId,
   type ResolveQuestionRequest,
   ResolveQuestionRequestSchema,
+  type RestoreCheckpointRequest,
+  RestoreCheckpointRequestSchema,
   type SetModelRequest,
   SetModelRequestSchema,
+  type TodosResponse,
 } from "@cna/shared";
 import { type Context, Hono } from "hono";
 import { bodyLimit } from "hono/body-limit";
@@ -42,6 +48,7 @@ const MAX_BODY_BYTES = 1024 * 1024;
 const SESSION_ERROR_STATUS: Partial<Record<ApiErrorCode, 400 | 404 | 409>> = {
   no_session: 404,
   question_not_found: 404,
+  checkpoint_not_found: 404,
   session_exists: 409,
   invalid_state: 409,
   question_resolved: 409,
@@ -66,6 +73,29 @@ async function parseBody<S extends ZodType>(c: Context, schema: S): Promise<z.in
   } catch {
     throw new InvalidRequestError("(root): body must be valid JSON");
   }
+  return validateBody(raw, schema);
+}
+
+/**
+ * Like parseBody, but an empty body (or one with only whitespace) is validated as `{}`.
+ * Throws InvalidRequestError.
+ */
+async function parseOptionalBody<S extends ZodType>(c: Context, schema: S): Promise<z.infer<S>> {
+  const text = await c.req.text();
+  if (text.trim() === "") {
+    return validateBody({}, schema);
+  }
+  let raw: unknown;
+  try {
+    raw = JSON.parse(text);
+  } catch {
+    throw new InvalidRequestError("(root): body must be valid JSON");
+  }
+  return validateBody(raw, schema);
+}
+
+/** Validates an already parsed JSON value against a schema. Throws InvalidRequestError. */
+function validateBody<S extends ZodType>(raw: unknown, schema: S): z.infer<S> {
   const result = schema.safeParse(raw);
   if (!result.success) {
     const issue = result.error.issues[0];
@@ -118,9 +148,50 @@ export function createApp(options: AppOptions): Hono {
     }),
   );
 
+  app.get("/session/todos", (c) => {
+    const body: TodosResponse = { todos: session.todos() };
+    return c.json(body);
+  });
+
   app.get("/session/messages", async (c) => {
     const body: MessagesResponse = { messages: await session.messages() };
     return c.json(body);
+  });
+
+  app.get("/session/diff", async (c) => {
+    const param = c.req.query("checkpoint");
+    let checkpointId: number | undefined;
+    if (param !== undefined) {
+      const parsed = parseCheckpointId(param);
+      if (parsed === null) {
+        throw new InvalidRequestError("checkpoint: must be a non-negative integer");
+      }
+      checkpointId = parsed;
+    }
+    const body: DiffResponse = await session.diff(checkpointId);
+    return c.json(body);
+  });
+
+  app.get("/session/checkpoints", (c) => {
+    const body: CheckpointsResponse = { checkpoints: session.checkpoints() };
+    return c.json(body);
+  });
+
+  // The body is optional: an empty one means { conversation: false } (files only).
+  app.post("/session/checkpoints/:id/restore", limitBody, async (c) => {
+    const checkpointId = parseCheckpointId(c.req.param("id"));
+    if (checkpointId === null) {
+      throw new InvalidRequestError("id: must be a non-negative integer");
+    }
+    const request: RestoreCheckpointRequest = await parseOptionalBody(
+      c,
+      RestoreCheckpointRequestSchema,
+    );
+    return c.json(
+      await session.restoreCheckpoint(checkpointId, {
+        conversation: request.conversation ?? false,
+      }),
+    );
   });
 
   app.post("/session/messages", limitBody, async (c) => {

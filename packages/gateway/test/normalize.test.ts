@@ -421,3 +421,81 @@ describe("uiRequestToNotify", () => {
     expect(uiRequestToNotify(request)).toBeNull();
   });
 });
+
+describe("normalizeRpcEvent: todo and mode", () => {
+  const TODOS = [
+    { id: 1, text: "Read the README", status: "completed" },
+    { id: 2, text: "Write the tests", status: "in_progress" },
+  ];
+
+  function todoEnd(overrides: Partial<RpcEvent> = {}): RpcEvent {
+    return {
+      type: "tool_execution_end",
+      toolCallId: "call_todo",
+      toolName: "todo",
+      result: { content: [{ type: "text", text: "2 tasks" }], details: { todos: TODOS } },
+      isError: false,
+      ...overrides,
+    };
+  }
+
+  it("emits tool_end and then the todo list of a valid todo call", () => {
+    expect(normalizeRpcEvent(todoEnd())).toEqual([
+      {
+        type: "tool_end",
+        toolCallId: "call_todo",
+        toolName: "todo",
+        result: { content: [{ type: "text", text: "2 tasks" }], details: { todos: TODOS } },
+        isError: false,
+      },
+      { type: "todo", todos: TODOS },
+    ]);
+  });
+
+  it("emits only tool_end when the todo call is an error", () => {
+    const events = normalizeRpcEvent(todoEnd({ isError: true }));
+    expect(events.map((event) => event.type)).toEqual(["tool_end"]);
+  });
+
+  it("emits only tool_end when the details of todo are invalid", () => {
+    const invalid = [
+      { result: { content: [] } },
+      { result: { details: { todos: [{ id: 0, text: "x", status: "pending" }] } } },
+      { result: { details: { todos: [{ id: 1, text: "x", status: "done" }] } } },
+      { result: { details: "not a list" } },
+    ];
+    for (const override of invalid) {
+      const events = normalizeRpcEvent(todoEnd(override));
+      expect(events.map((event) => event.type)).toEqual(["tool_end"]);
+    }
+  });
+
+  it("does not read the todo list from another tool with the same details", () => {
+    const events = normalizeRpcEvent(todoEnd({ toolName: "bash" }));
+    expect(events.map((event) => event.type)).toEqual(["tool_end"]);
+  });
+
+  it("maps entry_appended of cna.mode to mode", () => {
+    for (const mode of ["plan", "auto"]) {
+      expect(
+        normalizeRpcEvent({
+          type: "entry_appended",
+          entry: { type: "custom", customType: "cna.mode", data: { mode } },
+        }),
+      ).toEqual([{ type: "mode", mode }]);
+    }
+  });
+
+  it("ignores entry_appended of another customType or with an invalid mode", () => {
+    const entries = [
+      { type: "custom", customType: "cna.other", data: { mode: "auto" } },
+      { type: "custom", customType: "cna.mode", data: { mode: "yolo" } },
+      { type: "custom", customType: "cna.mode", data: {} },
+      { type: "message", customType: "cna.mode", data: { mode: "auto" } },
+    ];
+    for (const entry of entries) {
+      expect(normalizeRpcEvent({ type: "entry_appended", entry })).toEqual([]);
+    }
+    expect(normalizeRpcEvent({ type: "entry_appended" })).toEqual([]);
+  });
+});

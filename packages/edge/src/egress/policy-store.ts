@@ -98,6 +98,17 @@ export class PolicyStore {
     });
   }
 
+  /**
+   * Replaces the whole allow list (canonicalized and deduplicated) and persists it, keeping the mode.
+   * Entries are validated before anything is queued: an invalid one throws and changes nothing.
+   */
+  async setAllow(entries: readonly string[]): Promise<void> {
+    const canonical = canonicalizeEntries(entries);
+    return this.enqueue(async () => {
+      await this.persist({ mode: this.policy.mode, allow: canonical });
+    });
+  }
+
   /** Runs `task` after every previously queued write. A failed task does not block the queue. */
   private enqueue(task: () => Promise<void>): Promise<void> {
     const run = this.queue.then(task);

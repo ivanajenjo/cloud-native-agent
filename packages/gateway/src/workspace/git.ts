@@ -31,8 +31,11 @@ export class GitError extends Error {
   }
 }
 
-/** Runs git with the given args in cwd. */
-export type GitRunner = (args: string[], options: { cwd: string }) => Promise<GitResult>;
+/** Runs git with the given args in cwd. `env` is merged over the runner's base environment. */
+export type GitRunner = (
+  args: string[],
+  options: { cwd: string; env?: Record<string, string> },
+) => Promise<GitResult>;
 
 /**
  * Final environment for a git child process: undefined values are dropped and
@@ -57,10 +60,12 @@ export function createGitRunner(env: Record<string, string | undefined>): GitRun
   const childEnv = gitEnv(env);
   return (args, options) =>
     new Promise<GitResult>((resolve, reject) => {
+      const callEnv =
+        options.env === undefined ? childEnv : gitEnv({ ...childEnv, ...options.env });
       execFile(
         "git",
         args,
-        { cwd: options.cwd, env: childEnv, maxBuffer: MAX_BUFFER, encoding: "utf8" },
+        { cwd: options.cwd, env: callEnv, maxBuffer: MAX_BUFFER, encoding: "utf8" },
         (error, stdout, stderr) => {
           if (error) {
             reject(toGitError(args, error, stderr));

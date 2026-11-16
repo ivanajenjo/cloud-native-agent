@@ -205,6 +205,60 @@ describe("buildPiLaunch validation", () => {
   it("rejects a model that looks like a flag", () => {
     expect(() => buildPiLaunch({ ...base, model: "-x", env: {} })).toThrow(Error);
   });
+
+  it("rejects a relative webConfigFile", () => {
+    expect(() => buildPiLaunch({ ...base, webConfigFile: "web.yaml", env: {} })).toThrow(
+      "webConfigFile must be an absolute path: web.yaml",
+    );
+  });
+});
+
+describe("buildPiLaunch plan and web flags", () => {
+  it("adds --cna-plan after --cna-base-branch when autoPush is false", () => {
+    const spec = buildPiLaunch({ ...base, plan: true, env: {} });
+
+    expect(spec.args.slice(-3)).toEqual(["--cna-base-branch", "main", "--cna-plan"]);
+  });
+
+  it("adds --cna-plan after --cna-auto-push when both are set", () => {
+    const spec = buildPiLaunch({ ...full, plan: true, env: {} });
+
+    expect(spec.args.slice(-2)).toEqual(["--cna-auto-push", "--cna-plan"]);
+  });
+
+  it("does not add --cna-plan when plan is false or absent", () => {
+    expect(buildPiLaunch({ ...full, plan: false, env: {} }).args).not.toContain("--cna-plan");
+    expect(buildPiLaunch({ ...full, env: {} }).args).not.toContain("--cna-plan");
+  });
+
+  it("adds --cna-web-config with the absolute path at the end", () => {
+    const spec = buildPiLaunch({ ...full, webConfigFile: "/config/web.yaml", env: {} });
+
+    expect(spec.args.slice(-2)).toEqual(["--cna-web-config", "/config/web.yaml"]);
+  });
+
+  it("places --cna-plan before --cna-web-config when both are set", () => {
+    const spec = buildPiLaunch({
+      ...base,
+      plan: true,
+      webConfigFile: "/config/web.yaml",
+      env: {},
+    });
+
+    expect(spec.args.slice(-5)).toEqual([
+      "--cna-base-branch",
+      "main",
+      "--cna-plan",
+      "--cna-web-config",
+      "/config/web.yaml",
+    ]);
+  });
+
+  it("does not add --cna-web-config without webConfigFile", () => {
+    const spec = buildPiLaunch({ ...full, env: {} });
+
+    expect(spec.args).not.toContain("--cna-web-config");
+  });
 });
 
 describe("resolvePiCli", () => {

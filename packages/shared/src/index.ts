@@ -12,6 +12,14 @@ export {
   ResolveQuestionRequestSchema,
 } from "./internal.js";
 export {
+  MODE_ENTRY_TYPE,
+  type ModeEntryData,
+  PLAN_ANSWER_OPTIONS,
+  type PlanAnswerOption,
+  parseModeEntry,
+  SUBMIT_PLAN_TOOL_NAME,
+} from "./mode.js";
+export {
   NETWORK_DECISION_REASONS,
   NETWORK_MODES,
   type NetworkDecision,
@@ -20,6 +28,15 @@ export {
   type NetworkMethod,
   type NetworkMode,
 } from "./network.js";
+export {
+  NETWORK_LOG_CAPACITY,
+  NETWORK_LOG_DEFAULT_LIMIT,
+  NETWORK_ROUTES,
+  type NetworkLogResponse,
+  type NetworkPolicyResponse,
+  type UpdateNetworkPolicyRequest,
+  UpdateNetworkPolicyRequestSchema,
+} from "./network-api.js";
 export { DEFAULT_PORTS } from "./ports.js";
 export {
   type ProviderConfig,
@@ -43,6 +60,23 @@ export {
   type QuestionMethod,
   type QuestionOutcome,
 } from "./questions.js";
+export {
+  NOTIFICATION_EVENTS,
+  type NotificationEvent,
+  type NotificationsConfig,
+  NotificationsConfigSchema,
+  parseNotificationsConfig,
+  parseWebConfig,
+  resolveSecretRef,
+  SEARCH_API_BASES,
+  SEARCH_PROVIDERS,
+  type SearchProvider,
+  type ServiceEndpoint,
+  serviceEndpoints,
+  TELEGRAM_API_BASE,
+  type WebConfig,
+  WebConfigSchema,
+} from "./services.js";
 export {
   ACTIVE_SESSION_STATUSES,
   type AnswerRequest,
@@ -71,3 +105,26 @@ export {
   type ThinkingLevel,
   ThinkingLevelSchema,
 } from "./session.js";
+export {
+  parseTodoDetails,
+  TODO_LIMITS,
+  TODO_STATUSES,
+  TODO_TOOL_NAME,
+  type TodoDetails,
+  type TodoItem,
+  type TodoStatus,
+  type TodosResponse,
+} from "./todo.js";
+export {
+  type Checkpoint,
+  type CheckpointsResponse,
+  DIFF_PATCH_MAX_BYTES,
+  type DiffFile,
+  type DiffFileStatus,
+  type DiffResponse,
+  type DiffSource,
+  parseCheckpointId,
+  type RestoreCheckpointRequest,
+  RestoreCheckpointRequestSchema,
+  type RestoreCheckpointResponse,
+} from "./workspace.js";

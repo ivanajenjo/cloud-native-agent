@@ -68,10 +68,22 @@ function runProcess(
   });
 }
 
-function fakePi(flags: Flags) {
+type GhFake = (args: string[], options?: ExecOptions) => ExecResult;
+
+/** Default simulated gh: creates the pull request and prints its URL. Never runs gh. */
+const GH_SUCCESS: GhFake = () => ({
+  stdout: "Creating pull request for agent/test into main\nhttps://github.com/owner/repo/pull/7\n",
+  stderr: "",
+  code: 0,
+  killed: false,
+  truncated: false,
+});
+
+function fakePi(flags: Flags, gh: GhFake = GH_SUCCESS) {
   let registered: CapturedTool[] = [];
+  // Git runs for real against the local repository; gh is simulated, never executed.
   const exec = vi.fn((command: string, args: string[], options?: ExecOptions) =>
-    runProcess(command, args, options),
+    command === "gh" ? Promise.resolve(gh(args, options)) : runProcess(command, args, options),
   );
   const pi = {
     registerTool: vi.fn((definition: unknown) => {
@@ -133,8 +145,8 @@ describe("git extension", () => {
     };
   }
 
-  function setup() {
-    const fake = fakePi(flags);
+  function setup(gh?: GhFake) {
+    const fake = fakePi(flags, gh);
     const ctx = context();
     const run = (name: string, params: Record<string, unknown> = {}) =>
       fake.tool(name).execute("call-1", params, undefined, undefined, ctx);
@@ -142,7 +154,7 @@ describe("git extension", () => {
   }
 
   describe("registration", () => {
-    it("registers the flags and the three tools", () => {
+    it("registers the flags and the four tools", () => {
       const { pi, registered } = setup();
       expect(pi.registerFlag).toHaveBeenCalledWith(
         "cna-base-branch",
@@ -152,7 +164,12 @@ describe("git extension", () => {
         "cna-auto-push",
         expect.objectContaining({ type: "boolean", default: false }),
       );
-      expect(registered().map((t) => t.name)).toEqual(["git_status", "git_commit", "git_push"]);
+      expect(registered().map((t) => t.name)).toEqual([
+        "git_status",
+        "git_commit",
+        "git_push",
+        "create_pr",
+      ]);
     });
 
     it("names each tool in its prompt guidelines", () => {
@@ -372,6 +389,200 @@ describe("git extension", () => {
           expect(forbidden).not.toContain(arg);
         }
       }
+    });
+  });
+
+  describe("create_pr", () => {
+    const pr = { title: "Add feature", body: "Body text" };
+    const expectedArgs = [
+      "pr",
+      "create",
+      "--base=main",
+      "--head=agent/test",
+      "--title=Add feature",
+      "--body=Body text",
+    ];
+
+    beforeEach(() => {
+      writeFileSync(join(work, "feature.txt"), "feature\n");
+      git(work, ["add", "-A"]);
+      git(work, ["commit", "-q", "-m", "feat: add feature"]);
+    });
+
+    /** Publishes the agent branch to origin under the same name, as git_push does. */
+    function pushBranch(): void {
+      git(work, ["push", "-q", "origin", "HEAD:refs/heads/agent/test"]);
+    }
+
+    function ghCalls(exec: ReturnType<typeof vi.fn>): unknown[][] {
+      return exec.mock.calls.filter(([command]) => command === "gh");
+    }
+
+    it("names create_pr in its prompt guideline", () => {
+      const { registered } = setup();
+      const tool = registered().find((t) => t.name === "create_pr");
+      expect(tool?.promptGuidelines).toEqual([
+        "Use create_pr after git_push to open a pull request; never run gh pr create in bash.",
+      ]);
+    });
+
+    it("refuses when the base branch is unknown and never calls gh", async () => {
+      flags = { "cna-auto-push": false };
+      pushBranch();
+      const { run, exec } = setup();
+
+      await expect(run("create_pr", pr)).rejects.toThrow(
+        "base branch unknown; pull requests disabled",
+      );
+      expect(ghCalls(exec)).toHaveLength(0);
+    });
+
+    it.each([
+      ["an empty title", "   ", "empty"],
+      ["a title of 257 characters", "a".repeat(257), "longer than 256"],
+    ])("refuses %s", async (_label, title, message) => {
+      pushBranch();
+      const { run, exec } = setup();
+
+      await expect(run("create_pr", { ...pr, title })).rejects.toThrow(message);
+      expect(ghCalls(exec)).toHaveLength(0);
+    });
+
+    it("refuses a body longer than 65536 characters", async () => {
+      pushBranch();
+      const { run, exec } = setup();
+
+      await expect(run("create_pr", { ...pr, body: "x".repeat(65_537) })).rejects.toThrow(
+        "longer than 65536",
+      );
+      expect(ghCalls(exec)).toHaveLength(0);
+    });
+
+    it("refuses a branch that is not agent/*", async () => {
+      git(work, ["checkout", "-q", "-b", "feature/x"]);
+      const { run, exec } = setup();
+
+      await expect(run("create_pr", pr)).rejects.toThrow("pull requests only from agent/*");
+      expect(ghCalls(exec)).toHaveLength(0);
+    });
+
+    it("refuses the base branch itself", async () => {
+      flags = { "cna-base-branch": "agent/test", "cna-auto-push": false };
+      pushBranch();
+      const { run, exec } = setup();
+
+      await expect(run("create_pr", pr)).rejects.toThrow("pull requests only from agent/*");
+      expect(ghCalls(exec)).toHaveLength(0);
+    });
+
+    it("refuses a branch that is not on origin and never calls gh", async () => {
+      const { run, exec } = setup();
+
+      await expect(run("create_pr", pr)).rejects.toThrow("use git_push first");
+      expect(ghCalls(exec)).toHaveLength(0);
+      expect(confirm).not.toHaveBeenCalled();
+    });
+
+    it("refuses a branch with commits that are not pushed and never calls gh", async () => {
+      pushBranch();
+      writeFileSync(join(work, "more.txt"), "more\n");
+      git(work, ["add", "-A"]);
+      git(work, ["commit", "-q", "-m", "feat: more"]);
+      const { run, exec } = setup();
+
+      await expect(run("create_pr", pr)).rejects.toThrow("not pushed");
+      expect(ghCalls(exec)).toHaveLength(0);
+    });
+
+    it("does not create the pull request when the user does not confirm", async () => {
+      confirm.mockResolvedValue(false);
+      pushBranch();
+      const { run, exec } = setup();
+
+      await expect(run("create_pr", pr)).rejects.toThrow("Pull request not confirmed by the user.");
+      expect(ghCalls(exec)).toHaveLength(0);
+    });
+
+    it("asks with a cna:confirm: title that names the branch and base", async () => {
+      pushBranch();
+      const { run } = setup();
+
+      await expect(run("create_pr", pr)).resolves.toBeDefined();
+
+      expect(confirm).toHaveBeenCalledTimes(1);
+      const [title, message] = confirm.mock.calls[0] ?? [];
+      expect(String(title).startsWith("cna:confirm:")).toBe(true);
+      expect(String(title)).toContain("agent/test");
+      expect(String(title)).toContain("main");
+      expect(String(message)).toContain("Add feature");
+    });
+
+    it("runs gh with the exact arguments and the repository as cwd once confirmed", async () => {
+      pushBranch();
+      const { run, exec } = setup();
+
+      const result = await run("create_pr", pr);
+
+      expect(ghCalls(exec)).toEqual([
+        ["gh", expectedArgs, expect.objectContaining({ cwd: work, timeout: 120_000 })],
+      ]);
+      expect(result.content[0]?.text).toBe(
+        "Created pull request https://github.com/owner/repo/pull/7",
+      );
+      expect(result.details).toEqual({
+        url: "https://github.com/owner/repo/pull/7",
+        base: "main",
+        branch: "agent/test",
+        draft: false,
+      });
+    });
+
+    it("skips confirmation with auto-push and adds --draft last for drafts", async () => {
+      flags = { "cna-base-branch": "main", "cna-auto-push": true };
+      pushBranch();
+      const { run, exec } = setup();
+
+      const result = await run("create_pr", { ...pr, draft: true });
+
+      expect(confirm).not.toHaveBeenCalled();
+      const [call] = ghCalls(exec);
+      expect(call?.[1]).toEqual([...expectedArgs, "--draft"]);
+      expect(result.details).toEqual({
+        url: "https://github.com/owner/repo/pull/7",
+        base: "main",
+        branch: "agent/test",
+        draft: true,
+      });
+    });
+
+    it("fails with gh's stderr when gh exits with an error", async () => {
+      pushBranch();
+      const { run } = setup(() => ({
+        stdout: "",
+        stderr: "GraphQL: a pull request already exists\n",
+        code: 1,
+        killed: false,
+        truncated: false,
+      }));
+
+      await expect(run("create_pr", pr)).rejects.toThrow(
+        "gh pr create failed (exit 1): GraphQL: a pull request already exists",
+      );
+    });
+
+    it("fails when gh prints no pull request URL", async () => {
+      pushBranch();
+      const { run } = setup(() => ({
+        stdout: "Done.\n",
+        stderr: "",
+        code: 0,
+        killed: false,
+        truncated: false,
+      }));
+
+      await expect(run("create_pr", pr)).rejects.toThrow(
+        "gh pr create did not print the pull request URL",
+      );
     });
   });
 });
