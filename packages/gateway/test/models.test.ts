@@ -8,6 +8,7 @@ import {
   listModels,
   loadProvidersConfig,
   PLACEHOLDER_API_KEY,
+  providerSecrets,
   writeModelsJson,
 } from "../src/config/models.js";
 
@@ -261,5 +262,38 @@ describe("writeModelsJson", () => {
     await writeModelsJson(root, OLLAMA_CONFIG);
 
     expect((await readdir(root)).sort()).toStrictEqual(["models.json"]);
+  });
+});
+
+describe("providerSecrets", () => {
+  const config = (keys: Record<string, string | undefined>): ProvidersConfig => ({
+    providers: Object.fromEntries(
+      Object.entries(keys).map(([id, apiKey]) => [id, { apiKey, models: [] }]),
+    ),
+  });
+
+  it("returns literal keys as written", () => {
+    expect(providerSecrets(config({ a: "sk-literal-key-123" }), {})).toStrictEqual([
+      "sk-literal-key-123",
+    ]);
+  });
+
+  it("resolves $NAME and the braced form against env", () => {
+    const env = { MY_LLM_KEY: "value-from-env-1", OTHER: "value-from-env-2" };
+    // Built with a join so the linter does not take the braces for a template placeholder.
+    const braced = ["$", "{OTHER}"].join("");
+    expect(providerSecrets(config({ a: "$MY_LLM_KEY", b: braced }), env)).toStrictEqual([
+      "value-from-env-1",
+      "value-from-env-2",
+    ]);
+  });
+
+  it("treats $$ and $! as literal characters", () => {
+    expect(providerSecrets(config({ a: "pa$$word$!end" }), {})).toStrictEqual(["pa$word!end"]);
+  });
+
+  it("skips providers without apiKey, !command keys and unset variables", () => {
+    const keys = { none: undefined, command: "!pass show llm", unset: "$NOT_SET_ANYWHERE" };
+    expect(providerSecrets(config(keys), {})).toStrictEqual([]);
   });
 });

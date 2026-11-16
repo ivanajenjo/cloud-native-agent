@@ -237,6 +237,32 @@ describe("createGatewayRuntime", () => {
     expect(events).not.toContain(TOKEN);
   }, 15_000);
 
+  it("redacts a literal apiKey of providers.yaml from the events", async () => {
+    const apiKey = "sk-literal-provider-key";
+    await writeFile(
+      join(root, "providers.yaml"),
+      `providers:\n  custom:\n    baseUrl: https://llm.example.invalid/v1\n    apiKey: ${apiKey}\n`,
+    );
+    const { app, startPi } = await start();
+
+    await app.request("/session", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ repo: "octo/hello", prompt: "hola" }),
+    });
+    await waitForRunning(app);
+
+    const handlers = startPi.mock.calls[0]?.[1];
+    handlers?.onEvent({
+      type: "message_end",
+      message: { role: "assistant", content: `the key is ${apiKey}, end-of-leak` },
+    });
+
+    const events = await readEventsUntil(app, "end-of-leak");
+    expect(events).toContain("the key is [REDACTED], end-of-leak");
+    expect(events).not.toContain(apiKey);
+  }, 15_000);
+
   it("rejects when providers.yaml is invalid", async () => {
     await writeFile(join(root, "providers.yaml"), "providers:\n  ollama:\n    bogus: 1\n");
 

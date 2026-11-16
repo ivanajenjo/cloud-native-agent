@@ -86,6 +86,51 @@ export function listModels(config: ProvidersConfig): ModelsResponse {
   return { default: config.default ?? null, models };
 }
 
+const API_KEY_INTERPOLATION = /\$(?:(\$|!)|\{([A-Za-z_][A-Za-z0-9_]*)\}|([A-Za-z_][A-Za-z0-9_]*))/g;
+
+/**
+ * Values of the `apiKey` fields of the config, for the redactor: literals as written and
+ * `$NAME` / `${NAME}` references resolved against `env` (Pi's syntax; `$$` and `$!` are a literal
+ * `$` and `!`). Keys whose value cannot be known here are skipped: `!command` keys and
+ * references to variables that are not set.
+ */
+export function providerSecrets(
+  config: ProvidersConfig,
+  env: Record<string, string | undefined>,
+): string[] {
+  const secrets: string[] = [];
+  for (const provider of Object.values(config.providers)) {
+    const apiKey = provider.apiKey;
+    if (apiKey === undefined || apiKey.startsWith("!")) {
+      continue;
+    }
+    let resolved = true;
+    const value = apiKey.replace(
+      API_KEY_INTERPOLATION,
+      (
+        _match,
+        escaped: string | undefined,
+        braced: string | undefined,
+        bare: string | undefined,
+      ) => {
+        if (escaped !== undefined) {
+          return escaped;
+        }
+        const found = env[braced ?? bare ?? ""];
+        if (found === undefined) {
+          resolved = false;
+          return "";
+        }
+        return found;
+      },
+    );
+    if (resolved && value !== "") {
+      secrets.push(value);
+    }
+  }
+  return secrets;
+}
+
 /** Reads and parses the file. A missing file (ENOENT) yields `{ providers: {} }`. */
 export async function loadProvidersConfig(path: string): Promise<ProvidersConfig> {
   let text: string;

@@ -3,7 +3,12 @@ import { copyFile, mkdir } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import type { Hono } from "hono";
 import { createApp } from "./app.js";
-import { listModels, loadProvidersConfig, writeModelsJson } from "./config/models.js";
+import {
+  listModels,
+  loadProvidersConfig,
+  providerSecrets,
+  writeModelsJson,
+} from "./config/models.js";
 import { type GatewayConfig, gatewayPaths } from "./config.js";
 import { EventLog } from "./events/event-log.js";
 import { resolvePiCli } from "./pi/launch.js";
@@ -57,8 +62,8 @@ export async function createGatewayRuntime(options: GatewayWiringOptions): Promi
   await writeModelsJson(paths.agentDir, providers);
   await copyFile(paths.globalAgentsFile, join(paths.agentDir, "AGENTS.md"));
 
-  // The redactor sees every secret in env, API token included.
-  const redactor = createRedactor(secretsFromEnv(env));
+  // The redactor sees every secret in env (API token included) and the keys of providers.yaml.
+  const redactor = createRedactor([...secretsFromEnv(env), ...providerSecrets(providers, env)]);
   // Git and Pi get the environment without the API token.
   const childEnv = withoutApiToken(env);
   const events = new EventLog();
