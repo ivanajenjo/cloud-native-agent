@@ -47,7 +47,7 @@ export const CreateSessionRequestSchema = z
     prompt: z.string().min(1),
     model: ModelRefSchema.optional(),
     thinking: ThinkingLevelSchema.optional(),
-    /** Phase 1 only implements "auto"; "plan" is rejected with 400 until phase 2. */
+    /** Default "auto". "plan": read-only until the user approves a plan (`question{kind:"plan"}`). */
     mode: SessionModeSchema.optional(),
     autoPush: z.boolean().optional(),
   })
@@ -139,6 +139,7 @@ export type ApiErrorCode =
   | "invalid_state"
   | "question_not_found"
   | "question_resolved"
+  | "checkpoint_not_found"
   | "mode_not_supported"
   | "unknown_model"
   | "unauthorized"

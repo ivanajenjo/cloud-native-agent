@@ -1,6 +1,8 @@
 import type { NetworkLogEntry } from "./network.js";
 import type { Question, QuestionOutcome } from "./questions.js";
-import type { PiMessage, SessionStatus } from "./session.js";
+import type { PiMessage, SessionMode, SessionStatus } from "./session.js";
+import type { TodoItem } from "./todo.js";
+import type { Checkpoint } from "./workspace.js";
 
 /**
  * Events of `GET /session/events`, normalized from Pi's RPC events and from edge.
@@ -28,6 +30,12 @@ export type SessionEvent =
   | { type: "question"; question: Question }
   | { type: "question_resolved"; questionId: string; outcome: QuestionOutcome }
   | { type: "network"; entry: NetworkLogEntry }
+  /** The complete task list, after each successful call of the `todo` tool (or a restore). */
+  | { type: "todo"; todos: TodoItem[] }
+  /** A checkpoint was created, or the working tree was restored to it. */
+  | { type: "checkpoint"; action: "created" | "restored"; checkpoint: Checkpoint }
+  /** The session mode changed (plan approved → "auto"). */
+  | { type: "mode"; mode: SessionMode }
   | {
       type: "compaction";
       phase: "start" | "end";
