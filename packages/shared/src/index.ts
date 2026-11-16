@@ -1,3 +1,4 @@
+export { parsePort } from "./env.js";
 export type { HealthResponse } from "./health.js";
 export type {
   NetworkDecision,
