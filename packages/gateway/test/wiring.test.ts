@@ -85,6 +85,8 @@ function configFor(overrides: Partial<GatewayConfig> = {}): GatewayConfig {
     port: 8090,
     dataDir,
     providersFile: join(root, "providers.yaml"),
+    notificationsFile: join(root, "notifications.yaml"),
+    webFile: join(root, "web.yaml"),
     extensionsDir: loadGatewayConfig({}).extensionsDir,
     gitUserName: "Agent",
     gitUserEmail: "agent@example.invalid",
