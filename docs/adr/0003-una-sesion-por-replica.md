@@ -30,5 +30,4 @@ y `edge` (proxy de entrada/salida). Sigue siendo una unidad de despliegue con un
 como máximo.
 
 ## Actualización (ADR-0006)
-El contenedor `agent` entero, gateway incluido, se considera no fiable. La autenticación,
-los secretos y las aprobaciones de red y de push/PR viven en `edge`.
+`edge` valida el Bearer y decide las preguntas de red; el resto sigue en el gateway.

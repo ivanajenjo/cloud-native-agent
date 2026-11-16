@@ -41,13 +41,9 @@ eventos SSE, y un proxy `CONNECT` propio es pequeño y queda en el mismo stack.
   compartiría la red del pod y podría esquivarse).
 
 ## Actualización (ADR-0006)
-- El flujo `ask` ya no pasa por el gateway: `edge` crea la aprobación, la expone en su
-  propia API (`/approvals`, `/edge/events`) y la aplica. Desaparece el secreto compartido
-  edge ↔ gateway.
+- La respuesta a una pregunta de red la recoge `edge` al pasar por la API; el gateway solo
+  la muestra. Desaparece el secreto compartido edge ↔ gateway.
 - La política, *permitir siempre* y el registro de red se guardan en el volumen de `edge`,
   no en `/data` (el agente podría editarlos).
 - El proxy atiende también peticiones HTTP sin `CONNECT`, aplica la política por host y
-  puerto, y deniega siempre los destinos que resuelvan a direcciones internas.
-- Los proveedores LLM, el buscador y GitHub (git y API) dejan de estar en la allowlist:
-  se llega a ellos por upstreams de `edge` que inyectan las credenciales. La inyección de
-  credenciales deja de ser trabajo futuro y no requiere interceptar TLS.
+  puerto, y deniega los destinos internos salvo los hosts de `providers.yaml`.

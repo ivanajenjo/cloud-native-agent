@@ -81,24 +81,19 @@ afectada está actualizada.
   apuntando a la configuración generada (`models.json`, `AGENTS.md` global).
 
 ## Invariantes de seguridad (nunca romper)
-- El contenedor `agent` entero (gateway incluido) es **no fiable**; `edge` es la única
-  pieza de confianza (ADR-0006).
-- El contenedor `agent` **no recibe ningún secreto**: `AGENT_API_TOKEN`, `GITHUB_TOKEN` y
-  las API keys solo existen en `edge`. Nunca aparecen en logs, eventos SSE ni ficheros.
 - El contenedor `agent` **no tiene salida directa** a internet: todo pasa por `edge`
   (ADR-0004). No añadas el agente a redes externas ni puertos que lo esquiven.
 - Política de red por defecto **`ask`**; sin respuesta en el timeout o sin sesión → **denegar**.
-  Destinos que resuelvan a direcciones internas → **denegar siempre**.
-- Las aprobaciones de red, push y PR se crean, se responden y se aplican **en `edge`**.
-  La política de la sesión sale de la petición del cliente, nunca del gateway.
-- El agente trabaja en ramas `agent/<slug>`. `edge` rechaza cualquier push que no sea a
-  `refs/heads/agent/*` del repo de la sesión. **Nunca** push a la rama base ni `--force`.
-  Push y PR piden aprobación salvo `autoPush: true`.
-- La política y el registro de red se guardan en el volumen de `edge`, no en `/data`.
+- Las preguntas de red las decide `edge`, y su política y registro se guardan en el
+  volumen de `edge`, no en `/data` (ADR-0006).
+- `AGENT_API_TOKEN` solo existe en `edge`, que exige `Authorization: Bearer` en toda la
+  API salvo `GET /health` y los estáticos de la web UI.
 - **Nunca** montar `/var/run/docker.sock` ni ejecutar contenedores con privilegios.
-- Contenedores con usuario no root (`agent`, uid 1000) y sin capabilities.
-- La API pública (`edge:8080`) exige `Authorization: Bearer <AGENT_API_TOKEN>` salvo
-  `GET /health` y los estáticos de la web UI.
+- Contenedores con usuario no root (`agent`, uid 1000).
+- El agente trabaja en ramas `agent/<slug>`. **Nunca** push a la rama base ni `--force`.
+  `git push` y `create_pr` piden confirmación salvo `autoPush: true`.
+- Los secretos (`GITHUB_TOKEN`, API keys) nunca se escriben en logs, eventos SSE ni
+  ficheros del workspace; el token de GitHub no va en la URL del remoto.
 
 ## Tests
 - **Nunca** llames a un LLM real en los tests.
@@ -107,11 +102,9 @@ afectada está actualizada.
   varios diálogos pendientes y `agent_end` seguido de reintento antes de `agent_settled`.
 - e2e: Pi real con un proveedor mock (servidor HTTP local compatible con OpenAI que
   devuelve respuestas guionizadas) definido en `models.json`.
-- Edge, política de red: allowlist con comodines y puertos, ask, deny por timeout,
-  deduplicación de preguntas concurrentes, denegación de destinos internos.
-- Edge, git: el filtro de `git-receive-pack` rechaza la rama base, tags, borrados y otros
-  repos, y no reenvía nada sin aprobación cuando `autoPush` es falso.
-- Edge, API: sin Bearer no pasa nada salvo `/health` y los estáticos.
+- Edge: tests de la política (allowlist con comodines y puertos, ask, deny por timeout,
+  deduplicación de preguntas concurrentes al mismo destino) y de la entrada (sin Bearer
+  no pasa nada salvo `/health` y los estáticos).
 
 ## Fuera de alcance
 No implementes: Docker-in-Docker, MCP, subagentes, permisos por tool, multiusuario,

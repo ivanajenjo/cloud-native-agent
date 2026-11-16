@@ -1,53 +1,44 @@
-# ADR-0006: `edge` como única pieza de confianza: autenticación, secretos y aprobaciones
+# ADR-0006: Seguridad proporcionada a un proyecto personal
 
 - Estado: aceptado
 - Fecha: 2026-11-16
 
 ## Contexto
 El gateway, Pi y los comandos que lanza el agente comparten contenedor y usuario. Un
-agente bajo inyección de prompt puede, con `bash`:
-- leer cualquier variable de entorno del contenedor (también las del gateway, por
-  `/proc/<pid>/environ`), y con `AGENT_API_TOKEN` llamar a la API y aprobar sus propias
-  preguntas;
-- escribir directamente en el stdin de Pi o manipular el proceso del gateway, de modo que
-  tampoco sirve que el gateway "solo acepte peticiones de `edge`";
+agente bajo inyección de prompt puede leer cualquier variable de entorno del contenedor
+y llamar a cualquier servicio que este alcance. Con eso podría:
+- usar `AGENT_API_TOKEN` para contestar sus propias preguntas, incluidas las de red;
 - usar `GITHUB_TOKEN` para hacer `git push` sin pasar por la tool que pide confirmación;
 - editar la allowlist de red si se guarda en `/data`.
 
-Con el diseño anterior, las confirmaciones de push/PR y de red eran orientativas.
+Se valoró sacar todos los secretos del contenedor y hacer de `edge` un intermediario de
+credenciales (proxy inverso de git con filtro de ramas, de la API de GitHub y de los
+proveedores LLM, más un gestor de aprobaciones). Cierra todos los casos, pero multiplica
+el tamaño de `edge` y es desproporcionado para un proyecto personal de un solo usuario.
 
 ## Decisión
-1. El contenedor `agent` completo es **no fiable** y **no recibe ningún secreto**.
-2. `edge` publica la API, valida el Bearer y sirve la web UI. El gateway escucha sin
-   autenticación solo en la red interna.
-3. `edge` guarda `GITHUB_TOKEN` y las API keys y los inyecta en upstreams internos
-   (`:8081`), a los que el agente habla por HTTP dentro de la red interna:
-   - `/git`: proxy inverso de GitHub smart HTTP, limitado al repo de la sesión. En
-     `git-receive-pack` solo deja pasar actualizaciones de `refs/heads/agent/*`.
-   - `/github`: crear PR y leer comentarios de PR del repo de la sesión.
-   - `/llm/<proveedor>` y `/search`: reenvío con la key inyectada.
-4. Las aprobaciones de **red**, **push** y **PR** se crean, se exponen (`/approvals`,
-   `/edge/events`) y se aplican en `edge`. Sin respuesta en el timeout → denegar.
-5. `edge` obtiene la política de la sesión (`repo`, `baseBranch`, `autoPush`) del cuerpo
-   de `POST /session` al reenviarlo, nunca del gateway, y la guarda en su propio volumen
-   junto con la política y el registro de red.
-6. Las notificaciones push las envía `edge`.
-7. Las preguntas que resuelve Pi (`ask_user`, plan) y la extensión `guard` se consideran
-   ayudas de uso, no barreras de seguridad.
+Se aplican solo las medidas que no añaden piezas:
+1. `edge` valida el Bearer al reenviar al gateway. El contenedor del agente no recibe
+   `AGENT_API_TOKEN`.
+2. Las preguntas de red las decide `edge`: las publica a través del gateway para que
+   salgan por SSE, pero recoge él la respuesta al pasar por la API. La política, *permitir
+   siempre* y el registro de red se guardan en el volumen de `edge`.
+3. `GITHUB_TOKEN` y las API keys se quedan en el contenedor del agente.
 
-Se descarta separar gateway y Pi en usuarios o contenedores distintos: exige privilegios
-para cambiar de usuario o un tercer contenedor por réplica, y no resuelve el problema del
-token de GitHub.
+## Riesgos aceptados
+- Las confirmaciones de push/PR, el modo plan y la extensión `guard` frenan despistes del
+  modelo, pero un agente hostil puede saltárselas: tiene el token y `bash`.
+- Un agente hostil puede gastar con las API keys o enviarlas a un dominio permitido.
+- El gateway no se autentica dentro de la red interna.
+
+## Mitigaciones baratas
+- PAT fine-grained solo para los repos que se usen, sin permiso *Workflows*.
+- Ruleset de GitHub que proteja la rama base: es la barrera real contra un push indebido.
+- Límite de gasto en las cuentas de los proveedores.
+- El gateway sustituye los valores de los secretos conocidos en eventos y logs.
 
 ## Consecuencias
-- (+) "Nunca push a la rama base" y "la red se pregunta" pasan a ser propiedades que se
-  cumplen aunque el agente sea hostil.
-- (+) Sin secretos en el contenedor no hace falta redactarlos en logs ni eventos, ni
-  cuidar que el token no acabe en `.git/config`.
-- (+) No se necesita `gh` en la imagen ni excepción de red para Ollama en la LAN.
-- (−) `edge` crece: proxy inverso de git con lectura de pkt-lines, cliente de la API de
-  GitHub, reenvío de LLM con streaming y gestor de aprobaciones.
-- (−) El cliente consume dos flujos SSE (`/session/events` y `/edge/events`).
-- (−) Un agente hostil aún puede falsear lo que muestra el gateway (conversación, diff).
-  Por eso el diálogo de una aprobación se pinta con los datos de `edge`.
-- (−) Un push aprobado sigue pudiendo contener cualquier cosa: la revisión es el PR.
+- (+) `edge` sigue siendo pequeño: entrada con Bearer y proxy de salida con política.
+- (+) El agente no puede abrirse la red a sí mismo, que es lo que más limita el daño.
+- (−) "Nunca push a la rama base" depende del ruleset de GitHub, no de este sistema.
+- La inyección de credenciales en `edge` queda en el backlog por si el uso cambia.

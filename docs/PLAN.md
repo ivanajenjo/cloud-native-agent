@@ -19,41 +19,37 @@ ejecutar tests y subir los cambios. Se controla por API REST, una web UI sencill
 | Uso | Personal, mono-usuario |
 | Concurrencia | **1 sesión por réplica**; más sesiones = más réplicas |
 | Servicios | El agente ejecuta tests, pero **no** levanta servicios (sin Docker-in-Docker) |
-| Push / PR | Se **aprueban** fuera del contenedor del agente (en `edge`), salvo `autoPush: true` |
+| Push / PR | El agente **pregunta** antes de hacer push/PR, salvo `autoPush: true` |
 | Alcance funcional | Un "Claude Code lite": ver [Funcionalidades tipo Claude Code](#funcionalidades-tipo-claude-code) |
 | Red saliente | Todo el tráfico sale por un proxy propio. Modo por defecto **`ask`**: dominios fuera de la allowlist se preguntan al usuario |
-| Secretos | **Ninguno** dentro del contenedor del agente: `edge` los guarda y los inyecta (ADR-0006) |
+| Seguridad | Nivel de proyecto personal: contenedor + proxy de salida. Riesgos aceptados en ADR-0006 |
 
 ## Arquitectura
 
 ```
- Web UI / CLI / curl                                        internet
-        │  REST + SSE (Bearer token)                            ▲
-        ▼                                                       │
-┌──────────────────────────── edge (TS) — de confianza ─────────┴────┐
-│ :8080 API pública: valida el Bearer, sirve la web UI,              │
-│        aprobaciones y red (propias), y reenvía /session/* al       │
-│        gateway                                                     │
-│ :3128 proxy de salida (CONNECT + HTTP) con política y registro     │
-│ :8081 upstreams internos con credenciales inyectadas:              │
-│        /git (GitHub smart HTTP) /github (PR) /llm/<prov> /search   │
-│ Secretos: AGENT_API_TOKEN, GITHUB_TOKEN, API keys. Volumen propio. │
-└──────────────┬─────────────────────────────────▲───────────────────┘
-  red interna  │ /session/*                      │ proxy, git, LLM,
-  (sin salida) ▼                                 │ búsqueda, avisos
-┌───────────────────── agent (contenedor) — NO fiable ───────────────┐
-│ gateway (TS, Node) :8090, sin autenticación, no publicado          │
-│  · API de sesión + SSE · SessionManager (máx. 1 sesión)            │
-│  · checkpoints, diff y registro de tools                           │
-│  · RpcBridge ── spawn ──► pi --mode rpc (subproceso)               │
-│                              │ JSONL stdin/stdout                  │
-│                              ▼                                     │
-│                    Pi + extensiones propias:                       │
-│                     ask_user, git, todo, plan-mode, guard, web     │
-│ Toolchains (mise): Java+Maven/Gradle, Node+pnpm, Python+uv, Go     │
-│ /data/workspace  /data/sessions  /data/cache  (volumen)            │
-│ Sin secretos en el entorno ni en disco.                            │
-└────────────────────────────────────────────────────────────────────┘
+ Web UI / CLI / curl                                   internet
+        │  REST + SSE (Bearer token)                       ▲
+        ▼                                                  │ allowlist / ask
+┌─────────────────────────── edge (TS) ────────────────────┴─────┐
+│ · :8080 valida el Bearer y reenvía al gateway                  │
+│ · :3128 proxy de salida (CONNECT + HTTP) · registro + política │
+│ · decide las preguntas de red · única pieza con red externa    │
+└──────────────┬──────────────────────────────────▲──────────────┘
+  red interna  │ (sin salida a internet)          │ HTTPS_PROXY
+               ▼                                  │
+┌───────────────────────── agent (contenedor) ────┴──────────────┐
+│ gateway (TS, Node) :8090, solo en la red interna               │
+│  · API REST + SSE · sirve la web UI estática                   │
+│  · SessionManager (máx. 1 sesión activa)                       │
+│  · checkpoints, diff y registro de tools                       │
+│  · RpcBridge ── spawn ──► pi --mode rpc (subproceso)           │
+│                              │ JSONL stdin/stdout              │
+│                              ▼                                 │
+│                    Pi + extensiones propias:                   │
+│                     ask_user, git, todo, plan-mode, guard, web │
+│ Toolchains (mise): Java+Maven/Gradle, Node+pnpm, Python+uv, Go │
+│ /data/workspace  /data/sessions  /data/cache  (volumen)        │
+└────────────────────────────────────────────────────────────────┘
 ```
 
 ### Decisiones clave
@@ -64,16 +60,13 @@ ejecutar tests y subir los cambios. Se controla por API REST, una web UI sencill
 - **Una sesión por réplica** (ADR-0003). Escalar = más réplicas.
 - **Imagen única multi-arch** (`linux/amd64`, `linux/arm64`) con toolchains vía `mise`.
   Si el repo trae `.tool-versions`/`mise.toml`, se respetan.
-- **Proxy de salida propio** (ADR-0004). El agente está en una red interna sin salida.
-- **`edge` es la única pieza de confianza** (ADR-0006). Todo lo que corre en el contenedor
-  `agent` comparte usuario con un agente que puede estar bajo inyección de prompt, así que
-  ni guarda secretos ni decide nada relevante para la seguridad:
-  - `edge` valida el Bearer; el contenedor `agent` no conoce `AGENT_API_TOKEN`.
-  - `edge` guarda `GITHUB_TOKEN` y las API keys y los inyecta en *upstreams* internos
-    (`/git`, `/github`, `/llm/<proveedor>`, `/search`). No hace falta interceptar TLS.
-  - Las aprobaciones de **red** y de **push/PR** se crean, se responden y se aplican en
-    `edge`. Las preguntas que resuelve Pi (`ask_user`, plan) son ayudas de uso, no
-    barreras: un agente hostil podría contestárselas a sí mismo.
+- **GitHub con PAT fine-grained** limitado a los repos propios + `gh` CLI.
+- **Proxy de salida propio** (ADR-0004). El agente está en una red interna sin salida;
+  todo pasa por `edge`, que registra cada conexión y aplica la política.
+- **Seguridad proporcionada a un proyecto personal** (ADR-0006). `edge` se queda pequeño:
+  valida el Bearer y decide las preguntas de red, de modo que el agente no pueda abrirse
+  la red a sí mismo. El token de GitHub y las API keys siguen en el contenedor del agente
+  y las confirmaciones de push/PR son una ayuda, no una barrera; es un riesgo aceptado.
 - **El gateway observa; las extensiones solo aportan tools** (ADR-0007). Checkpoints, diff
   y registro de tools los hace el gateway a partir de los eventos RPC. Cuando una
   extensión necesita avisar al gateway usa `pi.appendEntry()`, que llega por RPC como
@@ -81,10 +74,9 @@ ejecutar tests y subir los cambios. Se controla por API REST, una web UI sencill
 
 ## API REST (borrador v1)
 
-Todo se sirve en `edge:8080`. Exige `Authorization: Bearer <AGENT_API_TOKEN>` salvo
-`GET /health` y los ficheros estáticos de la web UI.
+Se entra por `edge:8080`, que exige `Authorization: Bearer <AGENT_API_TOKEN>` salvo en
+`GET /health` y en los ficheros estáticos de la web UI, y reenvía al gateway.
 
-**Sesión** (edge reenvía al gateway):
 ```
 GET    /health
 GET    /models                          modelos/proveedores configurados
@@ -107,19 +99,12 @@ DELETE /session                         cierra y limpia el workspace. 409 si hay
                                         sin subir, salvo ?force=true
 ```
 
-**Aprobaciones y red** (los atiende `edge`, nunca llegan al gateway):
+Endpoints de red (los atiende `edge`, no el gateway):
 ```
-GET    /approvals                       aprobaciones pendientes
-POST   /approvals/:id                   {decision: "once"|"always"|"deny"}
-GET    /edge/events                     SSE: approval, approval_resolved, network
-GET    /network/log                     conexiones (host, puerto, decisión, bytes)
+GET    /network/log                     conexiones de la sesión (host, puerto, decisión, bytes)
 GET    /network/policy                  modo + allowlist/denylist efectivas
 PUT    /network/policy                  cambiar modo o listas
 ```
-
-`edge` lee el cuerpo de `POST /session` y `DELETE /session` al reenviarlos y guarda la
-política de la sesión (`repo`, `baseBranch`, `autoPush`). Así la política viene siempre
-del cliente autenticado y no de lo que diga el contenedor `agent`.
 
 Como hay una sesión por réplica, la API usa `/session` en singular. Un hub futuro
 expondría `/sessions/:id` y redirigiría a la réplica correspondiente.
@@ -133,17 +118,18 @@ expondría `/sessions/:id` y redirigiría a la réplica correspondiente.
 - Hasta la fase 4, un reinicio del contenedor pierde la sesión: el gateway arranca en
   `idle` y conserva el workspace anterior hasta que se crea una sesión nueva.
 
-**Eventos SSE de `/session/events`** (normalizados desde los eventos RPC de Pi):
+**Eventos SSE** (normalizados desde los eventos RPC de Pi y del proxy):
 `status`, `message_delta`, `thinking_delta`, `message`, `tool_start`, `tool_update`,
-`tool_end`, `question`, `question_resolved`, `todo`, `checkpoint`, `compaction`, `retry`,
-`notify`, `error`.
+`tool_end`, `question`, `question_resolved`, `network`, `todo`, `checkpoint`,
+`compaction`, `retry`, `notify`, `error`.
 - Pi solo envía deltas en `message_update`; el mensaje definitivo es el de `message_end`.
-- `question.kind`: `ask_user`, `confirm` o `plan` (opciones: *aprobar*, *pedir cambios*).
-  `extension_ui_request` no lleva metadatos, así que las extensiones marcan el tipo con un
+- `question.kind`: `ask_user`, `confirm` (push/PR), `plan` (*aprobar*, *pedir cambios*) o
+  `network` (*permitir esta vez*, *permitir siempre*, *denegar*).
+- `extension_ui_request` no lleva metadatos, así que las extensiones marcan el tipo con un
   prefijo en el título (`cna:<kind>:`), definido en `@cna/shared`; el gateway lo quita.
-
-**Eventos SSE de `/edge/events`:** `approval` (`kind`: `network`, `push` o `pr`),
-`approval_resolved`, `network` (una conexión registrada).
+- Las preguntas `network` las crea `edge` y las publica a través del gateway para que
+  salgan en el mismo flujo SSE. Su respuesta llega a `POST /session/answers/:id` como las
+  demás, pero `edge` la intercepta (ids con prefijo `net-`) y no la reenvía.
 
 La web UI no puede usar `EventSource` (no permite cabeceras): lee SSE con `fetch`.
 
@@ -157,11 +143,11 @@ repo sí se carga, como texto no fiable.
 | Extensión | Qué hace |
 |---|---|
 | `ask_user` | Tool `ask_user({question, options?, multiline?})`. Usa `ctx.ui.select` / `ctx.ui.input` / `ctx.ui.editor`; el gateway lo publica como `question{kind:"ask_user"}`. |
-| `git` | Tools `git_status`, `git_commit`, `git_push`, `create_pr`. El remoto es `http://edge:8081/git/<owner>/<repo>.git`; `create_pr` llama a `edge:8081/github`. La aprobación la pide `edge`: la tool solo espera el resultado. Ramas siempre `agent/<slug>`. |
+| `git` | Tools `git_status`, `git_commit`, `git_push`, `create_pr` (con `gh`). `git_push` y `create_pr` piden confirmación con `ctx.ui.confirm` salvo `autoPush: true`. Ramas siempre `agent/<slug>`; nunca push a la rama base. |
 | `todo` | Tool `todo` (crear/actualizar/completar). El estado va en `details` del resultado; el gateway lo lee de `tool_execution_end` y emite `todo`. Basada en `examples/extensions/todo.ts`. |
 | `plan-mode` | Con `mode: "plan"` (flag `--plan`) solo activa tools de lectura y añade `submit_plan`. El plan se presenta como `question{kind:"plan"}`; al aprobarlo se activan el resto de tools. Avisa del cambio de modo con `pi.appendEntry("cna.mode", …)`. Basada en `examples/extensions/plan-mode`. |
-| `guard` | Hook `tool_call` que bloquea comandos peligrosos evidentes (`rm -rf /`, `docker run`, `git push --force`…). Es una ayuda contra despistes del modelo, **no** una barrera de seguridad. |
-| `web` | Tools `web_search` (llama a `edge:8081/search`, que consulta SearXNG o Brave/Tavily) y `web_fetch` (descarga por el proxy y convierte a texto). El resultado se marca como contenido externo no fiable. |
+| `guard` | Hook `tool_call` que bloquea comandos peligrosos evidentes (`git push` directo por `bash`, `--force`, `rm -rf /`, `docker run`…). Es una ayuda contra despistes del modelo, no una barrera de seguridad. |
+| `web` | Tools `web_search` (SearXNG autoalojado o API tipo Brave/Tavily) y `web_fetch` (descarga y convierte a texto). El resultado se marca como contenido externo no fiable. Su tráfico pasa por el proxy como el resto. |
 
 No hay extensión `audit` ni `checkpoint`: lo hace el gateway (ADR-0007).
 
@@ -171,13 +157,13 @@ pregunta por dominios nuevos y la política de ramas y PR.
 
 ## Proveedores y modelos
 
-Fichero `config/providers.yaml`, **sin secretos**, montado en solo lectura en `edge` y
-`agent`. Las API keys son variables de entorno de `edge` únicamente.
+Fichero `config/providers.yaml` (montado como volumen/ConfigMap) que el gateway traduce
+a `models.json` de Pi al arrancar. Las API keys llegan por variables de entorno
+(`ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, …), que Pi ya reconoce.
 
 ```yaml
 default: ollama/qwen3-coder:30b               # o <proveedor>/<modelo> de los built-in de Pi
 providers:
-  anthropic: {}                               # built-in; la key vive en edge
   ollama:
     baseUrl: http://192.168.1.50:11434/v1     # Ollama en otra máquina
     api: openai-completions
@@ -186,12 +172,11 @@ providers:
         contextWindow: 65536                  # debe coincidir con el num_ctx de Ollama
 ```
 
-- El gateway genera `models.json` con cada proveedor apuntando a
-  `http://edge:8081/llm/<proveedor>` y `apiKey: "edge"` (Pi exige el campo aunque no se
-  use). Para los built-in basta con sobrescribir `baseUrl`.
-- `edge` reenvía a la URL real añadiendo la cabecera de autenticación del proveedor.
+- Pi exige `apiKey` también en proveedores que no la usan: el gateway pone un valor de
+  relleno si falta.
 - Para Ollama y similares, `compat.supportsDeveloperRole: false` y
   `compat.supportsReasoningEffort: false` por defecto, configurables.
+- Los hosts de los proveedores entran en la allowlist de red automáticamente.
 
 > En la Raspberry Pi 4 no es viable ejecutar un modelo útil con Ollama local:
 > Ollama debería correr en el MacBook u otra máquina de la red, o usar API keys.
@@ -204,9 +189,9 @@ providers:
 | 2 | **Modo plan** | 2 | Extensión `plan-mode`. Investiga en solo lectura, propone plan, espera aprobación y ejecuta. |
 | 3 | **Diff de cambios en la UI** | 2 (API), 3 (UI) | `GET /session/diff` (frente a la rama base o a un checkpoint); vista en la web y `cna diff`. |
 | 4 | **Checkpoints y deshacer** | 2 | El gateway crea un snapshot git al terminar cada ejecución con cambios. Restaura ficheros y, opcionalmente, la conversación (`fork` de Pi). |
-| 5 | **Notificaciones push** | 2 | Las envía `edge` (ntfy o Telegram) cuando hay una aprobación pendiente o cuando el gateway le avisa de que la sesión espera respuesta, termina o falla. `config/notifications.yaml`. |
+| 5 | **Notificaciones push** | 2 | El gateway avisa cuando la sesión pasa a `waiting_input`, termina o falla. Proveedor configurable: **ntfy** (autoalojable) o Telegram. `config/notifications.yaml`; el host entra en la allowlist automáticamente. |
 | 6 | **Instrucciones del proyecto** | 1 | Pi carga el `AGENTS.md`/`CLAUDE.md` del repo. Añadimos un `AGENTS.md` global en el directorio de configuración de Pi. |
-| 7 | **Trabajar sobre un PR existente** | 4 | `POST /session` con `pr: <número>`: checkout de la rama del PR; el agente lee los comentarios de revisión por `edge:8081/github` y los atiende. |
+| 7 | **Trabajar sobre un PR existente** | 4 | `POST /session` con `pr: <número>`: checkout de la rama del PR; el agente lee los comentarios de revisión con `gh` y los atiende; push a la misma rama. |
 | 8 | **Procesos en segundo plano** | Backlog | Tool `bash_bg` (`start`, `logs`, `stop`, `list`). Limitado a 1–2 procesos por la RAM de la Pi. |
 | 9 | **Tokens y coste por sesión** | 4 | `get_session_stats` de Pi expuesto en `GET /session/stats`. |
 | 10 | **Historial de sesiones** | 4 | Listar y retomar sesiones pasadas de la réplica. |
@@ -217,32 +202,29 @@ providers:
 - **MCP:** Pi 1.x ya lo soporta, pero cada servidor es un proceso más y más destinos de
   red que controlar. Se arranca con `--no-mcp`; queda en el backlog.
 - **Subagentes:** demasiado caros en memoria para una Raspberry Pi 4.
-- **Permisos por tool:** el contenedor, el proxy y las aprobaciones de `edge` cumplen ese
-  papel. Las únicas confirmaciones son push/PR, el plan y la red.
+- **Permisos por tool:** el contenedor y el proxy de salida cumplen ese papel. Las únicas confirmaciones son push/PR, el plan y la red.
 
-## Frontera de confianza y secretos
+## Seguridad: qué protege y qué no
 
-Detalle en ADR-0006.
+Detalle en ADR-0006. Es un proyecto personal: se busca contener errores del modelo y
+ver a dónde se conecta, no resistir a un atacante decidido.
 
-- **Qué es fiable:** `edge` y el cliente autenticado. **Qué no:** todo el contenedor
-  `agent` (gateway incluido), el contenido del repo y lo que llegue de la web.
-- **Upstream `/git`:** proxy inverso de GitHub smart HTTP para el repo de la sesión y
-  ningún otro. Inyecta el token. En `git-receive-pack` lee los comandos de refs (van en
-  claro al principio de la petición) y solo deja pasar actualizaciones de
-  `refs/heads/agent/*`: nada de la rama base, tags ni borrados. Antes de reenviar un push
-  pide una aprobación `push`, salvo `autoPush: true`.
-- **Upstream `/github`:** crear el PR (cabeza `agent/*`, base = rama base de la sesión;
-  aprobación `pr` salvo `autoPush`) y leer comentarios de un PR del repo de la sesión.
-  No se instala `gh` en la imagen.
-- **Upstreams `/llm/<proveedor>` y `/search`:** reenvío con la key inyectada.
-- **Permisos del PAT fine-grained:** *Contents* (lectura y escritura), *Pull requests*
-  (lectura y escritura), *Metadata* (lectura). Sin *Workflows*: GitHub rechazará los push
-  que toquen `.github/workflows`. Recomendado además un ruleset que proteja la rama base.
+- **Token de la API:** lo valida `edge`; el contenedor del agente no lo recibe.
+- **Red:** las preguntas `network` las decide `edge`, así que el agente no puede abrirse
+  la red a sí mismo. La política y el registro viven en el volumen de `edge`.
+- **GitHub y API keys:** siguen en el contenedor del agente. Por tanto las confirmaciones
+  de push/PR y la extensión `guard` frenan despistes, pero un agente bajo inyección de
+  prompt podría saltárselas. Se acota con:
+  - PAT fine-grained solo para los repos que se usen, con *Contents* y *Pull requests*
+    (lectura y escritura) y *Metadata* (lectura). Sin *Workflows*.
+  - Un ruleset en GitHub que proteja la rama base (recomendado; es la barrera real).
+  - Límite de gasto en las cuentas de los proveedores LLM.
+- **Clonado:** el token se pasa con el credential helper de `gh`, nunca en la URL del
+  remoto (quedaría en `.git/config`).
+- **Salida de tools:** el gateway sustituye los valores de los secretos conocidos antes
+  de publicar eventos o escribir logs.
 - **Identidad de los commits:** `CNA_GIT_USER_NAME` / `CNA_GIT_USER_EMAIL`.
 - **Colisión de rama:** si `agent/<slug>` ya existe en el remoto se añade un sufijo (`-2`, `-3`…).
-- **Limitación aceptada:** un dominio permitido que acepte subidas (un registry, GitHub
-  con un token ajeno, el propio proveedor LLM) sigue siendo un canal de exfiltración
-  posible. Los registries privados con credenciales quedan fuera de alcance.
 
 ## Control de red saliente (egress)
 
@@ -251,50 +233,48 @@ Detalle en ADR-0004.
 - **Topología (compose):** red `internal` (`internal: true`, sin salida) con `agent` y
   `edge`; red `external` solo con `edge`, que publica el `8080`.
 - **Proxy:** `CONNECT` sin interceptar TLS (se ve host y puerto, no URL ni contenido) y
-  proxy HTTP normal para peticiones `http://`. La política se aplica a **host y puerto**;
-  por defecto solo 80 y 443.
-- **Destinos internos:** se deniegan siempre, sin preguntar, los que resuelvan a
-  loopback, rangos privados, link-local o al propio `edge`. La comprobación se hace
-  sobre la IP ya resuelta, que es la que se usa para conectar. Ollama en la LAN no
-  necesita excepción porque se llega por `/llm/ollama`.
+  proxy HTTP normal para peticiones `http://` (p. ej. Ollama). La política se aplica a
+  **host y puerto**; por defecto solo 80 y 443.
+- **Destinos internos:** loopback, rangos privados, link-local y el propio `edge` se
+  deniegan sin preguntar, salvo los hosts de `providers.yaml` (Ollama en la LAN).
 - **Clientes:** `HTTPS_PROXY`/`HTTP_PROXY`/`NO_PROXY=edge,localhost`; `NODE_USE_ENV_PROXY=1`
   para el `fetch` de Node; `settings.xml` de Maven y `gradle.properties` con el proxy.
   Lo que ignore el proxy no tiene ruta de salida: **falla cerrado**.
 - **Modos:** `ask` (**por defecto**), `allowlist` y `audit`.
 - **Allowlist:** entradas `host[:puerto]`, con comodín solo como prefijo (`*.dominio`).
-  Base: descargas de GitHub (`github.com`, `codeload.github.com`,
+  Base: GitHub (`github.com`, `api.github.com`, `codeload.github.com`,
   `objects.githubusercontent.com`, `release-assets.githubusercontent.com`,
   `raw.githubusercontent.com`), registries (`registry.npmjs.org`, `pypi.org`,
   `files.pythonhosted.org`, `repo.maven.apache.org`, `repo1.maven.org`,
-  `plugins.gradle.org`, `proxy.golang.org`, `sum.golang.org`) y descargas de toolchains
+  `plugins.gradle.org`, `proxy.golang.org`, `sum.golang.org`), descargas de toolchains
   (`services.gradle.org`, `downloads.gradle.org`, `nodejs.org`, `go.dev`,
-  `dl.google.com`, `api.adoptium.net`, `mise.jdx.dev`). La lista exacta se cierra en la
-  fase 0 ejecutando cada stack en modo `audit`. Los proveedores LLM, el buscador y el
-  servicio de notificaciones **no** están: se llega a ellos solo a través de `edge`.
-- **Flujo `ask`:** `edge` retiene la conexión, crea una aprobación `network` (*permitir
-  esta vez*, *permitir siempre*, *denegar*) y espera. Sin respuesta en el timeout
+  `dl.google.com`, `api.adoptium.net`, `mise.jdx.dev`), los hosts de `providers.yaml`,
+  el buscador de `web_search` y el servicio de notificaciones. La lista exacta se cierra
+  en la fase 0 ejecutando cada stack en modo `audit`.
+- **Flujo `ask`:** `edge` retiene la conexión, crea una pregunta `network` y la envía al
+  gateway para que salga por SSE. La respuesta la recoge `edge` al pasar por la API.
+  *Permitir siempre* se persiste en el volumen de `edge`. Sin respuesta en el timeout
   (2 min por defecto) o sin sesión activa → **denegar**. Peticiones concurrentes al mismo
-  host y puerto comparten la misma aprobación.
-- **Persistencia:** *permitir siempre*, la política y el registro
-  (`network.jsonl`: timestamp, host, puerto, decisión, bytes, duración) viven en el
-  volumen de `edge`, fuera del alcance del agente.
+  host y puerto comparten la misma pregunta.
+- **Registro:** cada conexión (timestamp, host, puerto, decisión, bytes, duración) va a
+  `network.jsonl` en el volumen de `edge` y se emite como evento SSE `network`.
 - **Limitación aceptada:** la resolución DNS la hace Docker; la exfiltración por DNS es
   posible en teoría.
+- **Futuro:** inyección de credenciales en `edge` para que el agente no las vea.
 
 ## Contenedor
 
 - Base: `debian:bookworm-slim` + Node 22 LTS (≥ 22.21, por Pi y por `NODE_USE_ENV_PROXY`).
-- Paquetes: git, curl, ripgrep, fd, jq, build-essential, unzip.
+- Paquetes: git, gh, curl, ripgrep, fd, jq, build-essential, unzip.
 - `mise` con versiones LTS preinstaladas de Java (Temurin) + Maven + Gradle, Node + pnpm,
   Python + uv, Go.
-- Usuario `agent` (uid 1000), sin privilegios, todas las capabilities retiradas.
+- Usuario `agent` (uid 1000), sin privilegios.
 - Volumen `/data`: `workspace/`, `sessions/` (JSONL de Pi), `cache/` (Maven, Gradle, npm,
   uv, Go), `config/` (configuración de Pi generada), `logs/tools.jsonl`.
 - Pi: `PI_OFFLINE=1`, `PI_TELEMETRY=0`, `PI_SKIP_VERSION_CHECK=1`, `PI_CODING_AGENT_DIR`.
-- **Sin secretos:** las únicas variables sensibles (`AGENT_API_TOKEN`, `GITHUB_TOKEN`, API
-  keys, claves de búsqueda y notificaciones) se pasan solo a `edge`.
-- `edge`: imagen ligera de Node, usuario no root, volumen propio `/edge-data` (política,
-  registro de red, política de la sesión en curso). Incluye la web UI estática.
+- Variables: `GITHUB_TOKEN` y claves de proveedores. `AGENT_API_TOKEN` solo va a `edge`.
+- `edge`: imagen ligera de Node, usuario no root, volumen propio `/edge-data` (política
+  y registro de red).
 - Tamaño estimado del agente: 2–3 GB. Build multi-arch con `docker buildx`.
 
 ### Consideraciones Raspberry Pi 4 (8 GB)
@@ -310,12 +290,12 @@ packages/
   gateway/        API de sesión + SSE, SessionManager, RpcBridge, checkpoints, config
   extensions/     extensiones de Pi (ask_user, git, todo, plan-mode, guard, web) + prompt de sistema
   cli/            cliente de terminal
-  web/            web UI sencilla (estática, servida por edge)
-  edge/           API pública y autenticación, aprobaciones, proxy de salida, upstreams
+  web/            web UI sencilla (estática, servida por el gateway)
+  edge/           entrada con autenticación + proxy de salida con política
   shared/         tipos del protocolo API/eventos compartidos
 docker/
   Dockerfile        imagen del agente (gateway + Pi + toolchains)
-  Dockerfile.edge   imagen de edge (incluye la web UI)
+  Dockerfile.edge   imagen ligera de edge
 deploy/
   compose/        docker-compose.yml (1..N réplicas; SearXNG opcional con un profile)
   k8s/            manifiestos / kustomize para k3s/kind
@@ -332,40 +312,37 @@ Monorepo con npm workspaces, Node 22 LTS, TypeScript estricto, Hono (HTTP), zod 
 ### Fase 0 — Esqueleto y contenedores
 - Monorepo, tooling (tsconfig, biome, vitest), CI de GitHub Actions (lint + test + build de imágenes).
 - Dockerfile multi-arch con toolchains y Pi instalado. `docker compose up` arranca gateway y `edge`.
-- `edge` mínimo: API pública con Bearer y `/health`, reenvío al gateway, proxy
-  `CONNECT` + HTTP con registro y bloqueo de destinos internos, y la topología de redes.
-- Verificar que npm, pip/uv, Maven, Gradle, Go y mise funcionan a través del proxy, y
-  cerrar la allowlist base con el modo `audit`.
-- Test de la composición: el contenedor `agent` no recibe ninguna variable secreta.
+- `edge` mínimo: entrada con Bearer y `/health`, reenvío al gateway, proxy `CONNECT` +
+  HTTP con registro, y la topología de redes (el agente sin salida directa).
+- Verificar que npm, pip/uv, Maven, Gradle, Go, mise, git y gh funcionan a través del
+  proxy, y cerrar la allowlist base con el modo `audit`.
 
 ### Fase 1 — MVP conversacional (API)
 - RpcBridge: spawn de `pi --mode rpc`, parser JSONL conforme, correlación por `id`,
   diálogos de extensión. Reutiliza los tipos RPC que exporta Pi.
-- `edge`: upstreams `/llm/<proveedor>` y `/git` (clone y push con filtro de refs),
-  política de sesión leída de `POST /session`, aprobaciones (`/approvals`, `/edge/events`)
-  y modo `ask` con persistencia de *permitir siempre* y denegación por timeout.
-- SessionManager: clonar por `edge`, crear rama `agent/<slug>`, arrancar Pi en el workspace.
+- SessionManager: clonar repo, crear rama `agent/<slug>`, arrancar Pi en el workspace.
 - Endpoints `/session*` + SSE con replay; `GET /session/messages`; `PUT /session/model`.
 - Extensión `ask_user`; preguntas concurrentes y cancelación al abortar.
-- Configuración de proveedores (`providers.yaml` → `models.json`).
+- Configuración de proveedores (`providers.yaml` → `models.json`); sus hosts entran en la allowlist.
+- Política de red en `edge` con modo `ask`: pregunta `network` por SSE, respuesta
+  interceptada en `edge`, persistencia de *permitir siempre*, denegar por timeout.
 - Extensión `git` con `git_status`, `git_commit` y `git_push`: el MVP ya entrega una rama.
 - Prompt de sistema del entorno y `AGENTS.md` global (6).
-- Tests: unitarios del parser/bridge con un Pi falso; e2e con un modelo mock; política
-  de red y filtro de refs de `edge`.
+- Tests: unitarios del parser/bridge con un Pi falso; e2e con un modelo mock; política de red.
 
 ### Fase 2 — PR y funcionalidades
-- `create_pr` y upstream `/github`.
-- Extensiones `todo` (1), `plan-mode` (2), `guard` y `web` (con upstream `/search`).
+- `create_pr` con `gh`.
+- Extensiones `todo` (1), `plan-mode` (2), `guard` y `web`.
 - Endpoints `/network/*`.
 - Registro de tools, `GET /session/diff` (3) y checkpoints con restauración (4).
-- Notificaciones push desde `edge` (5).
+- Notificaciones push con ntfy/Telegram (5).
 
 ### Fase 3 — CLI y web UI
-- CLI: `cna run <repo> "<prompt>" [--plan]`, chat interactivo, responder preguntas y
-  aprobaciones, `cna status/diff/todos/abort/close`.
-- Web UI (servida por `edge`): formulario de nueva sesión, chat con streaming, tarjetas
-  de tool calls, diálogos de preguntas y de aprobaciones, checklist de tareas, vista de
-  diff con checkpoints, panel de conexiones de red, botón de abortar.
+- CLI: `cna run <repo> "<prompt>" [--plan]`, chat interactivo en terminal, responder preguntas,
+  `cna status/diff/todos/abort/close`.
+- Web UI: formulario de nueva sesión (modo plan/auto), chat con streaming, tarjetas de tool calls,
+  diálogo de preguntas (incluidas plan y red), checklist de tareas, vista de diff con
+  checkpoints, panel de conexiones de red, botón de abortar.
 
 ### Fase 4 — Persistencia y robustez
 - Reanudar sesión tras reinicio del contenedor (JSONL de Pi + estado en disco).
@@ -373,7 +350,7 @@ Monorepo con npm workspaces, Node 22 LTS, TypeScript estricto, Hono (HTTP), zod 
 - Trabajar sobre un PR existente (7), tokens y coste por sesión (9), historial de sesiones (10).
 
 ### Fase 5 — Kubernetes y múltiples réplicas
-- Manifiestos para k3s/kind (StatefulSet con PVC por réplica, Secret solo para `edge`, Service).
+- Manifiestos para k3s/kind (StatefulSet con PVC por réplica, Secret, Service).
 - `edge` como Deployment aparte + NetworkPolicy que solo permite salida del agente hacia
   `edge` (como sidecar no sirve: compartiría la red del pod y se podría esquivar).
 - Hub opcional: registro de réplicas, asignación de sesiones a réplicas libres, UI con todas las sesiones.
@@ -383,9 +360,10 @@ Monorepo con npm workspaces, Node 22 LTS, TypeScript estricto, Hono (HTTP), zod 
 - Comandos y skills en UI/CLI (11).
 - Imágenes en el prompt (12).
 - Servidores MCP.
+- Inyección de credenciales en `edge` (GitHub y API keys fuera del contenedor del agente).
 
 ## Fuera de alcance (por ahora)
 - Docker-in-Docker / servicios de apoyo (bases de datos para tests de integración, Testcontainers).
-- Multiusuario, GitLab/Gitea, registries privados con credenciales.
+- Multiusuario, GitLab/Gitea.
 - Exposición a internet (solo LAN o Tailscale).
 - Subagentes y permisos por tool (ver [descartado conscientemente](#funcionalidades-tipo-claude-code)).
