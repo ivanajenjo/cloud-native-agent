@@ -1,9 +1,15 @@
 import { existsSync } from "node:fs";
-import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
-import type { CreateSessionRequest, Question, SessionEvent, StreamEvent } from "@cna/shared";
+import type {
+  CreateSessionRequest,
+  Question,
+  SessionEvent,
+  StreamEvent,
+  TodoItem,
+} from "@cna/shared";
 import type { RpcExtensionUIRequest } from "@earendil-works/pi-coding-agent";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { EventLog } from "../src/events/event-log.js";
@@ -887,5 +893,381 @@ describe("SessionManager", () => {
     pi.emit({ type: "agent_start" });
     expect(h.events.lastId).toBe(before);
     expect(h.manager.get()?.status).toBe("running");
+  });
+
+  describe("checkpoints", () => {
+    const FIRST_TODOS: TodoItem[] = [{ id: 1, text: "Read the code", status: "in_progress" }];
+    const SECOND_TODOS: TodoItem[] = [
+      { id: 1, text: "Read the code", status: "completed" },
+      { id: 2, text: "Write the tests", status: "pending" },
+    ];
+
+    /** Fork messages (user messages Pi can fork from), as get_fork_messages lists them. */
+    function forkMessages(entryIds: string[]): Array<{ entryId: string; text: string }> {
+      return entryIds.map((entryId) => ({ entryId, text: `prompt ${entryId}` }));
+    }
+
+    function checkpointEvent(id: number, action: "created" | "restored") {
+      return (event: SessionEvent) =>
+        event.type === "checkpoint" && event.action === action && event.checkpoint.id === id;
+    }
+
+    function todoEnd(toolCallId: string, todos: TodoItem[]): RpcEvent {
+      return {
+        type: "tool_execution_end",
+        toolCallId,
+        toolName: "todo",
+        result: { content: [{ type: "text", text: "ok" }], details: { todos } },
+        isError: false,
+      };
+    }
+
+    it("takes checkpoint 0 after cloning, before Pi starts", async () => {
+      const h = harness();
+      await createAndRun(h);
+
+      const list = h.manager.checkpoints();
+      expect(list).toEqual([
+        {
+          id: 0,
+          commit: expect.stringMatching(/^[0-9a-f]{40}$/),
+          createdAt: expect.any(String),
+          reason: "start",
+        },
+      ]);
+      const events = h.events.since(0).events.map((stored) => stored.event);
+      expect(events).toContainEqual({ type: "checkpoint", action: "created", checkpoint: list[0] });
+      expect(events.findIndex((event) => event.type === "checkpoint")).toBeLessThan(
+        events.findIndex(isStatus("running")),
+      );
+
+      const ref = await realGit(["rev-parse", "refs/cna/checkpoints/0"], {
+        cwd: h.workspaceDir,
+      });
+      expect(ref.stdout.trim()).toBe(list[0]?.commit);
+    });
+
+    it("takes a checkpoint when a run settles with changes, and none when nothing changed", async () => {
+      const h = harness();
+      const pi = await createAndRun(h);
+      pi.responders.set("get_fork_messages", () => ({ messages: forkMessages(["e1"]) }));
+
+      await writeFile(join(h.workspaceDir, "README.md"), "changed\n");
+      pi.emit({ type: "agent_settled" });
+      await waitForEvent(h.events, checkpointEvent(1, "created"));
+      expect(h.events.since(0).events.map((stored) => stored.event)).toContainEqual({
+        type: "checkpoint",
+        action: "created",
+        checkpoint: expect.objectContaining({ id: 1, reason: "run" }),
+      });
+      expect(pi.send).toHaveBeenCalledWith({ type: "get_fork_messages" });
+
+      // postMessage waits for the queued checkpoint job: it is the barrier before the next settle.
+      await h.manager.postMessage({ text: "again" });
+      pi.emit({ type: "agent_settled" });
+      await h.manager.postMessage({ text: "once more" });
+
+      expect(h.manager.checkpoints().map((checkpoint) => checkpoint.id)).toEqual([0, 1]);
+    });
+
+    it("throws no_session without a session", async () => {
+      const h = harness();
+      expect(() => h.manager.checkpoints()).toThrow(SessionError);
+      let caught: unknown;
+      try {
+        h.manager.checkpoints();
+      } catch (error) {
+        caught = error;
+      }
+      expect(caught).toMatchObject({ code: "no_session" });
+      await expect(h.manager.restoreCheckpoint(0, { conversation: false })).rejects.toMatchObject({
+        code: "no_session",
+      });
+      await expect(h.manager.diff()).rejects.toMatchObject({ code: "no_session" });
+    });
+
+    it("restores the files to a checkpoint and keeps the later checkpoints", async () => {
+      const h = harness();
+      const pi = await createAndRun(h);
+      await writeFile(join(h.workspaceDir, "README.md"), "changed\n");
+      await writeFile(join(h.workspaceDir, "NEW.md"), "new\n");
+      pi.emit({ type: "agent_settled" });
+      await waitForEvent(h.events, checkpointEvent(1, "created"));
+
+      await writeFile(join(h.workspaceDir, "README.md"), "later\n");
+      await writeFile(join(h.workspaceDir, "LATER.md"), "later\n");
+
+      const response = await h.manager.restoreCheckpoint(0, { conversation: false });
+
+      expect(response).toEqual({
+        checkpoint: expect.objectContaining({ id: 0, reason: "start" }),
+        conversationRestored: false,
+      });
+      expect(await readFile(join(h.workspaceDir, "README.md"), "utf8")).toBe("hello\n");
+      expect(existsSync(join(h.workspaceDir, "NEW.md"))).toBe(false);
+      expect(existsSync(join(h.workspaceDir, "LATER.md"))).toBe(false);
+      expect(pi.send).not.toHaveBeenCalledWith(expect.objectContaining({ type: "fork" }));
+      expect(h.manager.checkpoints().map((checkpoint) => checkpoint.id)).toEqual([0, 1]);
+      expect(h.events.since(0).events.map((stored) => stored.event)).toContainEqual({
+        type: "checkpoint",
+        action: "restored",
+        checkpoint: expect.objectContaining({ id: 0 }),
+      });
+    });
+
+    it("restores the conversation with fork, drops the later checkpoints and the task list of the checkpoint", async () => {
+      const h = harness();
+      const pi = await createAndRun(h);
+      const entries = forkMessages(["e1"]);
+      pi.responders.set("get_fork_messages", () => ({ messages: entries }));
+      pi.responders.set("fork", () => ({ text: "prompt e2", cancelled: false }));
+      pi.emit(todoEnd("call-1", FIRST_TODOS));
+
+      await writeFile(join(h.workspaceDir, "README.md"), "one\n");
+      pi.emit({ type: "agent_settled" });
+      await waitForEvent(h.events, checkpointEvent(1, "created"));
+
+      entries.push(...forkMessages(["e2"]));
+      await h.manager.postMessage({ text: "second prompt" });
+      pi.emit(todoEnd("call-2", SECOND_TODOS));
+      await writeFile(join(h.workspaceDir, "README.md"), "two\n");
+      await writeFile(join(h.workspaceDir, "NEW.md"), "new\n");
+      pi.emit({ type: "agent_settled" });
+      await waitForEvent(h.events, checkpointEvent(2, "created"));
+
+      const response = await h.manager.restoreCheckpoint(1, { conversation: true });
+
+      expect(response).toEqual({
+        checkpoint: expect.objectContaining({ id: 1 }),
+        conversationRestored: true,
+      });
+      expect(pi.send).toHaveBeenCalledWith({ type: "fork", entryId: "e2" });
+      expect(h.manager.checkpoints().map((checkpoint) => checkpoint.id)).toEqual([0, 1]);
+      const refs = await realGit(["for-each-ref", "--format=%(refname)", "refs/cna/checkpoints/"], {
+        cwd: h.workspaceDir,
+      });
+      expect(refs.stdout.trim().split("\n")).toEqual([
+        "refs/cna/checkpoints/0",
+        "refs/cna/checkpoints/1",
+      ]);
+      expect(await readFile(join(h.workspaceDir, "README.md"), "utf8")).toBe("one\n");
+      expect(existsSync(join(h.workspaceDir, "NEW.md"))).toBe(false);
+
+      expect(h.manager.todos()).toEqual(FIRST_TODOS);
+      const todoEvents = h.events
+        .since(0)
+        .events.map((stored) => stored.event)
+        .filter((event) => event.type === "todo");
+      expect(todoEvents.at(-1)).toEqual({ type: "todo", todos: FIRST_TODOS });
+    });
+
+    it("does not fork when the conversation is already at the checkpoint", async () => {
+      const h = harness();
+      const pi = await createAndRun(h);
+      pi.responders.set("get_fork_messages", () => ({ messages: forkMessages(["e1"]) }));
+      await writeFile(join(h.workspaceDir, "README.md"), "one\n");
+      pi.emit({ type: "agent_settled" });
+      await waitForEvent(h.events, checkpointEvent(1, "created"));
+
+      const response = await h.manager.restoreCheckpoint(1, { conversation: true });
+
+      expect(response.conversationRestored).toBe(true);
+      expect(pi.send.mock.calls.map(([command]) => command.type)).not.toContain("fork");
+    });
+
+    it("refuses messages and another restore while a restore is in progress", async () => {
+      const h = harness();
+      const pi = await createAndRun(h);
+      pi.responders.set("get_fork_messages", () => ({ messages: forkMessages(["e1"]) }));
+      await writeFile(join(h.workspaceDir, "README.md"), "one\n");
+      pi.emit({ type: "agent_settled" });
+      await waitForEvent(h.events, checkpointEvent(1, "created"));
+
+      pi.responders.set("get_fork_messages", () => ({ messages: forkMessages(["e1", "e2"]) }));
+      let releaseFork: () => void = () => undefined;
+      pi.responders.set(
+        "fork",
+        () => new Promise((resolve) => (releaseFork = () => resolve({ cancelled: false }))),
+      );
+
+      const restoring = h.manager.restoreCheckpoint(0, { conversation: true });
+      await vi.waitFor(() => {
+        expect(pi.send.mock.calls.map(([command]) => command.type)).toContain("fork");
+      });
+
+      await expect(h.manager.postMessage({ text: "next" })).rejects.toMatchObject({
+        code: "invalid_state",
+      });
+      await expect(h.manager.restoreCheckpoint(1, { conversation: false })).rejects.toMatchObject({
+        code: "invalid_state",
+      });
+
+      releaseFork();
+      await expect(restoring).resolves.toMatchObject({ conversationRestored: true });
+      await expect(h.manager.postMessage({ text: "next" })).resolves.toEqual({
+        disposition: "started",
+      });
+    });
+
+    it("leaves the files alone when Pi cancels the fork", async () => {
+      const h = harness();
+      const pi = await createAndRun(h);
+      pi.responders.set("get_fork_messages", () => ({ messages: forkMessages(["e1"]) }));
+      await writeFile(join(h.workspaceDir, "README.md"), "one\n");
+      pi.emit({ type: "agent_settled" });
+      await waitForEvent(h.events, checkpointEvent(1, "created"));
+
+      pi.responders.set("get_fork_messages", () => ({ messages: forkMessages(["e1", "e2"]) }));
+      pi.responders.set("fork", () => ({ cancelled: true }));
+
+      await expect(h.manager.restoreCheckpoint(0, { conversation: true })).rejects.toMatchObject({
+        code: "invalid_state",
+        message: "fork cancelled",
+      });
+      expect(await readFile(join(h.workspaceDir, "README.md"), "utf8")).toBe("one\n");
+      expect(h.manager.checkpoints().map((checkpoint) => checkpoint.id)).toEqual([0, 1]);
+    });
+
+    it("refuses a conversation restore when the position of the checkpoint is unknown", async () => {
+      const h = harness();
+      const pi = await createAndRun(h);
+      // No responder for get_fork_messages: Pi gives no list, so the checkpoint has no position.
+      await writeFile(join(h.workspaceDir, "README.md"), "one\n");
+      pi.emit({ type: "agent_settled" });
+      await waitForEvent(h.events, checkpointEvent(1, "created"));
+
+      await expect(h.manager.restoreCheckpoint(1, { conversation: true })).rejects.toMatchObject({
+        code: "invalid_state",
+        message: "the conversation position of this checkpoint is unknown",
+      });
+      expect(await readFile(join(h.workspaceDir, "README.md"), "utf8")).toBe("one\n");
+    });
+
+    it("refuses a restore while the session is running, and an unknown checkpoint", async () => {
+      const h = harness();
+      const pi = await createAndRun(h);
+
+      await expect(h.manager.restoreCheckpoint(0, { conversation: false })).rejects.toMatchObject({
+        code: "invalid_state",
+      });
+
+      pi.emit({ type: "agent_settled" });
+      await expect(h.manager.restoreCheckpoint(99, { conversation: false })).rejects.toMatchObject({
+        code: "checkpoint_not_found",
+      });
+    });
+
+    it("diffs the working tree against the base branch, with the status of each file", async () => {
+      const h = harness();
+      await createAndRun(h);
+      await writeFile(join(h.workspaceDir, "README.md"), "changed\n");
+      await writeFile(join(h.workspaceDir, "NEW.md"), "new\n");
+
+      const diff = await h.manager.diff();
+
+      const base = await realGit(["rev-parse", "HEAD"], { cwd: join(root, "source") });
+      expect(diff.from).toEqual({ kind: "base", branch: "main", commit: base.stdout.trim() });
+      expect(diff.files).toHaveLength(2);
+      expect(diff.files).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({
+            path: "README.md",
+            status: "modified",
+            additions: 1,
+            deletions: 1,
+          }),
+          expect.objectContaining({ path: "NEW.md", status: "added", additions: 1, deletions: 0 }),
+        ]),
+      );
+      expect(diff.patch).toContain("+changed");
+      expect(diff.truncated).toBe(false);
+    });
+
+    it("diffs against a checkpoint when one is given", async () => {
+      const h = harness();
+      await createAndRun(h);
+      await writeFile(join(h.workspaceDir, "README.md"), "changed\n");
+
+      const diff = await h.manager.diff(0);
+
+      expect(diff.from).toEqual({
+        kind: "checkpoint",
+        id: 0,
+        commit: h.manager.checkpoints()[0]?.commit,
+      });
+      expect(diff.files.map((file) => file.path)).toEqual(["README.md"]);
+    });
+
+    it("refuses a diff against an unknown checkpoint, and while the workspace is cloning", async () => {
+      const h = harness();
+      const creating = h.manager.create(REQUEST);
+
+      await expect(h.manager.diff()).rejects.toMatchObject({ code: "invalid_state" });
+      await creating;
+      await waitForEvent(h.events, isStatus("running"));
+
+      await expect(h.manager.diff(42)).rejects.toMatchObject({ code: "checkpoint_not_found" });
+    });
+
+    it("redacts secrets in the diff patch", async () => {
+      const h = harness();
+      await createAndRun(h);
+      await writeFile(join(h.workspaceDir, "NOTES.md"), `token ${SECRET}\n`);
+
+      const diff = await h.manager.diff();
+
+      expect(diff.patch).not.toContain(SECRET);
+      expect(diff.patch).toContain("+token [REDACTED]");
+    });
+
+    it("postMessage waits for the checkpoint being taken, so the next prompt is not counted in it", async () => {
+      let slowSnapshot = false;
+      let snapshotStarted!: () => void;
+      const started = new Promise<void>((resolve) => {
+        snapshotStarted = resolve;
+      });
+      let releaseSnapshot!: () => void;
+      const gate = new Promise<void>((resolve) => {
+        releaseSnapshot = resolve;
+      });
+      const h = harness((real) => async (args, options) => {
+        if (slowSnapshot && args[0] === "write-tree") {
+          snapshotStarted();
+          await gate;
+        }
+        return real(args, options);
+      });
+      const pi = await createAndRun(h);
+      pi.responders.set("get_fork_messages", () => ({ messages: forkMessages(["e1"]) }));
+      await writeFile(join(h.workspaceDir, "README.md"), "changed\n");
+
+      slowSnapshot = true;
+      pi.emit({ type: "agent_settled" });
+      await started;
+
+      const posting = h.manager.postMessage({ text: "next" });
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      expect(pi.send).not.toHaveBeenCalledWith({ type: "prompt", message: "next" });
+
+      releaseSnapshot();
+      await expect(posting).resolves.toEqual({ disposition: "started" });
+      expect(pi.send).toHaveBeenCalledWith({ type: "prompt", message: "next" });
+      expect(h.manager.checkpoints().map((checkpoint) => checkpoint.id)).toEqual([0, 1]);
+    });
+
+    it("keeps the session going, without a checkpoint 0, when the first snapshot fails", async () => {
+      const h = harness((real) => async (args, options) => {
+        if (args[0] === "commit-tree" && args.includes("cna checkpoint 0")) {
+          throw new Error("disk full");
+        }
+        return real(args, options);
+      });
+
+      await createAndRun(h);
+
+      expect(h.manager.get()?.status).toBe("running");
+      expect(h.manager.checkpoints()).toEqual([]);
+      expect(h.logs).toContainEqual(expect.stringContaining("checkpoint 0: disk full"));
+    });
   });
 });

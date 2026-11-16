@@ -1,4 +1,6 @@
 import type {
+  Checkpoint,
+  DiffResponse,
   ModelsResponse,
   PiMessage,
   Question,
@@ -41,6 +43,20 @@ const NETWORK_QUESTION: Question = {
   network: { host: "example.com", port: 443 },
 };
 
+const CHECKPOINT: Checkpoint = {
+  id: 2,
+  commit: "a".repeat(40),
+  createdAt: "2026-11-16T10:00:00.000Z",
+  reason: "run",
+};
+
+const DIFF: DiffResponse = {
+  from: { kind: "base", branch: "main", commit: "b".repeat(40) },
+  files: [{ path: "README.md", status: "modified", additions: 1, deletions: 1 }],
+  patch: "@@ -1 +1 @@\n-hello\n+changed\n",
+  truncated: false,
+};
+
 const NETWORK_ENTRY = {
   ts: "2026-11-16T10:00:00.000Z",
   method: "CONNECT" as const,
@@ -63,6 +79,12 @@ function fakeSession(overrides: Partial<SessionService> = {}) {
     setModel: vi.fn(async () => {}),
     abort: vi.fn(async () => {}),
     messages: vi.fn(async (): Promise<PiMessage[]> => []),
+    checkpoints: vi.fn((): Checkpoint[] => [CHECKPOINT]),
+    restoreCheckpoint: vi.fn(async (id: number, options: { conversation: boolean }) => ({
+      checkpoint: { ...CHECKPOINT, id },
+      conversationRestored: options.conversation,
+    })),
+    diff: vi.fn(async (): Promise<DiffResponse> => DIFF),
     close: vi.fn(async () => {}),
     publishNetworkQuestion: vi.fn(() => true),
     resolveNetworkQuestion: vi.fn(() => true),
@@ -570,6 +592,180 @@ describe("internal routes", () => {
 
     expect(res.status).toBe(204);
     expect(session.publishNetworkEntry).toHaveBeenCalledWith(NETWORK_ENTRY);
+  });
+});
+
+describe("GET /session/checkpoints", () => {
+  it("answers 200 with { checkpoints } from checkpoints()", async () => {
+    const { app, session } = build();
+
+    const res = await app.request("/session/checkpoints");
+
+    expect(res.status).toBe(200);
+    expect(await res.json()).toEqual({ checkpoints: [CHECKPOINT] });
+    expect(session.checkpoints).toHaveBeenCalledOnce();
+  });
+
+  it("answers 404 no_session when there is no session", async () => {
+    const session = fakeSession({
+      checkpoints: vi.fn(() => {
+        throw new SessionError("no_session");
+      }),
+    });
+    const app = createApp({ version: "1", session, events: new EventLog(), models: () => MODELS });
+
+    const res = await app.request("/session/checkpoints");
+
+    expect(res.status).toBe(404);
+    expect(await res.json()).toEqual({ error: "no_session", message: "no_session" });
+  });
+});
+
+describe("POST /session/checkpoints/:id/restore", () => {
+  it("answers 200 and passes the id and the conversation flag", async () => {
+    const { app, session } = build();
+
+    const res = await app.request(
+      "/session/checkpoints/3/restore",
+      jsonRequest("POST", { conversation: true }),
+    );
+
+    expect(res.status).toBe(200);
+    expect(await res.json()).toEqual({
+      checkpoint: { ...CHECKPOINT, id: 3 },
+      conversationRestored: true,
+    });
+    expect(session.restoreCheckpoint).toHaveBeenCalledWith(3, { conversation: true });
+  });
+
+  it("treats an empty body as { conversation: false } (files only)", async () => {
+    const { app, session } = build();
+
+    const withoutBody = await app.request("/session/checkpoints/0/restore", { method: "POST" });
+    const blankBody = await app.request("/session/checkpoints/0/restore", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: "  ",
+    });
+
+    expect(withoutBody.status).toBe(200);
+    expect(blankBody.status).toBe(200);
+    expect(session.restoreCheckpoint).toHaveBeenNthCalledWith(1, 0, { conversation: false });
+    expect(session.restoreCheckpoint).toHaveBeenNthCalledWith(2, 0, { conversation: false });
+  });
+
+  it("answers 400 for an id that is not a canonical non-negative integer", async () => {
+    const { app, session } = build();
+
+    for (const id of ["abc", "01", "-1", "1.5"]) {
+      const res = await app.request(`/session/checkpoints/${id}/restore`, { method: "POST" });
+      expect(res.status).toBe(400);
+      expect(((await res.json()) as { error: string }).error).toBe("invalid_request");
+    }
+    expect(session.restoreCheckpoint).not.toHaveBeenCalled();
+  });
+
+  it("answers 400 for a body that does not match the schema or is not JSON", async () => {
+    const { app, session } = build();
+
+    const wrongType = await app.request(
+      "/session/checkpoints/1/restore",
+      jsonRequest("POST", { conversation: "x" }),
+    );
+    const extraField = await app.request(
+      "/session/checkpoints/1/restore",
+      jsonRequest("POST", { conversation: true, force: true }),
+    );
+    const notJson = await app.request("/session/checkpoints/1/restore", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: "{not json",
+    });
+
+    expect(wrongType.status).toBe(400);
+    expect(extraField.status).toBe(400);
+    expect(notJson.status).toBe(400);
+    expect(session.restoreCheckpoint).not.toHaveBeenCalled();
+  });
+
+  it("answers 404 checkpoint_not_found when the service throws it", async () => {
+    const session = fakeSession({
+      restoreCheckpoint: vi.fn(async () => {
+        throw new SessionError("checkpoint_not_found");
+      }),
+    });
+    const app = createApp({ version: "1", session, events: new EventLog(), models: () => MODELS });
+
+    const res = await app.request("/session/checkpoints/9/restore", { method: "POST" });
+
+    expect(res.status).toBe(404);
+    expect(await res.json()).toEqual({
+      error: "checkpoint_not_found",
+      message: "checkpoint_not_found",
+    });
+  });
+
+  it("answers 409 invalid_state when the service throws it", async () => {
+    const session = fakeSession({
+      restoreCheckpoint: vi.fn(async () => {
+        throw new SessionError("invalid_state", "fork cancelled");
+      }),
+    });
+    const app = createApp({ version: "1", session, events: new EventLog(), models: () => MODELS });
+
+    const res = await app.request("/session/checkpoints/1/restore", { method: "POST" });
+
+    expect(res.status).toBe(409);
+    expect(await res.json()).toEqual({ error: "invalid_state", message: "fork cancelled" });
+  });
+});
+
+describe("GET /session/diff", () => {
+  it("answers 200 with the diff against the base branch when there is no checkpoint", async () => {
+    const { app, session } = build();
+
+    const res = await app.request("/session/diff");
+
+    expect(res.status).toBe(200);
+    expect(await res.json()).toEqual(DIFF);
+    expect(session.diff).toHaveBeenCalledWith(undefined);
+  });
+
+  it("passes the checkpoint id of ?checkpoint=", async () => {
+    const { app, session } = build();
+
+    const res = await app.request("/session/diff?checkpoint=0");
+
+    expect(res.status).toBe(200);
+    expect(session.diff).toHaveBeenCalledWith(0);
+  });
+
+  it("answers 400 for a checkpoint that is not a canonical non-negative integer", async () => {
+    const { app, session } = build();
+
+    for (const value of ["x", "01", "", "-2"]) {
+      const res = await app.request(`/session/diff?checkpoint=${value}`);
+      expect(res.status).toBe(400);
+      expect(((await res.json()) as { error: string }).error).toBe("invalid_request");
+    }
+    expect(session.diff).not.toHaveBeenCalled();
+  });
+
+  it("answers 404 checkpoint_not_found when the service throws it", async () => {
+    const session = fakeSession({
+      diff: vi.fn(async () => {
+        throw new SessionError("checkpoint_not_found");
+      }),
+    });
+    const app = createApp({ version: "1", session, events: new EventLog(), models: () => MODELS });
+
+    const res = await app.request("/session/diff?checkpoint=7");
+
+    expect(res.status).toBe(404);
+    expect(await res.json()).toEqual({
+      error: "checkpoint_not_found",
+      message: "checkpoint_not_found",
+    });
   });
 });
 

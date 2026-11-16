@@ -1,13 +1,16 @@
 import type {
   AnswerRequest,
   ApiErrorCode,
+  Checkpoint,
   CreateSessionRequest,
+  DiffResponse,
   NetworkLogEntry,
   PiMessage,
   PostMessageRequest,
   PostMessageResponse,
   Question,
   QuestionOutcome,
+  RestoreCheckpointResponse,
   SessionInfo,
   SetModelRequest,
   TodoItem,
@@ -15,8 +18,9 @@ import type {
 
 /**
  * Error raised by the session service. The HTTP layer maps `code` to a status:
- * no_session → 404, question_not_found → 404, session_exists → 409, invalid_state → 409,
- * question_resolved → 409, invalid_request → 400, mode_not_supported → 400, unknown_model → 400.
+ * no_session → 404, question_not_found → 404, checkpoint_not_found → 404, session_exists → 409,
+ * invalid_state → 409, question_resolved → 409, invalid_request → 400, mode_not_supported → 400,
+ * unknown_model → 400.
  * `message` must be safe to show to the client (no secrets).
  */
 export class SessionError extends Error {
@@ -72,6 +76,27 @@ export interface SessionService {
 
   /** Full conversation from Pi (`get_messages`), redacted. Throws no_session; invalid_state if Pi is not running. */
   messages(): Promise<PiMessage[]>;
+
+  /** Checkpoints of the session, oldest first (copies). Throws no_session. */
+  checkpoints(): Checkpoint[];
+
+  /**
+   * Restores the working tree to checkpoint `id`; with `conversation` also the conversation (Pi `fork`).
+   * Throws no_session; invalid_state if the status is not ready, if the conversation position is unknown,
+   * if Pi cancels the fork (the files are then not touched), or on a git or Pi failure;
+   * checkpoint_not_found if there is no such checkpoint.
+   */
+  restoreCheckpoint(
+    id: number,
+    options: { conversation: boolean },
+  ): Promise<RestoreCheckpointResponse>;
+
+  /**
+   * Diff of the working tree against the base branch (`checkpointId` undefined) or against a checkpoint.
+   * Throws no_session; invalid_state while cloning, without base branch or branch, or on a git failure;
+   * checkpoint_not_found if the checkpoint does not exist. The patch and the file names are redacted.
+   */
+  diff(checkpointId?: number): Promise<DiffResponse>;
 
   /**
    * Stops Pi, deletes the workspace and marks the session closed (get() returns null afterwards).

@@ -3,7 +3,10 @@ import { rm } from "node:fs/promises";
 import {
   ACTIVE_SESSION_STATUSES,
   type AnswerRequest,
+  type Checkpoint,
   type CreateSessionRequest,
+  type DiffResponse,
+  type DiffSource,
   NETWORK_QUESTION_ID_PREFIX,
   type NetworkLogEntry,
   type PiMessage,
@@ -12,6 +15,7 @@ import {
   type PromptDisposition,
   type Question,
   type QuestionOutcome,
+  type RestoreCheckpointResponse,
   type SessionEvent,
   type SessionInfo,
   type SessionStatus,
@@ -34,7 +38,21 @@ import {
   type RpcEvent,
   type RpcExit,
 } from "../rpc/bridge.js";
-import { type GitRunner, prepareWorkspace, slugify, workspaceState } from "../workspace/git.js";
+import {
+  GitError,
+  type GitRunner,
+  prepareWorkspace,
+  slugify,
+  workspaceState,
+} from "../workspace/git.js";
+import {
+  deleteCheckpointRefsAfter,
+  diffWorkingTree,
+  mergeBaseWith,
+  restoreWorkingTree,
+  saveCheckpointRef,
+  snapshotWorkingTree,
+} from "../workspace/snapshot.js";
 import { normalizeRpcEvent, uiRequestToNotify, uiRequestToQuestion } from "./normalize.js";
 import { PendingQuestions } from "./pending-questions.js";
 import { answerToUiResponse, outcomeOfAnswer } from "./questions.js";
@@ -88,6 +106,17 @@ const MAX_LOGGED_LINE_LENGTH = 500;
 const PROMPT_DISPOSITIONS: readonly PromptDisposition[] = ["started", "queued", "handled"];
 const MESSAGE_STATUSES: readonly SessionStatus[] = ["running", "waiting_input", "ready"];
 
+/** A checkpoint plus what restoring its conversation needs (ADR-0007, point 3). */
+interface CheckpointRecord {
+  checkpoint: Checkpoint;
+  /** Tree sha of the snapshot: a run that changed nothing gets no checkpoint. */
+  tree: string;
+  /** Index, in get_fork_messages, of the user message that follows the checkpoint. -1 = unknown. */
+  forkIndex: number;
+  /** Task list at the checkpoint. */
+  todos: TodoItem[];
+}
+
 /**
  * The single session of this replica (ADR-0003): clones the repo, runs Pi in RPC mode on it,
  * turns Pi's events into SSE events and keeps the state machine of the session.
@@ -122,6 +151,12 @@ export class SessionManager implements SessionService {
    * so a new clone must not start while the previous one (of a closed session) still writes.
    */
   private workspaceQueue: Promise<void> = Promise.resolve();
+  /** Checkpoints of the current session, oldest first. Reset by create() and close(). */
+  private checkpointList: CheckpointRecord[] = [];
+  /** Run checkpoints are chained here, and so are the requests that need them. Never rejects. */
+  private checkpointQueue: Promise<void> = Promise.resolve();
+  /** True while a checkpoint is being restored: no new prompt or restore may start meanwhile. */
+  private restoring = false;
 
   constructor(options: SessionManagerOptions) {
     this.options = options;
@@ -168,6 +203,8 @@ export class SessionManager implements SessionService {
     // A new session starts with an empty replay buffer, also after a close (ids keep growing).
     this.events.clear();
     this.todoList = [];
+    this.checkpointList = [];
+    this.checkpointQueue = Promise.resolve();
 
     const info: SessionInfo = {
       id: this.newId(),
@@ -215,6 +252,11 @@ export class SessionManager implements SessionService {
     const pi = this.pi;
     if (pi === null || !MESSAGE_STATUSES.includes(info.status)) {
       throw new SessionError("invalid_state");
+    }
+    // A checkpoint being taken must not count the message sent next (its forkIndex).
+    await this.checkpointQueue;
+    if (this.restoring) {
+      throw new SessionError("invalid_state", "a checkpoint is being restored");
     }
 
     const command: RpcCommandInput = this.settled
@@ -342,6 +384,122 @@ export class SessionManager implements SessionService {
     return this.redactor.redact(messages);
   }
 
+  checkpoints(): Checkpoint[] {
+    if (this.info === null) {
+      throw new SessionError("no_session");
+    }
+    return this.checkpointList.map((record) => ({ ...record.checkpoint }));
+  }
+
+  /**
+   * Restores the working tree to a checkpoint and, with `conversation`, also the conversation (Pi
+   * `fork`). The conversation is forked first: a fork that fails or is cancelled leaves the files alone.
+   * Throws no_session, invalid_state (not ready, unknown conversation position, fork cancelled, git or
+   * Pi failure) and checkpoint_not_found.
+   */
+  async restoreCheckpoint(
+    id: number,
+    options: { conversation: boolean },
+  ): Promise<RestoreCheckpointResponse> {
+    const started = this.info;
+    if (started === null) {
+      throw new SessionError("no_session");
+    }
+    await this.checkpointQueue;
+    if (!this.isCurrent(started.id)) {
+      throw new SessionError("no_session");
+    }
+    if (started.status !== "ready") {
+      throw new SessionError(
+        "invalid_state",
+        "checkpoints can only be restored when the session is ready",
+      );
+    }
+    const record = this.checkpointList.find((item) => item.checkpoint.id === id);
+    if (record === undefined) {
+      throw new SessionError("checkpoint_not_found");
+    }
+    if (this.restoring) {
+      throw new SessionError("invalid_state", "a checkpoint is being restored");
+    }
+
+    const git = this.options.git;
+    const dir = this.options.workspaceDir;
+    this.restoring = true;
+    try {
+      if (options.conversation) {
+        await this.forkToCheckpoint(record);
+      }
+      await restoreWorkingTree(git, dir, record.checkpoint.commit);
+      if (options.conversation) {
+        await deleteCheckpointRefsAfter(git, dir, id);
+        this.checkpointList = this.checkpointList.filter((item) => item.checkpoint.id <= id);
+        this.todoList = record.todos.map((item) => ({ ...item }));
+        this.emit({ type: "todo", todos: this.todoList });
+      }
+    } catch (error) {
+      if (error instanceof GitError || error instanceof RpcCommandError) {
+        throw new SessionError("invalid_state", this.redactor.redactString(errorMessage(error)));
+      }
+      throw error;
+    } finally {
+      this.restoring = false;
+    }
+
+    this.emit({ type: "checkpoint", action: "restored", checkpoint: { ...record.checkpoint } });
+    return {
+      checkpoint: { ...record.checkpoint },
+      conversationRestored: options.conversation,
+    };
+  }
+
+  /**
+   * Lists the working tree against the base branch (`from.kind` "base") or against a checkpoint.
+   * Throws no_session, invalid_state (session still cloning, or no base/branch yet, or git failure)
+   * and checkpoint_not_found.
+   */
+  async diff(checkpointId?: number): Promise<DiffResponse> {
+    const info = this.info;
+    if (info === null) {
+      throw new SessionError("no_session");
+    }
+    const baseBranch = info.baseBranch;
+    if (info.status === "cloning" || baseBranch === null || info.branch === null) {
+      throw new SessionError("invalid_state", "the workspace is not ready for a diff");
+    }
+
+    const git = this.options.git;
+    const dir = this.options.workspaceDir;
+    try {
+      let from: DiffSource;
+      if (checkpointId === undefined) {
+        from = {
+          kind: "base",
+          branch: baseBranch,
+          commit: await mergeBaseWith(git, dir, baseBranch),
+        };
+      } else {
+        const record = this.checkpointList.find((item) => item.checkpoint.id === checkpointId);
+        if (record === undefined) {
+          throw new SessionError("checkpoint_not_found");
+        }
+        from = { kind: "checkpoint", id: checkpointId, commit: record.checkpoint.commit };
+      }
+      const result = await diffWorkingTree(git, dir, from.commit);
+      return {
+        from,
+        files: this.redactor.redact(result.files),
+        patch: this.redactor.redactString(result.patch),
+        truncated: result.truncated,
+      };
+    } catch (error) {
+      if (error instanceof GitError) {
+        throw new SessionError("invalid_state", this.redactor.redactString(errorMessage(error)));
+      }
+      throw error;
+    }
+  }
+
   async close(options: { force: boolean }): Promise<void> {
     const info = this.info;
     if (info === null || this.closing) {
@@ -361,6 +519,8 @@ export class SessionManager implements SessionService {
       await rm(this.options.workspaceDir, { recursive: true, force: true });
       this.setStatus("closed");
       this.info = null;
+      this.checkpointList = [];
+      this.checkpointQueue = Promise.resolve();
     } finally {
       this.closing = false;
     }
@@ -423,6 +583,13 @@ export class SessionManager implements SessionService {
       info.baseBranch = prepared.baseBranch;
       info.branch = prepared.branch;
 
+      await this.createStartCheckpoint(sessionId);
+      if (this.current(sessionId) === null) {
+        // Closed while taking the first checkpoint: Pi must not start.
+        await this.removeWorkspaceQuietly();
+        return;
+      }
+
       const spec = buildPiLaunch({
         ...this.options.pi,
         cwd: this.options.workspaceDir,
@@ -446,6 +613,115 @@ export class SessionManager implements SessionService {
       }
     } catch (error) {
       await this.failStart(sessionId, error);
+    }
+  }
+
+  /** Checkpoint 0 right after cloning, before Pi starts. A failure is logged and the session goes on. */
+  private async createStartCheckpoint(sessionId: string): Promise<void> {
+    const git = this.options.git;
+    const dir = this.options.workspaceDir;
+    try {
+      const { commit, tree } = await snapshotWorkingTree(git, dir, "cna checkpoint 0");
+      await saveCheckpointRef(git, dir, 0, commit);
+      if (!this.isCurrent(sessionId)) {
+        return;
+      }
+      const checkpoint: Checkpoint = {
+        id: 0,
+        commit,
+        createdAt: this.now().toISOString(),
+        reason: "start",
+      };
+      // The conversation is empty: the first user message is fork index 0.
+      this.checkpointList.push({ checkpoint, tree, forkIndex: 0, todos: [] });
+      this.emit({ type: "checkpoint", action: "created", checkpoint: { ...checkpoint } });
+    } catch (error) {
+      this.logger.error(`checkpoint 0: ${this.redactor.redactString(errorMessage(error))}`);
+    }
+  }
+
+  /** Queues the checkpoint of the run that just settled, after the jobs already queued. Never rejects. */
+  private enqueueRunCheckpoint(sessionId: string): void {
+    const job = this.checkpointQueue.then(() => this.createRunCheckpoint(sessionId));
+    this.checkpointQueue = job.catch(() => undefined);
+  }
+
+  /** Creates a checkpoint if the working tree changed since the last one. Errors are logged. */
+  private async createRunCheckpoint(sessionId: string): Promise<void> {
+    const pi = this.pi;
+    if (!this.isCurrent(sessionId) || pi === null) {
+      return;
+    }
+    const git = this.options.git;
+    const dir = this.options.workspaceDir;
+    try {
+      const { commit, tree } = await snapshotWorkingTree(git, dir, "cna checkpoint");
+      const last = this.checkpointList.at(-1);
+      if (last !== undefined && last.tree === tree) {
+        return;
+      }
+      const id = last === undefined ? 0 : last.checkpoint.id + 1;
+      await saveCheckpointRef(git, dir, id, commit);
+      const forkIndex = await this.countForkEntries(pi);
+      if (!this.isCurrent(sessionId)) {
+        return;
+      }
+      const checkpoint: Checkpoint = {
+        id,
+        commit,
+        createdAt: this.now().toISOString(),
+        reason: "run",
+      };
+      this.checkpointList.push({
+        checkpoint,
+        tree,
+        forkIndex,
+        todos: this.todoList.map((item) => ({ ...item })),
+      });
+      this.emit({ type: "checkpoint", action: "created", checkpoint: { ...checkpoint } });
+    } catch (error) {
+      this.logger.error(`checkpoint: ${this.redactor.redactString(errorMessage(error))}`);
+    }
+  }
+
+  /** Number of user messages Pi can fork from now; -1 if Pi does not answer with a list. */
+  private async countForkEntries(pi: PiProcess): Promise<number> {
+    try {
+      const entries = forkEntriesOf(await pi.send({ type: "get_fork_messages" }));
+      return entries?.length ?? -1;
+    } catch {
+      return -1;
+    }
+  }
+
+  /** Moves the conversation back to the checkpoint with Pi's `fork`. Throws invalid_state. */
+  private async forkToCheckpoint(record: CheckpointRecord): Promise<void> {
+    const pi = this.pi;
+    if (pi === null) {
+      throw new SessionError("invalid_state", "Pi is not running");
+    }
+    if (record.forkIndex < 0) {
+      throw new SessionError(
+        "invalid_state",
+        "the conversation position of this checkpoint is unknown",
+      );
+    }
+    const entries = forkEntriesOf(await this.sendToPi(pi, { type: "get_fork_messages" }));
+    if (entries === null) {
+      throw new SessionError("invalid_state", "Pi did not list the conversation messages");
+    }
+    if (record.forkIndex >= entries.length) {
+      // The conversation is already at this point: nothing to fork.
+      return;
+    }
+    const entry: unknown = entries[record.forkIndex];
+    const entryId = isRecord(entry) ? entry.entryId : undefined;
+    if (typeof entryId !== "string") {
+      throw new SessionError("invalid_state", "Pi sent a fork message without an entryId");
+    }
+    const data = await this.sendToPi(pi, { type: "fork", entryId });
+    if (isRecord(data) && data.cancelled === true) {
+      throw new SessionError("invalid_state", "fork cancelled");
     }
   }
 
@@ -506,6 +782,10 @@ export class SessionManager implements SessionService {
     } else if (event.type === "agent_settled") {
       this.settled = true;
       this.refreshStatus();
+      const sessionId = this.info?.id;
+      if (sessionId !== undefined) {
+        this.enqueueRunCheckpoint(sessionId);
+      }
     }
     for (const sessionEvent of normalizeRpcEvent(event)) {
       if (sessionEvent.type === "todo") {
@@ -687,6 +967,12 @@ function dispositionOf(data: unknown): PromptDisposition | undefined {
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+/** The `messages` list of a get_fork_messages response, or null if Pi did not send one. */
+function forkEntriesOf(data: unknown): unknown[] | null {
+  const list: unknown = isRecord(data) ? data.messages : undefined;
+  return Array.isArray(list) ? list : null;
 }
 
 function errorMessage(error: unknown): string {
