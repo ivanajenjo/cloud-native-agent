@@ -101,6 +101,63 @@ scripts/verify-egress.sh
 Más detalle (Windows, Raspberry, variables de `edge`) en
 [`docs/despliegue-local.md`](docs/despliegue-local.md).
 
+### Usar Ollama como modelo
+
+> **Aún no funciona.** El agente conversacional y la configuración de proveedores llegan
+> en la fase 1. Además, hoy el proxy de `edge` deniega Ollama: está en tu máquina o en la
+> LAN (destino interno) y usa el puerto `11434` (solo se permiten 80 y 443). La fase 1
+> añade la excepción para los hosts de los proveedores configurados. Lo de abajo sirve
+> para dejar Ollama preparado.
+
+**Dónde ejecutar Ollama.** En el Mac o en el PC con Windows. En la Raspberry Pi 4 no es
+viable ejecutar un modelo útil: allí el agente usará el Ollama de otra máquina de la LAN.
+
+**1. Instalar y descargar un modelo** (en la máquina de Ollama, desde
+[ollama.com](https://ollama.com)):
+
+```sh
+ollama pull qwen3-coder:30b     # o un modelo más pequeño si no hay memoria suficiente
+```
+
+**2. Escuchar en la red y fijar el contexto.** Por defecto Ollama solo escucha en
+`127.0.0.1`, inaccesible desde los contenedores, y con un contexto corto para un agente
+de programación:
+
+| Sistema | Cómo |
+|---|---|
+| macOS (app) | `launchctl setenv OLLAMA_HOST 0.0.0.0` y `launchctl setenv OLLAMA_CONTEXT_LENGTH 65536`; reinicia la app |
+| Windows | Variables de usuario `OLLAMA_HOST=0.0.0.0` y `OLLAMA_CONTEXT_LENGTH=65536`; reinicia Ollama |
+| Linux (systemd) | `sudo systemctl edit ollama` → `[Service]` `Environment="OLLAMA_HOST=0.0.0.0"` `Environment="OLLAMA_CONTEXT_LENGTH=65536"`; `sudo systemctl restart ollama` |
+
+Escuchar en `0.0.0.0` expone Ollama, que no tiene autenticación, a toda tu red: hazlo
+solo en una LAN de confianza.
+
+**3. Comprobar que responde** desde otra máquina (o desde la misma con su IP de la LAN):
+
+```sh
+curl http://<ip-de-la-maquina>:11434/v1/models
+```
+
+**4. Qué URL usará el agente:**
+- Agente en el mismo Mac o PC que Ollama: `http://host.docker.internal:11434/v1`.
+- Agente en la Raspberry: `http://<ip-del-mac-o-pc>:11434/v1`. Conviene fijar esa IP en
+  el router.
+
+En la fase 1 esa URL irá en `config/providers.yaml` (formato previsto en
+[`docs/PLAN.md`](docs/PLAN.md#proveedores-y-modelos)). El `contextWindow` debe coincidir
+con `OLLAMA_CONTEXT_LENGTH`:
+
+```yaml
+default: ollama/qwen3-coder:30b
+providers:
+  ollama:
+    baseUrl: http://host.docker.internal:11434/v1
+    api: openai-completions
+    models:
+      - id: qwen3-coder:30b
+        contextWindow: 65536
+```
+
 ## Desarrollo
 
 Monorepo con npm workspaces y TypeScript estricto.
