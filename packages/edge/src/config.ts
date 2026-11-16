@@ -7,11 +7,21 @@ export interface EdgeConfig {
   dataDir: string;
   apiPort: number;
   proxyPort: number;
+  /** providers.yaml mounted read-only (EDGE_PROVIDERS_FILE, default "/config/providers.yaml"). Absolute path. */
+  providersFile: string;
+  /** Network question timeout (EDGE_ASK_TIMEOUT_MS, default 120000). Integer in [1000, 3600000]. */
+  askTimeoutMs: number;
 }
 
 const MIN_TOKEN_LENGTH = 32;
 const DEFAULT_GATEWAY_URL = "http://agent:8090";
 const DEFAULT_DATA_DIR = "/edge-data";
+const DEFAULT_PROVIDERS_FILE = "/config/providers.yaml";
+const DEFAULT_ASK_TIMEOUT_MS = 120_000;
+const MIN_ASK_TIMEOUT_MS = 1000;
+const MAX_ASK_TIMEOUT_MS = 3_600_000;
+/** Decimal digits only: no sign, no exponent, no decimal point. */
+const DIGITS_PATTERN = /^[0-9]+$/;
 
 /** Whitespace or control characters. The message for these never echoes the token. */
 const FORBIDDEN_TOKEN_CHARS = /[\s\p{Cc}]/u;
@@ -31,12 +41,14 @@ export function loadConfig(env: Record<string, string | undefined>): EdgeConfig 
     env.EDGE_PROXY_PORT,
     DEFAULT_PORTS.edgeProxy,
   );
+  const providersFile = parseProvidersFile(env.EDGE_PROVIDERS_FILE ?? DEFAULT_PROVIDERS_FILE);
+  const askTimeoutMs = parseAskTimeout(env.EDGE_ASK_TIMEOUT_MS);
 
   if (apiPort === proxyPort) {
     throw new Error("EDGE_API_PORT and EDGE_PROXY_PORT must be different");
   }
 
-  return { token, gatewayUrl, dataDir, apiPort, proxyPort };
+  return { token, gatewayUrl, dataDir, apiPort, proxyPort, providersFile, askTimeoutMs };
 }
 
 function parseToken(value: string | undefined): string {
@@ -80,6 +92,31 @@ function parseDataDir(value: string): string {
     throw new Error("EDGE_DATA_DIR must be an absolute path");
   }
   return value;
+}
+
+function parseProvidersFile(value: string): string {
+  if (!isAbsolute(value)) {
+    throw new Error("EDGE_PROVIDERS_FILE must be an absolute path");
+  }
+  return value;
+}
+
+/** Milliseconds, digits only. Absent → default. Never echoes the value. */
+function parseAskTimeout(value: string | undefined): number {
+  if (value === undefined) {
+    return DEFAULT_ASK_TIMEOUT_MS;
+  }
+  const timeout = DIGITS_PATTERN.test(value) ? Number(value) : Number.NaN;
+  if (
+    !Number.isSafeInteger(timeout) ||
+    timeout < MIN_ASK_TIMEOUT_MS ||
+    timeout > MAX_ASK_TIMEOUT_MS
+  ) {
+    throw new Error(
+      `EDGE_ASK_TIMEOUT_MS must be an integer between ${MIN_ASK_TIMEOUT_MS} and ${MAX_ASK_TIMEOUT_MS}`,
+    );
+  }
+  return timeout;
 }
 
 /** Wraps parsePort so the message names the variable and never echoes its value. */

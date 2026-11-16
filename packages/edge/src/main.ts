@@ -1,13 +1,9 @@
 import { readFileSync } from "node:fs";
 import type { Server } from "node:http";
 import type { Socket } from "node:net";
-import { join } from "node:path";
 import { serve } from "@hono/node-server";
 import { loadConfig } from "./config.js";
-import { createFileNetworkLog } from "./egress/log.js";
-import { createAuditPolicy } from "./egress/policy.js";
-import { createEgressProxy } from "./egress/proxy.js";
-import { createIngressApp } from "./ingress.js";
+import { createEdgeRuntime, type EdgeRuntime } from "./wiring.js";
 
 interface PackageJson {
   version: string;
@@ -29,11 +25,19 @@ try {
 // never inherited by anything that might run later.
 delete process.env.AGENT_API_TOKEN;
 
-const { token, gatewayUrl, dataDir, apiPort, proxyPort } = config;
+const { apiPort, proxyPort, gatewayUrl } = config;
+
+let runtime: EdgeRuntime;
+try {
+  runtime = await createEdgeRuntime({ config, version: packageJson.version });
+} catch (error) {
+  console.error(error instanceof Error ? error.message : error);
+  process.exit(1);
+}
 
 const apiServer = serve(
   {
-    fetch: createIngressApp({ token, gatewayUrl, version: packageJson.version }).fetch,
+    fetch: runtime.ingress.fetch,
     port: apiPort,
     hostname: "0.0.0.0",
   },
@@ -42,8 +46,7 @@ const apiServer = serve(
   },
 );
 
-const log = createFileNetworkLog(join(dataDir, "network.jsonl"));
-const proxyServer: Server = createEgressProxy({ policy: createAuditPolicy(), log });
+const proxyServer: Server = runtime.proxy;
 
 // CONNECT tunnels are not closed by server.close(), so keep the client sockets to destroy them.
 const proxySockets = new Set<Socket>();
@@ -55,7 +58,7 @@ proxyServer.on("connection", (socket: Socket) => {
 });
 
 proxyServer.listen(proxyPort, "0.0.0.0", () => {
-  console.log(`edge proxy listening on 0.0.0.0:${proxyPort} (mode: audit, phase 0)`);
+  console.log(`edge proxy listening on 0.0.0.0:${proxyPort} (mode: ${runtime.mode()})`);
 });
 
 function closeServer(server: {
@@ -88,7 +91,7 @@ async function shutdown(): Promise<void> {
   }
 
   await Promise.all([closeServer(apiServer), closeServer(proxyServer)]);
-  await log.close();
+  await runtime.close();
   process.exit(0);
 }
 
