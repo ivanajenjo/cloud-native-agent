@@ -6,8 +6,9 @@ Docker en una Raspberry Pi 4, un MacBook o un PC con Windows, clona repos de Git
 trabaja en ellos (Java, Node, Python, Go), ejecuta tests y sube los cambios a una rama.
 Uso personal, mono-usuario.
 
-> **Estado:** fase 0 completada (esqueleto, `edge` y contenedores). Todavía no hay agente
-> conversacional: llega en la fase 1. Ver [`docs/PLAN.md`](docs/PLAN.md).
+> **Estado:** fase 1 (MVP conversacional por API): sesiones con Pi, preguntas al usuario,
+> rama `agent/<slug>` con commit y push, y red saliente en modo `ask`. La web UI y el CLI
+> llegan en la fase 3. Ver [`docs/PLAN.md`](docs/PLAN.md).
 
 ## Cómo funciona
 
@@ -25,7 +26,9 @@ Cada réplica son dos contenedores:
   - Valida el token (`Authorization: Bearer`) y reenvía la API al gateway, quitando el
     token para que nunca llegue al agente.
   - Hace de proxy de salida del agente: registra cada conexión en
-    `/edge-data/network.jsonl` y deniega los destinos internos (loopback, LAN, metadatos…).
+    `/edge-data/network.jsonl`, deniega los destinos internos (loopback, LAN, metadatos…)
+    salvo los proveedores de `config/providers.yaml`, y en modo `ask` (por defecto) pregunta
+    al usuario por los dominios que no están en la allowlist.
 - **`agent`**: gateway (API REST) + Pi + toolchains (mise). Vive en una red interna sin
   salida: lo que no pasa por el proxy de `edge` no llega a ningún sitio.
 
@@ -52,6 +55,9 @@ cd cloud-native-agent
 cp deploy/compose/.env.example deploy/compose/.env
 #    Edita deploy/compose/.env y rellena como mínimo:
 #      AGENT_API_TOKEN=<salida de: openssl rand -hex 32>
+
+#    Proveedores LLM (opcional si usas los de Pi con API key):
+cp config/providers.example.yaml config/providers.yaml
 
 # 2. Construir y arrancar
 docker compose -f deploy/compose/docker-compose.yml up --build -d
@@ -81,12 +87,55 @@ docker compose -f deploy/compose/docker-compose.yml down              # parar (c
 |---|---|---|
 | `AGENT_API_TOKEN` | sí | Token de la API (mínimo 32 caracteres). Solo lo recibe `edge`. |
 | `CNA_PUBLISH_ADDR` | no | Dónde se publica el `8080`. `127.0.0.1` (por defecto) solo esta máquina; `0.0.0.0` para la LAN. |
-| `GITHUB_TOKEN` | no (fase 1) | PAT *fine-grained* solo para tus repos: *Contents* y *Pull requests* (lectura/escritura), *Metadata* (lectura). Sin *Workflows*. |
-| `ANTHROPIC_API_KEY`, `OPENAI_API_KEY` | no (fase 1) | Claves de los proveedores LLM. |
-| `CNA_GIT_USER_NAME`, `CNA_GIT_USER_EMAIL` | no (fase 1) | Autor de los commits del agente. |
+| `GITHUB_TOKEN` | para clonar repos privados y hacer push | PAT *fine-grained* solo para tus repos: *Contents* y *Pull requests* (lectura/escritura), *Metadata* (lectura). Sin *Workflows*. |
+| `ANTHROPIC_API_KEY`, `OPENAI_API_KEY` | según el modelo | Claves de los proveedores LLM. |
+| `CNA_GIT_USER_NAME`, `CNA_GIT_USER_EMAIL` | recomendadas | Autor de los commits del agente. |
+| `EDGE_ASK_TIMEOUT_MS` | no | Tiempo para responder una pregunta de red antes de denegarla (por defecto 120000). |
+
+Los modelos se configuran en `config/providers.yaml` (copia de
+[`config/providers.example.yaml`](config/providers.example.yaml)), montado en solo lectura
+en los dos contenedores. Se traduce al `models.json` de Pi al arrancar, y los hosts de sus
+`baseUrl` se permiten en la red aunque estén en la LAN.
 
 No subas nunca el `.env` (está en `.gitignore`). Recomendado: un *ruleset* en GitHub que
 proteja la rama base y un límite de gasto en los proveedores LLM.
+
+## Usar la API
+
+Todo pasa por `edge:8080` con `Authorization: Bearer $AGENT_API_TOKEN`. Hay una sesión por
+réplica, así que la API usa `/session` en singular.
+
+```sh
+export API=http://localhost:8080 AUTH="Authorization: Bearer $AGENT_API_TOKEN"
+
+# Crear la sesión: clona el repo, crea la rama agent/<slug> y lanza el prompt
+curl -s -H "$AUTH" -H 'content-type: application/json' -X POST $API/session \
+  -d '{"repo":"tu-usuario/tu-repo","prompt":"Añade tests al parser","autoPush":false}'
+
+# Seguir los eventos (SSE con replay; -N para no bufferizar)
+curl -sN -H "$AUTH" $API/session/events
+
+# Estado y preguntas pendientes
+curl -s -H "$AUTH" $API/session
+
+# Responder una pregunta (select/input/editor → value; confirm → confirmed)
+curl -s -H "$AUTH" -H 'content-type: application/json' -X POST \
+  $API/session/answers/<id> -d '{"value":"b.txt"}'
+
+# Otro mensaje, abortar, cerrar (409 si hay cambios sin subir; ?force=true para forzar)
+curl -s -H "$AUTH" -H 'content-type: application/json' -X POST $API/session/messages \
+  -d '{"text":"Ahora ejecuta los tests"}'
+curl -s -H "$AUTH" -X POST $API/session/abort
+curl -s -H "$AUTH" -X DELETE $API/session
+```
+
+Estados: `cloning → running ⇄ waiting_input → ready` (+ `error`, `closed`). El agente
+pregunta con `ask_user`, pide confirmación antes de `git_push` (salvo `autoPush: true`) y
+nunca hace push a la rama base. Las preguntas de red (`kind: "network"`, ids `net-…`) se
+responden igual, con `{"value":"allow_once"|"allow_always"|"deny"}`; sin respuesta en el
+timeout se deniegan. *Permitir siempre* se guarda en `/edge-data/policy.json`.
+
+Referencia completa de rutas y eventos en [`docs/PLAN.md`](docs/PLAN.md#api-rest-borrador-v1).
 
 ### Verificar la red
 
@@ -103,11 +152,8 @@ Más detalle (Windows, Raspberry, variables de `edge`) en
 
 ### Usar Ollama como modelo
 
-> **Aún no funciona.** El agente conversacional y la configuración de proveedores llegan
-> en la fase 1. Además, hoy el proxy de `edge` deniega Ollama: está en tu máquina o en la
-> LAN (destino interno) y usa el puerto `11434` (solo se permiten 80 y 443). La fase 1
-> añade la excepción para los hosts de los proveedores configurados. Lo de abajo sirve
-> para dejar Ollama preparado.
+> Ollama está en tu máquina o en la LAN (destino interno) y usa el puerto `11434`. `edge`
+> lo permite solo porque su `baseUrl` está en `config/providers.yaml`.
 
 **Dónde ejecutar Ollama.** En el Mac o en el PC con Windows. En la Raspberry Pi 4 no es
 viable ejecutar un modelo útil: allí el agente usará el Ollama de otra máquina de la LAN.
@@ -143,9 +189,9 @@ curl http://<ip-de-la-maquina>:11434/v1/models
 - Agente en la Raspberry: `http://<ip-del-mac-o-pc>:11434/v1`. Conviene fijar esa IP en
   el router.
 
-En la fase 1 esa URL irá en `config/providers.yaml` (formato previsto en
+Esa URL va en `config/providers.yaml` (formato en
 [`docs/PLAN.md`](docs/PLAN.md#proveedores-y-modelos)). El `contextWindow` debe coincidir
-con `OLLAMA_CONTEXT_LENGTH`:
+con `OLLAMA_CONTEXT_LENGTH`. Tras cambiar el fichero, reinicia los dos contenedores:
 
 ```yaml
 default: ollama/qwen3-coder:30b
@@ -182,13 +228,14 @@ de la red):
 ```sh
 npm run build
 
-# Terminal 1: gateway
+# Terminal 1: gateway (datos y config en carpetas locales)
+CNA_DATA_DIR="$PWD/.data" CNA_PROVIDERS_FILE="$PWD/config/providers.yaml" \
 GATEWAY_PORT=8090 node packages/gateway/dist/main.js
 
 # Terminal 2: edge
 AGENT_API_TOKEN=$(openssl rand -hex 32) \
 GATEWAY_URL=http://127.0.0.1:8090 \
-EDGE_DATA_DIR="$PWD/.edge-data" \
+EDGE_DATA_DIR="$PWD/.edge-data" EDGE_PROVIDERS_FILE="$PWD/config/providers.yaml" \
 node packages/edge/dist/main.js
 
 # Terminal 3: usar el proxy de edge (no uses localhost como destino: se deniega)
@@ -203,6 +250,8 @@ packages/
   shared/     tipos compartidos de la API, eventos y red (@cna/shared)
   gateway/    API de sesión dentro del contenedor del agente (@cna/gateway)
   edge/       entrada con Bearer + proxy de salida con política (@cna/edge)
+  extensions/ extensiones de Pi (ask_user, git) y prompt de sistema (@cna/extensions)
+config/       providers.example.yaml (copiar a providers.yaml)
 docker/       Dockerfile (agent), Dockerfile.edge, config de mise/Maven/Gradle
 deploy/
   compose/    docker-compose.yml y .env.example
