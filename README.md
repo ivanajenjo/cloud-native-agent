@@ -44,6 +44,9 @@ qué no) en [`docs/adr/0006-frontera-de-confianza.md`](docs/adr/0006-frontera-de
 | Desarrollar | Node.js **22 LTS (≥ 22.21)** y npm |
 | Windows | Docker Desktop con backend **WSL2**; clona el repo dentro de WSL |
 
+Las imágenes no construyen tras un proxy que intercepte el TLS, como el de Claude Code en
+la nube: ver [la limitación](docs/despliegue-local.md#limitación-entornos-con-tls-interceptado-claude-code-en-la-nube).
+
 ## Puesta en marcha con Docker
 
 Cada equipo construye su propia imagen (amd64 o arm64 según la máquina).

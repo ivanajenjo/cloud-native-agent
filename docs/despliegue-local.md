@@ -78,6 +78,32 @@ El registro completo está en el volumen de `edge`:
 docker compose -f deploy/compose/docker-compose.yml exec edge cat /edge-data/network.jsonl
 ```
 
+## Limitación: entornos con TLS interceptado (Claude Code en la nube)
+
+Las imágenes **no se pueden construir ni verificar** en una sesión de Claude Code en la nube
+(ni, en general, detrás de un proxy corporativo que re-termina el TLS). Ese entorno tiene
+Docker, pero su red intercepta las conexiones HTTPS y las firma con una CA propia que las
+imágenes no conocen. El build de `agent` falla al descargar las claves de los repositorios
+de `gh` y mise:
+
+```
+curl: (60) SSL certificate problem: self-signed certificate in certificate chain
+```
+
+**No hay que añadir esa CA** a los Dockerfile, al contenedor ni a `edge` para salir del
+paso:
+- `scripts/verify-egress.sh` y la allowlist base miden qué hosts usan los toolchains
+  **a través de `edge`**. Con un proxy intermedio que intercepta el TLS, lo observado deja de
+  ser lo que pasará en la Raspberry o en el MacBook.
+- Meter una CA ajena en las imágenes rompe la frontera de confianza (ADR-0006): el agente
+  pasaría a aceptar certificados que no son de los destinos reales.
+
+Qué sí funciona ahí: `npm install`, `npm run typecheck`, `npm run lint` y `npm test`
+(incluido el e2e y el test conjunto de `edge` y gateway, que no usan Docker ni red real).
+Todo lo que necesita las imágenes construidas (este documento desde "Levantar la réplica",
+`scripts/verify-egress.sh` y el fijado de versiones de `docker/mise/config.toml`) se hace en
+una máquina con Docker y red normal: MacBook (amd64/arm64) o Raspberry Pi 4 (arm64).
+
 ## Política de red
 
 El modo por defecto es `ask`. Orden de decisión de `edge`:

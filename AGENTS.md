@@ -53,6 +53,13 @@ docker compose -f deploy/compose/docker-compose.yml up --build
 Una tarea está terminada solo si `typecheck`, `lint` y `test` pasan, y la documentación
 afectada está actualizada.
 
+**Docker en la nube.** En una sesión de Claude Code en la nube (o tras cualquier proxy
+que intercepte el TLS) las imágenes no construyen: el build falla con `curl: (60)
+self-signed certificate in certificate chain`. No metas la CA del entorno en los
+Dockerfile ni en los contenedores: falsearía la verificación de la salida por `edge`.
+Las tareas que necesitan las imágenes se dejan pendientes para una máquina con Docker y
+red normal (ver "Limitación" en `docs/despliegue-local.md`).
+
 ## Trampas conocidas de Pi (no las ignores)
 - **RPC:** `pi --mode rpc` habla JSONL por stdin/stdout. Separa registros **solo por `\n`**
   (quita un `\r` final si lo hay). **No uses `readline`**: corta también en U+2028/U+2029,

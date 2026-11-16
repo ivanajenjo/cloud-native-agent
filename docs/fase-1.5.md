@@ -24,7 +24,8 @@ Las tareas 1 y 2 se intentaron en una sesión de Claude Code en la nube y no se 
 completar: la red de ese entorno intercepta el TLS y el build de la imagen `agent` falla en
 `curl` con `self-signed certificate in certificate chain`. Meter esa CA en las imágenes
 falsearía la verificación, así que hay que hacerlas en una máquina con Docker y red normal
-(MacBook o Raspberry).
+(MacBook o Raspberry). Detalle en
+[`despliegue-local.md`](despliegue-local.md#limitación-entornos-con-tls-interceptado-claude-code-en-la-nube).
 
 Las tareas 3, 4 y 5 son independientes de las 1 y 2 y se pueden hacer antes. La 3 y la 4
 no comparten ficheros.
