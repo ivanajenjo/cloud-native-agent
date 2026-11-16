@@ -22,6 +22,10 @@ export interface PiLaunchOptions {
   /** Flags read by our git extension. */
   baseBranch: string;
   autoPush: boolean;
+  /** Flag read by the plan-mode extension: the session starts in plan mode. */
+  plan?: boolean;
+  /** Absolute path of web.yaml, read by the web extension (--cna-web-config). */
+  webConfigFile?: string;
   /** Base environment (normally process.env). */
   env: Record<string, string | undefined>;
   /** Node binary. Default process.execPath. */
@@ -54,6 +58,9 @@ function validate(options: PiLaunchOptions): void {
   }
   if (options.systemPromptFile !== undefined) {
     assertAbsolute("systemPromptFile", options.systemPromptFile);
+  }
+  if (options.webConfigFile !== undefined) {
+    assertAbsolute("webConfigFile", options.webConfigFile);
   }
   if (options.baseBranch.length === 0) {
     throw new Error("baseBranch must not be empty");
@@ -110,6 +117,12 @@ function buildArgs(options: PiLaunchOptions): string[] {
   args.push("--cna-base-branch", options.baseBranch);
   if (options.autoPush) {
     args.push("--cna-auto-push");
+  }
+  if (options.plan) {
+    args.push("--cna-plan");
+  }
+  if (options.webConfigFile !== undefined) {
+    args.push("--cna-web-config", options.webConfigFile);
   }
   return args;
 }
