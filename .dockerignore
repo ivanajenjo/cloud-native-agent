@@ -1,0 +1,12 @@
+# Build context: only what `npm ci` and `npm run build` need.
+**/node_modules
+node_modules
+**/dist
+.git
+.claude
+docs
+deploy
+**/*.md
+.env*
+coverage
+**/*.tsbuildinfo

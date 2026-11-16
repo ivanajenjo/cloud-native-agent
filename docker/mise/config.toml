@@ -1,0 +1,12 @@
+# Global mise configuration for the agent image (copied to /etc/mise/config.toml).
+# The versions are majors/LTS not yet pinned exactly: pin them (e.g. "21.0.x") after the
+# phase 0 verification. Repositories may add their own .tool-versions or mise.toml.
+[tools]
+java = "temurin-21"
+maven = "3.9"
+gradle = "8"
+node = "22"
+pnpm = "10"
+python = "3.12"
+uv = "latest"
+go = "latest"

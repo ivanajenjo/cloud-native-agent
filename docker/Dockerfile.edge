@@ -1,0 +1,61 @@
+# syntax=docker/dockerfile:1
+# Edge image: Bearer-authenticated entry point + egress proxy with policy (ADR-0004, ADR-0006).
+# Minimal runtime: no toolchains or git. It is the only piece with external network access.
+ARG NODE_IMAGE=node:22-bookworm-slim
+
+# ---------------------------------------------------------------------------
+# build: installs everything and compiles the workspaces
+# ---------------------------------------------------------------------------
+FROM ${NODE_IMAGE} AS build
+WORKDIR /app
+COPY package.json package-lock.json tsconfig.base.json ./
+COPY packages/shared/package.json packages/shared/package.json
+COPY packages/gateway/package.json packages/gateway/package.json
+COPY packages/edge/package.json packages/edge/package.json
+RUN npm ci
+COPY packages/ packages/
+RUN npm run build
+
+# ---------------------------------------------------------------------------
+# prod-deps: production dependencies of shared and edge only (no Pi)
+# ---------------------------------------------------------------------------
+FROM ${NODE_IMAGE} AS prod-deps
+WORKDIR /app
+COPY package.json package-lock.json ./
+COPY packages/shared/package.json packages/shared/package.json
+COPY packages/gateway/package.json packages/gateway/package.json
+COPY packages/edge/package.json packages/edge/package.json
+RUN npm ci --omit=dev --workspace=@cna/edge --include-workspace-root=false
+
+# ---------------------------------------------------------------------------
+# runtime
+# ---------------------------------------------------------------------------
+FROM ${NODE_IMAGE} AS runtime
+
+# agent user (uid/gid 1000), same as in the agent image.
+RUN groupmod -n agent node \
+ && usermod -l agent -d /home/agent -m node
+
+ENV EDGE_DATA_DIR=/edge-data \
+    EDGE_API_PORT=8080 \
+    EDGE_PROXY_PORT=3128 \
+    GATEWAY_URL=http://agent:8090
+
+WORKDIR /app
+COPY --from=build /app/packages/shared/package.json /app/packages/shared/package.json
+COPY --from=build /app/packages/shared/dist /app/packages/shared/dist
+COPY --from=build /app/packages/edge/package.json /app/packages/edge/package.json
+COPY --from=build /app/packages/edge/dist /app/packages/edge/dist
+COPY --from=prod-deps /app/node_modules /app/node_modules
+
+# edge's own volume: policy, "always allow" and network log (ADR-0006).
+RUN install -d -o agent -g agent /edge-data
+VOLUME /edge-data
+
+USER agent
+EXPOSE 8080 3128
+
+HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
+  CMD ["node", "-e", "fetch('http://127.0.0.1:8080/health').then(async (r) => { const b = await r.json(); process.exit(r.ok && b.status === 'ok' ? 0 : 1); }).catch(() => process.exit(1))"]
+
+CMD ["node", "packages/edge/dist/main.js"]
