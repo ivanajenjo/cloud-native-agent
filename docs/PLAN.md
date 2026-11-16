@@ -355,6 +355,50 @@ Monorepo con npm workspaces, Node 22 LTS, TypeScript estricto, Hono (HTTP), zod 
 - Prompt de sistema del entorno y `AGENTS.md` global (6).
 - Tests: unitarios del parser/bridge con un Pi falso; e2e con un modelo mock; política de red.
 
+### Fase 1.5 — Consolidación (antes de la fase 2)
+Mejoras detectadas al revisar la fase 1. No añaden funcionalidad: dejan la base lista para
+la fase 2. Se hacen en este orden y cada una es un commit propio.
+
+1. **Verificar con Docker.** Construir las dos imágenes y ejecutar
+   `scripts/verify-egress.sh` en una máquina con Docker (la revisión de la fase 1 solo
+   ejecutó `typecheck`, `lint` y `test`). Comparar los hosts registrados con la allowlist
+   base y corregir `BASE_ALLOWLIST` y este plan si falta o sobra alguno.
+   *Hecho cuando:* el script termina sin fallos y la lista coincide con el plan.
+2. **Fijar las versiones de los toolchains.** `docker/mise/config.toml` usa versiones
+   mayores y `latest` (uv, Go), así que dos builds en fechas distintas dan toolchains
+   distintos. Fijar versiones exactas con las que resuelva el build del punto 1.
+   *Hecho cuando:* no queda ningún `latest` ni versión mayor suelta y la imagen construye
+   en amd64 y arm64.
+3. **Partir `SessionManager`.** `packages/gateway/src/session/manager.ts` ronda las 700
+   líneas y la fase 2 le añade checkpoints, diff, todos y registro de tools. Extraer sin
+   cambiar el comportamiento ni la interfaz `SessionService`:
+   - las preguntas pendientes y sus timeouts (hoy repartidos entre `QuestionRegistry` y
+     el propio manager);
+   - el arranque en segundo plano (clonar, crear la rama, lanzar Pi y el primer prompt).
+   *Hecho cuando:* los tests existentes pasan sin modificarse y `manager.ts` se queda en
+   la máquina de estados y el reparto de eventos.
+4. **Test conjunto de `edge` y gateway.** Cada paquete se prueba por separado; nada
+   recorre una pregunta de red de extremo a extremo. Añadir un test que monte el ingress
+   y el proxy de `edge` contra la app real del gateway (con un Pi falso, sin Docker) y
+   cubra:
+   - destino fuera de la allowlist → evento `question` (`kind: "network"`) en el SSE →
+     `POST /session/answers/net-…` por `edge` → conexión permitida y `question_resolved`;
+   - `allow_always` persistido: la segunda conexión no pregunta;
+   - sin sesión activa → denegada sin pregunta (`no_session`);
+   - sin respuesta en el timeout → denegada (`ask_timeout`);
+   - `/internal/*` desde la entrada pública → `404`, con y sin Bearer.
+   *Hecho cuando:* el test pasa dentro de `npm test`.
+5. **Aclarar la versión de Node en ADR-0005.** Dice "Node ≥ 22.19" (lo que exige Pi) y el
+   resto del repo ≥ 22.21 (por `NODE_USE_ENV_PROXY`). Dejar escrito que manda 22.21.
+
+Revisado y **no** incluido aquí:
+- Cambiar el modo de red sin editar `policy.json` a mano: son los endpoints `/network/*`
+  de la fase 2.
+- Replay de eventos solo en memoria y pérdida de la sesión al reiniciar: fase 4.
+- Redacción de secretos codificados (base64, troceados): riesgo aceptado en ADR-0006.
+- Permitir sin preguntar los proveedores integrados de Pi: se decidió mantener la
+  pregunta de red (ver [Proveedores y modelos](#proveedores-y-modelos)).
+
 ### Fase 2 — PR y funcionalidades
 - `create_pr` con `gh`.
 - Extensiones `todo` (1), `plan-mode` (2), `guard` y `web`.

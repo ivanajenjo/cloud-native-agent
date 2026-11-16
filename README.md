@@ -8,7 +8,8 @@ Uso personal, mono-usuario.
 
 > **Estado:** fase 1 (MVP conversacional por API): sesiones con Pi, preguntas al usuario,
 > rama `agent/<slug>` con commit y push, y red saliente en modo `ask`. La web UI y el CLI
-> llegan en la fase 3. Ver [`docs/PLAN.md`](docs/PLAN.md).
+> llegan en la fase 3. Antes de la fase 2 hay una fase 1.5 de consolidación. Ver
+> [`docs/PLAN.md`](docs/PLAN.md#fases).
 
 ## Cómo funciona
 
