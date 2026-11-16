@@ -18,7 +18,7 @@ Reglas comunes:
 | 2 | Fijar las versiones de los toolchains | sí | 1 | pendiente |
 | 3 | Partir `SessionManager` | no | — | pendiente |
 | 4 | Test conjunto de `edge` y gateway | no | — | pendiente |
-| 5 | Aclarar la versión de Node en ADR-0005 | no | — | pendiente |
+| 5 | Aclarar la versión de Node en ADR-0005 | no | — | hecha |
 
 Las tareas 3, 4 y 5 son independientes de las 1 y 2 y se pueden hacer antes. La 3 y la 4
 no comparten ficheros.

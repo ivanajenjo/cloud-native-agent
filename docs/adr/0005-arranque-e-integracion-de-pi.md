@@ -32,4 +32,5 @@ necesita saber con certeza cuándo ha terminado una ejecución.
   prompt de sistema.
 - (+) El estado de la sesión no da falsos "terminado".
 - (−) No se aprovechan extensiones, skills ni servidores MCP que traiga un repo.
-- Requiere Node ≥ 22.19.
+- Pi requiere Node ≥ 22.19; el proyecto exige ≥ 22.21 porque `NODE_USE_ENV_PROXY`
+  (ADR-0004) lo necesita.
