@@ -76,6 +76,11 @@ ejecutar tests y subir los cambios. Se controla por API REST, una web UI sencill
 
 Se entra por `edge:8080`, que exige `Authorization: Bearer <AGENT_API_TOKEN>` salvo en
 `GET /health` y en los ficheros estáticos de la web UI, y reenvía al gateway.
+- Rutas públicas exactas (solo `GET`/`HEAD`): `/health` (la responde `edge`), `/`, `/ui` y
+  `/ui/*`. Una ruta `/ui/*` con segmentos `.` o `..` (también `%2e`) no es pública. La web
+  UI se sirve bajo `/ui/`, y el gateway debe rechazar rutas que salgan de su directorio.
+- `edge` quita `Authorization` y las cabeceras hop-by-hop antes de reenviar, para que el
+  token no llegue nunca al contenedor del agente.
 
 ```
 GET    /health
@@ -231,7 +236,11 @@ ver a dónde se conecta, no resistir a un atacante decidido.
 Detalle en ADR-0004.
 
 - **Topología (compose):** red `internal` (`internal: true`, sin salida) con `agent` y
-  `edge`; red `external` solo con `edge`, que publica el `8080`.
+  `edge`; red `external` solo con `edge`, que publica el `8080` en
+  `${CNA_PUBLISH_ADDR:-127.0.0.1}` (`0.0.0.0` para la LAN). El `3128` no se publica.
+- **Anti DNS rebinding:** `edge` resuelve el nombre, aplica la política a **todas** las
+  direcciones (si alguna es interna, deniega) y conecta a una de esas direcciones, sin
+  volver a resolver.
 - **Proxy:** `CONNECT` sin interceptar TLS (se ve host y puerto, no URL ni contenido) y
   proxy HTTP normal para peticiones `http://` (p. ej. Ollama). La política se aplica a
   **host y puerto**; por defecto solo 80 y 443.
@@ -240,7 +249,9 @@ Detalle en ADR-0004.
 - **Clientes:** `HTTPS_PROXY`/`HTTP_PROXY`/`NO_PROXY=edge,localhost`; `NODE_USE_ENV_PROXY=1`
   para el `fetch` de Node; `settings.xml` de Maven y `gradle.properties` con el proxy.
   Lo que ignore el proxy no tiene ruta de salida: **falla cerrado**.
-- **Modos:** `ask` (**por defecto**), `allowlist` y `audit`.
+- **Modos:** `ask` (**por defecto**), `allowlist` y `audit`. En la fase 0 solo existe
+  `audit` (lo externo en 80/443 se permite y registra); `ask` pasa a ser el modo por
+  defecto en la fase 1.
 - **Allowlist:** entradas `host[:puerto]`, con comodín solo como prefijo (`*.dominio`).
   Base: GitHub (`github.com`, `api.github.com`, `codeload.github.com`,
   `objects.githubusercontent.com`, `release-assets.githubusercontent.com`,
@@ -315,7 +326,8 @@ Monorepo con npm workspaces, Node 22 LTS, TypeScript estricto, Hono (HTTP), zod 
 - `edge` mínimo: entrada con Bearer y `/health`, reenvío al gateway, proxy `CONNECT` +
   HTTP con registro, y la topología de redes (el agente sin salida directa).
 - Verificar que npm, pip/uv, Maven, Gradle, Go, mise, git y gh funcionan a través del
-  proxy, y cerrar la allowlist base con el modo `audit`.
+  proxy, y cerrar la allowlist base con el modo `audit` (`scripts/verify-egress.sh`, ver
+  `docs/despliegue-local.md`).
 
 ### Fase 1 — MVP conversacional (API)
 - RpcBridge: spawn de `pi --mode rpc`, parser JSONL conforme, correlación por `id`,
