@@ -20,6 +20,7 @@ ejecutar tests y subir los cambios. Se controla por API REST, una web UI sencill
 | Concurrencia | **1 sesión por réplica**; más sesiones = más réplicas |
 | Servicios | El agente ejecuta tests, pero **no** levanta servicios (sin Docker-in-Docker) |
 | Push / PR | El agente **pregunta** antes de hacer push/PR, salvo que el prompt lo autorice |
+| Alcance funcional | Un "Claude Code lite": ver [Funcionalidades tipo Claude Code](#funcionalidades-tipo-claude-code) |
 | Red saliente | Todo el tráfico sale por un proxy propio. Modo por defecto **`ask`**: dominios fuera de la allowlist se preguntan al usuario |
 
 ## Arquitectura
@@ -73,13 +74,18 @@ ejecutar tests y subir los cambios. Se controla por API REST, una web UI sencill
 GET    /health
 GET    /models                          modelos/proveedores configurados
 GET    /session                         sesión actual (o 404)
-POST   /session                         {repo, baseBranch?, prompt, model?, thinking?}
+POST   /session                         {repo, baseBranch?, prompt, model?, thinking?,
+                                         mode?: "plan"|"auto", autoPush?}
                                         409 si la réplica ya está ocupada
 GET    /session/events                  SSE: estado, deltas de texto, tool calls,
                                         preguntas, errores (con Last-Event-ID)
 POST   /session/messages                {text, mode?: "steer"|"followUp"}
 POST   /session/answers/:questionId     {value} | {confirmed} | {cancelled:true}
 POST   /session/abort                   aborta el turno en curso
+GET    /session/todos                   lista de tareas actual del agente
+GET    /session/diff                    diff del workspace frente a la rama base (?checkpoint=id)
+GET    /session/checkpoints             snapshots por turno
+POST   /session/checkpoints/:id/restore vuelve los ficheros (y opcionalmente la conversación) a ese punto
 DELETE /session                         cierra la sesión y limpia el workspace
 ```
 
@@ -90,10 +96,11 @@ expondría `/sessions/:id` y redirigiría a la réplica correspondiente.
 
 **Eventos SSE** (normalizados desde los eventos RPC de Pi y del proxy):
 `status`, `message_delta`, `message`, `tool_start`, `tool_update`, `tool_end`,
-`question`, `question_resolved`, `network`, `notify`, `error`.
+`question`, `question_resolved`, `network`, `todo`, `checkpoint`, `notify`, `error`.
 
 Los eventos `question` llevan un `kind`: `ask_user` (pregunta del agente), `confirm`
-(push/PR) o `network` (acceso a un dominio nuevo; opciones: *permitir esta vez*,
+(push/PR), `plan` (aprobación del plan en modo plan; opciones: *aprobar*, *pedir cambios*)
+o `network` (acceso a un dominio nuevo; opciones: *permitir esta vez*,
 *permitir siempre*, *denegar*).
 
 Endpoints de red:
@@ -110,6 +117,9 @@ PUT    /network/policy                  cambiar modo o listas
 | `ask_user` | Tool `ask_user({question, options?, multiline?})`. Usa `ctx.ui.select` / `ctx.ui.input` / `ctx.ui.editor`; en RPC se convierte en `extension_ui_request` que el gateway publica como evento `question`. |
 | `git` | Tools `git_status`, `git_commit`, `git_push`, `create_pr`. `git_push` y `create_pr` piden confirmación con `ctx.ui.confirm` salvo que la sesión se haya creado con `autoPush: true` / el prompt lo autorice. Ramas siempre `agent/<slug>`; nunca push a la rama base. |
 | `guard` | Hook `tool_call` que bloquea comandos peligrosos (`git push --force` a la rama base, `rm -rf /`, intentos de `docker run`…). |
+| `todo` | Tool `todo` (crear/actualizar/completar tareas). El estado se guarda en la sesión y se emite como evento `todo` para mostrar un checklist en vivo. Basada en `examples/extensions/todo.ts` de Pi. |
+| `plan-mode` | Con `mode: "plan"` solo activa tools de lectura (`read`, `grep`, `find`, `ls`, bash de solo lectura) y añade la tool `submit_plan`. El plan se presenta como pregunta `plan`; al aprobarlo se activan el resto de tools y el agente ejecuta. Basada en `examples/extensions/plan-mode`. |
+| `checkpoint` | Al final de cada turno con cambios crea un snapshot git en una ref interna (`refs/cna/checkpoints/<n>`) sin tocar la rama ni el índice. Permite diff por turno y restaurar. Basada en `examples/extensions/git-checkpoint.ts`. |
 | `audit` | Hook `tool_call`/`tool_result` que registra todas las llamadas a tools y las publica por SSE. |
 | `web` | Tools `web_search` (SearXNG autoalojado o API tipo Brave/Tavily) y `web_fetch` (descarga y convierte a texto). El resultado se marca como contenido externo no fiable. Su tráfico pasa por el proxy como el resto. |
 
@@ -133,6 +143,35 @@ providers:
 
 > En la Raspberry Pi 4 no es viable ejecutar un modelo útil con Ollama local:
 > Ollama debería correr en el MacBook u otra máquina de la red, o usar API keys.
+
+## Funcionalidades tipo Claude Code
+
+Pi deja fuera a propósito varias piezas de la experiencia de Claude Code (plan mode,
+to-dos, subagentes, MCP, procesos en background). Estas son las que añadimos, cuándo, y
+las que descartamos conscientemente.
+
+| # | Funcionalidad | Fase | Cómo |
+|---|---|---|---|
+| 1 | **Lista de tareas visible** | 1 | Extensión `todo` + evento SSE `todo` + `GET /session/todos`. Checklist en vivo en la UI. |
+| 2 | **Modo plan** | 1 | Extensión `plan-mode`. `mode: "plan"` al crear la sesión: investiga en solo lectura, propone plan, espera aprobación (`question{kind:"plan"}`), luego ejecuta. |
+| 3 | **Diff de cambios en la UI** | 2 (API), 3 (UI) | `GET /session/diff` (frente a la rama base o a un checkpoint); vista de diff en la web y `cna diff` en el CLI. |
+| 4 | **Checkpoints y deshacer** | 2 | Extensión `checkpoint`: snapshot git por turno en refs internas. `POST /session/checkpoints/:id/restore` restaura ficheros; opcionalmente también la conversación con el árbol de sesión de Pi (`fork`). |
+| 5 | **Notificaciones push** | 2 | El gateway avisa cuando la sesión pasa a `waiting_input`, termina o falla. Proveedor configurable: **ntfy** (autoalojable) o Telegram. Configuración en `config/notifications.yaml`; el host entra en la allowlist automáticamente. |
+| 6 | **Instrucciones del proyecto** | 1 | Pi ya carga `AGENTS.md`/`CLAUDE.md` del repo. Añadimos un `AGENTS.md` global en `/data/config/AGENTS.md` (preferencias personales: estilo de commits, idioma…), montado como directorio de configuración de Pi. |
+| 7 | **Trabajar sobre un PR existente** | 4 | `POST /session` con `pr: <número>`: checkout de la rama del PR, el agente lee los comentarios de revisión con `gh` y los atiende; push a la misma rama. |
+| 8 | **Procesos en segundo plano** | Backlog | Tool `bash_bg` (`start`, `logs`, `stop`, `list`) para levantar un servidor de desarrollo y probarlo con `curl`. Limitado a 1–2 procesos por la RAM de la Pi. |
+| 9 | **Tokens y coste por sesión** | 4 | `get_session_stats` de Pi expuesto en `GET /session/stats` y en la UI/CLI. |
+| 10 | **Historial de sesiones** | 4 | Listar y retomar sesiones pasadas de la réplica (JSONL de Pi + metadatos), no solo la activa. |
+| 11 | **Comandos y skills** | Backlog | Pi ya soporta prompt templates y skills; exponerlos en la UI y el CLI (`/review`, `/test`…) y montar los propios desde `/data/config`. |
+| 12 | **Imágenes en el prompt** | Backlog | Pi ya acepta imágenes; permitir pegar/adjuntar capturas en la web UI y `--image` en el CLI. |
+
+**Descartado conscientemente:**
+- **MCP:** Pi no lo soporta por diseño (prefiere CLIs + skills). Si un día hace falta, se
+  añade como extensión.
+- **Subagentes:** demasiado caros en memoria para una Raspberry Pi 4 con 1 sesión por réplica.
+- **Permisos por tool** (preguntar antes de cada edición o comando): el sandbox del
+  contenedor y el proxy de salida cumplen ese papel; preguntar a cada paso haría el uso
+  remoto insoportable. Las únicas confirmaciones son push/PR, el plan y la red.
 
 ## Control de red saliente (egress)
 
@@ -225,6 +264,8 @@ Monorepo con npm workspaces, TypeScript estricto, `vitest` para tests, `biome` p
 - Configuración de proveedores (`providers.yaml` → `models.json`); sus hosts entran en la allowlist.
 - Política de red con modo `ask` por defecto: endpoint interno edge → gateway, pregunta
   `network` por SSE, persistencia de *permitir siempre*, denegar por timeout.
+- Extensiones `todo` y `plan-mode` (funcionalidades 1 y 2).
+- `AGENTS.md` global en `/data/config` + documentar el uso del `AGENTS.md`/`CLAUDE.md` del repo (6).
 - Tests: unitarios del parser/bridge con un Pi falso; e2e con un modelo mock.
 
 ### Fase 2 — Git y flujo de PR
@@ -233,15 +274,20 @@ Monorepo con npm workspaces, TypeScript estricto, `vitest` para tests, `biome` p
 - Extensión `web` (`web_search`, `web_fetch`).
 - Endpoints `/network/*`.
 - Prompt de sistema del entorno.
+- `GET /session/diff` (3) y extensión `checkpoint` con restauración (4).
+- Notificaciones push con ntfy/Telegram (5).
 
 ### Fase 3 — CLI y web UI
-- CLI: `cna run <repo> "<prompt>"`, chat interactivo en terminal, responder preguntas, `cna status/abort/close`.
-- Web UI: formulario de nueva sesión, chat con streaming, tarjetas de tool calls, diálogo de preguntas
-  (incluidas las de red), panel de conexiones de red, botón de abortar.
+- CLI: `cna run <repo> "<prompt>" [--plan]`, chat interactivo en terminal, responder preguntas,
+  `cna status/diff/todos/abort/close`.
+- Web UI: formulario de nueva sesión (modo plan/auto), chat con streaming, tarjetas de tool calls,
+  diálogo de preguntas (incluidas plan y red), checklist de tareas, vista de diff con
+  checkpoints, panel de conexiones de red, botón de abortar.
 
 ### Fase 4 — Persistencia y robustez
 - Reanudar sesión tras reinicio del contenedor (JSONL de Pi + estado en disco).
 - Timeouts de inactividad, límites de recursos, limpieza de workspace.
+- Trabajar sobre un PR existente (7), tokens y coste por sesión (9), historial de sesiones (10).
 
 ### Fase 5 — Kubernetes y múltiples réplicas
 - Manifiestos para k3s/kind (StatefulSet con PVC por réplica, Secret, Service).
@@ -249,7 +295,14 @@ Monorepo con npm workspaces, TypeScript estricto, `vitest` para tests, `biome` p
   `edge` (como sidecar no sirve: compartiría la red del pod y se podría esquivar).
 - Hub opcional: registro de réplicas, asignación de sesiones a réplicas libres, UI con todas las sesiones.
 
+## Backlog
+- Procesos en segundo plano con `bash_bg` (8).
+- Comandos y skills en UI/CLI (11).
+- Imágenes en el prompt (12).
+- Inyección de credenciales en el proxy de salida.
+
 ## Fuera de alcance (por ahora)
 - Docker-in-Docker / servicios de apoyo (bases de datos para tests de integración, Testcontainers).
 - Multiusuario, GitLab/Gitea.
 - Exposición a internet (solo LAN o Tailscale).
+- MCP, subagentes y permisos por tool (ver [descartado conscientemente](#funcionalidades-tipo-claude-code)).
