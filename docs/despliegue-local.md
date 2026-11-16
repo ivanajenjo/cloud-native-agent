@@ -5,8 +5,8 @@ Raspberry Pi 4) y cómo comprobar que la salida a internet pasa solo por `edge`.
 
 ## Requisitos
 - Docker con BuildKit y el plugin `compose` (Docker Desktop o Docker Engine ≥ 24).
-- Para la Raspberry Pi: mejor construir la imagen en el MacBook o en CI y hacer `docker pull`
-  (ver "Consideraciones Raspberry Pi 4" en `PLAN.md`).
+- Para la Raspberry Pi: mejor construir la imagen en el MacBook y copiarla
+  (ver "Construir en el Mac para la Raspberry" más abajo).
 
 ## Levantar la réplica
 
@@ -67,5 +67,17 @@ docker compose -f deploy/compose/docker-compose.yml exec edge cat /edge-data/net
 ## Estado
 - En la fase 0 el proxy está en modo `audit`: permite cualquier destino externo en los
   puertos 80/443 y deniega los destinos internos. El modo `ask` llega en la fase 1.
-- La construcción de las imágenes se comprueba en CI (amd64 y arm64). La ejecución de
-  `scripts/verify-egress.sh` necesita un daemon de Docker y queda a cargo del usuario.
+- No hay CI: la construcción de las imágenes y `scripts/verify-egress.sh` se comprueban
+  en local, con un daemon de Docker.
+
+## Construir en el Mac para la Raspberry
+
+Un Mac con Apple Silicon ya construye `linux/arm64`. Sin registro de imágenes, se copian
+por SSH:
+
+```sh
+docker compose -f deploy/compose/docker-compose.yml build
+docker save cna-agent cna-edge | ssh pi 'docker load'
+```
+
+En la Pi, `docker compose ... up -d` usa las imágenes cargadas (no añadas `--build`).

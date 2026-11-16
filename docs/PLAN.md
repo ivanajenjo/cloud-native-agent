@@ -291,8 +291,8 @@ Detalle en ADR-0004.
 ### Consideraciones Raspberry Pi 4 (8 GB)
 - Limitar la JVM de los tests (`MAVEN_OPTS`/`GRADLE_OPTS` con `-Xmx`), Gradle daemon desactivado.
 - Usar SSD por USB para `/data` mejor que la microSD.
-- Builds de la imagen en el MacBook o en CI y `docker pull` en la Pi. En CI, usar un
-  runner arm64 nativo en vez de QEMU.
+- Builds de la imagen en el MacBook (Apple Silicon ya es arm64) y copia a la Pi con
+  `docker save | ssh … docker load`. No hay CI ni registro de imágenes.
 
 ## Estructura del repositorio
 
@@ -321,7 +321,8 @@ Monorepo con npm workspaces, Node 22 LTS, TypeScript estricto, Hono (HTTP), zod 
 ## Fases
 
 ### Fase 0 — Esqueleto y contenedores
-- Monorepo, tooling (tsconfig, biome, vitest), CI de GitHub Actions (lint + test + build de imágenes).
+- Monorepo, tooling (tsconfig, biome, vitest). Sin CI: `typecheck`, `lint` y `test` se
+  ejecutan en local, y las imágenes se construyen en local.
 - Dockerfile multi-arch con toolchains y Pi instalado. `docker compose up` arranca gateway y `edge`.
 - `edge` mínimo: entrada con Bearer y `/health`, reenvío al gateway, proxy `CONNECT` +
   HTTP con registro, y la topología de redes (el agente sin salida directa).
