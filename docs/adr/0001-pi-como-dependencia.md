@@ -5,12 +5,12 @@
 
 ## Contexto
 Queremos un agente de programación que funcione en contenedores. Pi
-(`@mariozechner/pi-coding-agent`) es un agente mínimo en TypeScript, multiproveedor, con
+(`@earendil-works/pi-coding-agent`) es un agente mínimo en TypeScript, multiproveedor, con
 modos headless (print, JSON, RPC), SDK y un sistema de extensiones (tools, hooks sobre
 tool calls, diálogos de UI, proveedores personalizados). Es un proyecto muy activo.
 
 ## Decisión
-Instalar Pi como dependencia npm con versión fijada y ampliarlo exclusivamente mediante
+Instalar Pi como dependencia npm con versión exacta fijada (`1.5.2`) y ampliarlo exclusivamente mediante
 extensiones, prompt de sistema adicional y `models.json`. No hacemos fork.
 
 ## Consecuencias
@@ -19,6 +19,3 @@ extensiones, prompt de sistema adicional y `models.json`. No hacemos fork.
 - (−) Dependemos de la estabilidad de la API de extensiones y del protocolo RPC: hay que
   fijar versión y tener tests de integración que detecten roturas al actualizar.
 - Si alguna necesidad no se puede cubrir con extensiones, se reevaluará (fork o PR upstream).
-
-## Actualización (ADR-0005)
-El paquete pasa a ser `@earendil-works/pi-coding-agent`, fijado en `1.5.2`.

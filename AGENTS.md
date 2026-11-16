@@ -22,9 +22,8 @@ Si eres `implementer`, sigue el encargo recibido y esta guía; no replanifiques.
 4. Para cualquier duda sobre Pi, **lee su documentación instalada** en vez de suponer:
    `node_modules/@earendil-works/pi-coding-agent/docs/` (sobre todo `rpc.md`,
    `rpc-commands.md`, `rpc-extension-ui.md`, `json.md`, `extensions.md`, `models.md`,
-   `security.md`) y los ejemplos de `examples/extensions/`. El plan se validó en parte
-   contra la documentación de la 0.73.1: si algo no coincide con la instalada, manda la
-   instalada y hay que avisar.
+   `security.md`) y los ejemplos de `examples/extensions/`. Si el plan no coincide con la
+   documentación instalada, manda la instalada y hay que avisar.
 
 ## Stack y convenciones
 - **Node 22 LTS** (≥ 22.21), **TypeScript estricto**, ESM (`"type": "module"`), npm workspaces.

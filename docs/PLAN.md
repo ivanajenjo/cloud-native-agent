@@ -199,7 +199,7 @@ providers:
 | 12 | **Imágenes en el prompt** | Backlog | Adjuntar capturas en la web UI y `--image` en el CLI. |
 
 **Descartado conscientemente:**
-- **MCP:** Pi 1.x ya lo soporta, pero cada servidor es un proceso más y más destinos de
+- **MCP:** Pi lo soporta, pero cada servidor es un proceso más y más destinos de
   red que controlar. Se arranca con `--no-mcp`; queda en el backlog.
 - **Subagentes:** demasiado caros en memoria para una Raspberry Pi 4.
 - **Permisos por tool:** el contenedor y el proxy de salida cumplen ese papel. Las únicas confirmaciones son push/PR, el plan y la red.
