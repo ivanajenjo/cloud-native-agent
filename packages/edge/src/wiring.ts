@@ -1,5 +1,6 @@
 import { readFile } from "node:fs/promises";
 import type { Server } from "node:http";
+import type { Socket } from "node:net";
 import { join } from "node:path";
 import {
   type NetworkLogEntry,
@@ -36,6 +37,8 @@ export interface WiringOptions {
   resolver?: Resolver;
   /** Default console.error. Receives only messages without secrets. */
   logError?: (message: string) => void;
+  /** Injectable for tests. Opens the upstream TCP connection to an already validated IP. Default net.connect. */
+  connect?: (target: { host: string; port: number }) => Socket;
 }
 
 /**
@@ -76,7 +79,7 @@ export async function createEdgeRuntime(options: WiringOptions): Promise<EdgeRun
     },
   };
 
-  const proxy = createEgressProxy({ policy, log, resolver });
+  const proxy = createEgressProxy({ policy, log, resolver, connect: options.connect });
   const ingress = createIngressApp({
     token: config.token,
     gatewayUrl: config.gatewayUrl,

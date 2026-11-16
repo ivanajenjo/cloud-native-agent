@@ -4,5 +4,10 @@
     "noEmit": true,
     "customConditions": ["development"]
   },
-  "include": ["packages/*/src/**/*.ts", "packages/*/test/**/*.ts", "vitest.config.ts"]
+  "include": [
+    "packages/*/src/**/*.ts",
+    "packages/*/test/**/*.ts",
+    "tests/**/*.ts",
+    "vitest.config.ts"
+  ]
 }
