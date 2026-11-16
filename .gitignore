@@ -4,3 +4,6 @@ dist/
 coverage/
 .env
 .edge-data/
+.data/
+# Real providers file (may hold API keys); the versioned example is config/providers.example.yaml.
+config/providers.yaml

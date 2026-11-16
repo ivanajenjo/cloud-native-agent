@@ -12,6 +12,7 @@ COPY package.json package-lock.json tsconfig.base.json ./
 COPY packages/shared/package.json packages/shared/package.json
 COPY packages/gateway/package.json packages/gateway/package.json
 COPY packages/edge/package.json packages/edge/package.json
+COPY packages/extensions/package.json packages/extensions/package.json
 RUN npm ci
 COPY packages/ packages/
 RUN npm run build
@@ -25,6 +26,7 @@ COPY package.json package-lock.json ./
 COPY packages/shared/package.json packages/shared/package.json
 COPY packages/gateway/package.json packages/gateway/package.json
 COPY packages/edge/package.json packages/edge/package.json
+COPY packages/extensions/package.json packages/extensions/package.json
 RUN npm ci --omit=dev
 
 # ---------------------------------------------------------------------------
@@ -74,6 +76,14 @@ COPY --from=build /app/packages/shared/dist /app/packages/shared/dist
 COPY --from=build /app/packages/gateway/package.json /app/packages/gateway/package.json
 COPY --from=build /app/packages/gateway/dist /app/packages/gateway/dist
 COPY --from=prod-deps /app/node_modules /app/node_modules
+# shared's own dependencies may be nested (e.g. yaml 2.9.1 in packages/shared/node_modules).
+COPY --from=prod-deps /app/packages/shared/node_modules /app/packages/shared/node_modules
+
+# Extensions for Pi: loaded from source by jiti at runtime (src) with their markdown assets.
+# Owned by root (no --chown) and not writable by `agent`: the agent cannot change its own tools.
+COPY packages/extensions/package.json /app/packages/extensions/package.json
+COPY packages/extensions/src /app/packages/extensions/src
+COPY packages/extensions/assets /app/packages/extensions/assets
 
 # Pi: build-time check and global link. Config goes to a temporary directory so nothing
 # is left as root in the /data volume.

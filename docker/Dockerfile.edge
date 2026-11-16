@@ -12,6 +12,7 @@ COPY package.json package-lock.json tsconfig.base.json ./
 COPY packages/shared/package.json packages/shared/package.json
 COPY packages/gateway/package.json packages/gateway/package.json
 COPY packages/edge/package.json packages/edge/package.json
+COPY packages/extensions/package.json packages/extensions/package.json
 RUN npm ci
 COPY packages/ packages/
 RUN npm run build
@@ -25,7 +26,8 @@ COPY package.json package-lock.json ./
 COPY packages/shared/package.json packages/shared/package.json
 COPY packages/gateway/package.json packages/gateway/package.json
 COPY packages/edge/package.json packages/edge/package.json
-RUN npm ci --omit=dev --workspace=@cna/edge --include-workspace-root=false
+COPY packages/extensions/package.json packages/extensions/package.json
+RUN npm ci --omit=dev --workspace=@cna/edge --workspace=@cna/shared --include-workspace-root=false
 
 # ---------------------------------------------------------------------------
 # runtime
@@ -39,6 +41,7 @@ RUN groupmod -n agent node \
 ENV EDGE_DATA_DIR=/edge-data \
     EDGE_API_PORT=8080 \
     EDGE_PROXY_PORT=3128 \
+    EDGE_PROVIDERS_FILE=/config/providers.yaml \
     GATEWAY_URL=http://agent:8090
 
 WORKDIR /app
@@ -47,6 +50,8 @@ COPY --from=build /app/packages/shared/dist /app/packages/shared/dist
 COPY --from=build /app/packages/edge/package.json /app/packages/edge/package.json
 COPY --from=build /app/packages/edge/dist /app/packages/edge/dist
 COPY --from=prod-deps /app/node_modules /app/node_modules
+# shared's own dependencies may be nested (e.g. yaml 2.9.1 in packages/shared/node_modules).
+COPY --from=prod-deps /app/packages/shared/node_modules /app/packages/shared/node_modules
 
 # edge's own volume: policy, "always allow" and network log (ADR-0006).
 RUN install -d -o agent -g agent /edge-data

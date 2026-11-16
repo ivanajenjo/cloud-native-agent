@@ -6,7 +6,11 @@ node_modules
 .claude
 docs
 deploy
+# Real providers.yaml may hold API keys; the images read /config from a mount.
+config
 **/*.md
+# The extensions' markdown assets are loaded by Pi at runtime.
+!packages/extensions/assets/*.md
 .env*
 coverage
 **/*.tsbuildinfo

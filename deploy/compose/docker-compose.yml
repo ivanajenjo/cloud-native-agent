@@ -16,6 +16,8 @@ services:
     # No `ports`: the agent is only reachable from edge.
     volumes:
       - agent-data:/data
+      # Read-only: the providers file (ADR-0008). Mount the directory, not the file.
+      - ../../config:/config:ro
     environment:
       GITHUB_TOKEN: ${GITHUB_TOKEN:-}
       ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
@@ -40,8 +42,15 @@ services:
       - "${CNA_PUBLISH_ADDR:-127.0.0.1}:8080:8080"
     environment:
       AGENT_API_TOKEN: ${AGENT_API_TOKEN:?set AGENT_API_TOKEN}
+      EDGE_ASK_TIMEOUT_MS: ${EDGE_ASK_TIMEOUT_MS:-120000}
     volumes:
       - edge-data:/edge-data
+      # Read-only: edge reads the allowed provider endpoints from here (ADR-0008).
+      - ../../config:/config:ro
+    # Linux (Raspberry) needs this for http://host.docker.internal in providers.yaml; Docker
+    # Desktop already provides it. Only edge resolves and connects to providers.
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     depends_on:
       - agent
     security_opt:
