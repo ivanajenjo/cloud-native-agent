@@ -191,7 +191,7 @@ async function decide(
   target: ProxyTarget,
 ): Promise<string[]> {
   const addresses = await context.resolver(target.host).catch(() => []);
-  const result = context.policy({ host: target.host, port: target.port, addresses });
+  const result = await context.policy({ host: target.host, port: target.port, addresses });
   exchange.host = target.host;
   exchange.port = target.port;
   exchange.decision = result.decision;
