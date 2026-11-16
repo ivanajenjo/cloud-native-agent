@@ -341,6 +341,54 @@ describe("createGatewayRuntime", () => {
     ).rejects.toThrow(/web\.yaml/);
   });
 
+  it("redacts the ntfy token of notifications.yaml from the events", async () => {
+    const token = "ntfy-token-0123456789";
+    const config = configFor();
+    // notifications.yaml is read when the runtime is created, so it must exist before start().
+    await writeFile(
+      config.notificationsFile,
+      "provider: ntfy\nntfy:\n  url: https://ntfy.example.invalid\n  topic: cna\n  token: $TEST_NTFY_TOKEN\n",
+    );
+    const { app, startPi } = await start(config, { TEST_NTFY_TOKEN: token });
+
+    await app.request("/session", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ repo: "octo/hello", prompt: "hola" }),
+    });
+    await waitForRunning(app);
+
+    const handlers = startPi.mock.calls[0]?.[1];
+    handlers?.onEvent({
+      type: "message_end",
+      message: { role: "assistant", content: `the token is ${token}, ntfy-leak` },
+    });
+
+    const events = await readEventsUntil(app, "ntfy-leak");
+    expect(events).toContain("the token is [REDACTED], ntfy-leak");
+    expect(events).not.toContain(token);
+  }, 15_000);
+
+  it("starts without notifications.yaml", async () => {
+    const { app } = await start();
+
+    expect((await app.request("/models")).status).toBe(200);
+  });
+
+  it("rejects when notifications.yaml is invalid", async () => {
+    const config = configFor();
+    await writeFile(config.notificationsFile, "provider: bogus\n");
+
+    await expect(
+      createGatewayRuntime({
+        config,
+        version: "0.0.0-test",
+        env: testEnv(),
+        piCli: join(root, "pi", "cli.js"),
+      }),
+    ).rejects.toThrow(/^notifications\.yaml:/);
+  });
+
   it("rejects when an extension file is missing", async () => {
     const emptyExtensions = join(root, "empty-extensions");
     await mkdir(emptyExtensions);

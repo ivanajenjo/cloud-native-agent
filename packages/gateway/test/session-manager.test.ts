@@ -14,6 +14,7 @@ import type { RpcExtensionUIRequest } from "@earendil-works/pi-coding-agent";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { EventLog } from "../src/events/event-log.js";
 import type { ToolLog } from "../src/logs/tool-log.js";
+import type { Notification, Notifier } from "../src/notifications/notifier.js";
 import type { PiLaunchSpec } from "../src/pi/launch.js";
 import { createRedactor } from "../src/redact.js";
 import {
@@ -145,6 +146,7 @@ interface Harness {
 interface HarnessOptions {
   webConfigFile?: string;
   toolLog?: ToolLog;
+  notifier?: Notifier;
 }
 
 function harness(wrapGit: GitWrapper = (real) => real, options: HarnessOptions = {}): Harness {
@@ -174,6 +176,7 @@ function harness(wrapGit: GitWrapper = (real) => real, options: HarnessOptions =
     ...(options.toolLog !== undefined ? { toolLog: options.toolLog } : {}),
     defaultModel: "ollama/qwen3-coder:30b",
     remoteBase,
+    ...(options.notifier !== undefined ? { notifier: options.notifier } : {}),
     logger: {
       info: (message) => logs.push(message),
       error: (message) => logs.push(message),
@@ -1268,6 +1271,131 @@ describe("SessionManager", () => {
       expect(h.manager.get()?.status).toBe("running");
       expect(h.manager.checkpoints()).toEqual([]);
       expect(h.logs).toContainEqual(expect.stringContaining("checkpoint 0: disk full"));
+    });
+  });
+
+  describe("push notifications", () => {
+    function fakeNotifier(): { notify: ReturnType<typeof vi.fn> } & Notifier {
+      return { notify: vi.fn(async (_notification: Notification) => undefined) };
+    }
+
+    it("notifies waiting_input with the question and the repo, and not again while questions wait", async () => {
+      const notifier = fakeNotifier();
+      const h = harness(undefined, { notifier });
+      const pi = await createAndRun(h);
+      expect(notifier.notify).not.toHaveBeenCalled();
+
+      pi.ui(selectRequest("q1", "cna:ask_user:Which one?", ["a", "b"]));
+      expect(notifier.notify).toHaveBeenCalledTimes(1);
+      expect(notifier.notify).toHaveBeenLastCalledWith({
+        event: "waiting_input",
+        title: "cna: octo/hello needs your input",
+        message: "Which one?",
+      });
+
+      pi.ui(confirmRequest("q2", "cna:confirm:Push?"));
+      expect(h.manager.get()?.status).toBe("waiting_input");
+      expect(notifier.notify).toHaveBeenCalledTimes(1);
+    });
+
+    it("notifies ready with the branch when the run settles", async () => {
+      const notifier = fakeNotifier();
+      const h = harness(undefined, { notifier });
+      const pi = await createAndRun(h);
+
+      pi.emit({ type: "agent_settled" });
+
+      expect(h.manager.get()?.status).toBe("ready");
+      expect(notifier.notify).toHaveBeenCalledTimes(1);
+      expect(notifier.notify).toHaveBeenLastCalledWith({
+        event: "ready",
+        title: "cna: octo/hello finished",
+        message: "Branch agent/fix-the-readme is ready.",
+      });
+    });
+
+    it("notifies error with the reason when Pi exits unexpectedly", async () => {
+      const notifier = fakeNotifier();
+      const h = harness(undefined, { notifier });
+      const pi = await createAndRun(h);
+
+      pi.exit(1, null);
+
+      expect(notifier.notify).toHaveBeenCalledTimes(1);
+      expect(notifier.notify).toHaveBeenLastCalledWith({
+        event: "error",
+        title: "cna: octo/hello failed",
+        message: "pi exited unexpectedly (code 1, signal null)",
+      });
+    });
+
+    it("does not notify when the clone ends and the run starts", async () => {
+      const notifier = fakeNotifier();
+      const h = harness(undefined, { notifier });
+      await createAndRun(h);
+
+      expect(h.manager.get()?.status).toBe("running");
+      expect(notifier.notify).not.toHaveBeenCalled();
+    });
+
+    it("redacts secrets from the notification text", async () => {
+      const notifier = fakeNotifier();
+      const h = harness(undefined, { notifier });
+      const pi = await createAndRun(h);
+
+      pi.ui(selectRequest("q1", `cna:ask_user:Use ${SECRET} here?`, ["a"]));
+
+      expect(notifier.notify).toHaveBeenCalledTimes(1);
+      const sent = notifier.notify.mock.calls[0]?.[0] as Notification;
+      expect(sent.message).toBe("Use [REDACTED] here?");
+      expect(JSON.stringify(sent)).not.toContain(SECRET);
+    });
+
+    it("cuts the message to 300 characters", async () => {
+      const notifier = fakeNotifier();
+      const h = harness(undefined, { notifier });
+      const pi = await createAndRun(h);
+
+      pi.ui(selectRequest("q1", `cna:ask_user:${"y".repeat(500)}`, ["a"]));
+
+      const sent = notifier.notify.mock.calls[0]?.[0] as Notification;
+      expect(sent.message).toBe("y".repeat(300));
+    });
+
+    it("keeps the session going and logs the error when notify rejects", async () => {
+      const notifier: Notifier = {
+        notify: vi.fn(async () => {
+          throw new Error(`push failed with ${SECRET}`);
+        }),
+      };
+      const h = harness(undefined, { notifier });
+      const pi = await createAndRun(h);
+
+      pi.emit({ type: "agent_settled" });
+
+      expect(h.manager.get()?.status).toBe("ready");
+      expect(eventTypes(h)).toContain("status");
+      await vi.waitFor(() =>
+        expect(h.logs).toContain("notifications: push failed with [REDACTED]"),
+      );
+    });
+
+    it("keeps the session going and logs the error when notify throws synchronously", async () => {
+      const notifier: Notifier = {
+        notify: vi.fn((): Promise<void> => {
+          throw new Error("sync failure");
+        }),
+      };
+      const h = harness(undefined, { notifier });
+      const pi = await createAndRun(h);
+
+      pi.ui(selectRequest("q1", "cna:ask_user:Which?", ["a"]));
+
+      expect(h.manager.get()?.status).toBe("waiting_input");
+      expect(h.manager.get()?.pendingQuestions.map((q) => q.id)).toEqual(["q1"]);
+      expect(h.logs).toContain("notifications: sync failure");
+      await h.manager.answer("q1", { value: "a" });
+      expect(h.manager.get()?.status).toBe("running");
     });
   });
 });

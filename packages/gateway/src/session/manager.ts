@@ -28,6 +28,7 @@ import type {
 } from "@earendil-works/pi-coding-agent";
 import type { EventLog } from "../events/event-log.js";
 import type { ToolLog } from "../logs/tool-log.js";
+import type { Notification, Notifier } from "../notifications/notifier.js";
 import type { PiLaunchSpec } from "../pi/launch.js";
 import { buildPiLaunch } from "../pi/launch.js";
 import type { Redactor } from "../redact.js";
@@ -92,6 +93,8 @@ export interface SessionManagerOptions {
   gitIdentity?: { name?: string; email?: string };
   /** Default "https://github.com/" (tests pass a file:// base). */
   remoteBase?: string;
+  /** Push notifications of status changes (ADR-0009). Absent: no notifications. */
+  notifier?: Notifier;
   /** Default console. Receives only redacted text. */
   logger?: { info(message: string): void; error(message: string): void };
   now?: () => Date;
@@ -105,6 +108,8 @@ const ABORT_TIMEOUT_MS = 60_000;
 const MAX_LOGGED_LINE_LENGTH = 500;
 const PROMPT_DISPOSITIONS: readonly PromptDisposition[] = ["started", "queued", "handled"];
 const MESSAGE_STATUSES: readonly SessionStatus[] = ["running", "waiting_input", "ready"];
+/** Max length of the message of a push notification (after redaction). */
+const MAX_NOTIFICATION_MESSAGE_LENGTH = 300;
 
 /** A checkpoint plus what restoring its conversation needs (ADR-0007, point 3). */
 interface CheckpointRecord {
@@ -883,6 +888,7 @@ export class SessionManager implements SessionService {
     if (info.status === status && info.error === safeError) {
       return;
     }
+    const previous = info.status;
     info.status = status;
     info.error = safeError;
     this.emit(
@@ -890,6 +896,66 @@ export class SessionManager implements SessionService {
         ? { type: "status", status }
         : { type: "status", status, error: safeError },
     );
+    this.notifyStatusChange(previous, status, safeError);
+  }
+
+  /** Sends the push notification of a status change, if it has one. Never throws, never waits. */
+  private notifyStatusChange(previous: SessionStatus, status: SessionStatus, error?: string): void {
+    const notifier = this.options.notifier;
+    const draft = notifier === undefined ? null : this.notificationFor(previous, status, error);
+    if (notifier === undefined || draft === null) {
+      return;
+    }
+    const notification: Notification = {
+      event: draft.event,
+      title: this.redactor.redactString(draft.title),
+      message: this.redactor.redactString(draft.message).slice(0, MAX_NOTIFICATION_MESSAGE_LENGTH),
+    };
+    try {
+      void Promise.resolve(notifier.notify(notification)).catch((notifyError: unknown) => {
+        this.logNotificationError(notifyError);
+      });
+    } catch (notifyError) {
+      this.logNotificationError(notifyError);
+    }
+  }
+
+  /** The notification for entering `status` from `previous` (ADR-0009, funcionalidad 5); null if none. */
+  private notificationFor(
+    previous: SessionStatus,
+    status: SessionStatus,
+    error: string | undefined,
+  ): Notification | null {
+    const info = this.info;
+    if (info === null) {
+      return null;
+    }
+    if (status === "waiting_input" && previous !== "waiting_input") {
+      return {
+        event: "waiting_input",
+        title: `cna: ${info.repo} needs your input`,
+        message: this.questions.list()[0]?.title ?? "A question is waiting.",
+      };
+    }
+    if (status === "ready" && (previous === "running" || previous === "waiting_input")) {
+      return {
+        event: "ready",
+        title: `cna: ${info.repo} finished`,
+        message: `Branch ${info.branch ?? "(none)"} is ready.`,
+      };
+    }
+    if (status === "error") {
+      return {
+        event: "error",
+        title: `cna: ${info.repo} failed`,
+        message: error ?? "Unknown error",
+      };
+    }
+    return null;
+  }
+
+  private logNotificationError(error: unknown): void {
+    this.logger.error(`notifications: ${this.redactor.redactString(errorMessage(error))}`);
   }
 
   /** Throws invalid_state if the workspace has uncommitted changes or commits not pushed. */

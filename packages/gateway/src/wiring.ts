@@ -13,6 +13,11 @@ import {
 import { type GatewayConfig, gatewayPaths } from "./config.js";
 import { EventLog } from "./events/event-log.js";
 import { createToolLog } from "./logs/tool-log.js";
+import {
+  createNotifier,
+  loadNotificationsConfig,
+  notificationSecrets,
+} from "./notifications/notifier.js";
 import { resolvePiCli } from "./pi/launch.js";
 import { createRedactor, secretsFromEnv } from "./redact.js";
 import { RpcBridge, type RpcBridgeHandlers } from "./rpc/bridge.js";
@@ -58,6 +63,7 @@ export async function createGatewayRuntime(options: GatewayWiringOptions): Promi
 
   const providers = await loadProvidersConfig(config.providersFile);
   const webSecrets = await loadWebSecrets(config.webFile, env);
+  const notifications = await loadNotificationsConfig(config.notificationsFile);
 
   await mkdir(paths.agentDir, { recursive: true, mode: 0o700 });
   await mkdir(paths.sessionDir, { recursive: true });
@@ -65,11 +71,13 @@ export async function createGatewayRuntime(options: GatewayWiringOptions): Promi
   await writeModelsJson(paths.agentDir, providers);
   await copyFile(paths.globalAgentsFile, join(paths.agentDir, "AGENTS.md"));
 
-  // The redactor sees every secret in env (API token included) and the keys of providers.yaml.
+  // The redactor sees every secret in env (API token included), the keys of providers.yaml and the
+  // tokens of notifications.yaml.
   const redactor = createRedactor([
     ...secretsFromEnv(env),
     ...providerSecrets(providers, env),
     ...webSecrets,
+    ...(notifications === undefined ? [] : notificationSecrets(notifications, env)),
   ]);
   // Git and Pi get the environment without the API token.
   const childEnv = withoutApiToken(env);
@@ -98,6 +106,15 @@ export async function createGatewayRuntime(options: GatewayWiringOptions): Promi
     defaultModel: providers.default,
     gitIdentity: { name: config.gitUserName, email: config.gitUserEmail },
     remoteBase: options.remoteBase,
+    ...(notifications === undefined
+      ? {}
+      : {
+          notifier: createNotifier({
+            config: notifications,
+            env,
+            logError: (message) => console.error(message),
+          }),
+        }),
   });
 
   const app = createApp({
