@@ -16,6 +16,7 @@
     "typecheck": "tsc -p tsconfig.json",
     "lint": "biome check .",
     "format": "biome format --write .",
+    "pretest": "npm run build -w @cna/shared",
     "test": "vitest run"
   },
   "devDependencies": {
