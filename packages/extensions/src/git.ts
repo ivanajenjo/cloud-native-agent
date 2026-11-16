@@ -1,7 +1,8 @@
 /**
- * Extension `git`: `git_status`, `git_commit` and `git_push`. The agent commits only on
- * `agent/*` branches and never pushes the base branch. Git runs through `pi.exec` without
- * a shell. Pushes need the user's confirmation unless `cna-auto-push` is set.
+ * Extension `git`: `git_status`, `git_commit`, `git_push` and `create_pr`. The agent commits
+ * only on `agent/*` branches and never pushes the base branch. Git and gh run through
+ * `pi.exec` without a shell. Pushes and pull requests need the user's confirmation unless
+ * `cna-auto-push` is set.
  */
 
 import { posix, win32 } from "node:path";
@@ -13,7 +14,10 @@ const BRANCH_PREFIX = "agent/";
 const BASE_BRANCH_FLAG = "cna-base-branch";
 const AUTO_PUSH_FLAG = "cna-auto-push";
 const GIT_TIMEOUT_MS = 120_000;
+const GH_TIMEOUT_MS = 120_000;
 const MAX_STDERR_CHARS = 2000;
+const MAX_PR_TITLE_CHARS = 256;
+const MAX_PR_BODY_CHARS = 65_536;
 
 /** Runs git without a shell. A non-zero exit code is returned, not thrown. */
 function git(
@@ -114,6 +118,12 @@ const commitParameters = Type.Object({
 });
 
 const pushParameters = Type.Object({});
+
+const pullRequestParameters = Type.Object({
+  title: Type.String({ description: "Pull request title. Required and not empty." }),
+  body: Type.String({ description: "Pull request description in Markdown." }),
+  draft: Type.Optional(Type.Boolean({ description: "Open the pull request as a draft." })),
+});
 
 export default function gitExtension(pi: ExtensionAPI): void {
   pi.registerFlag(BASE_BRANCH_FLAG, {
@@ -238,6 +248,115 @@ export default function gitExtension(pi: ExtensionAPI): void {
       return {
         content: [{ type: "text", text: `Pushed ${branch} to origin.` }],
         details: { branch, confirmed: true, autoPush },
+      };
+    },
+  });
+
+  pi.registerTool({
+    name: "create_pr",
+    label: "Create pull request",
+    description:
+      "Open a pull request from the current agent/* branch into the base branch with gh. " +
+      "The branch must be pushed with git_push first. Asks the user for confirmation first, " +
+      "unless the session has auto-push enabled.",
+    promptGuidelines: [
+      "Use create_pr after git_push to open a pull request; never run gh pr create in bash.",
+    ],
+    parameters: pullRequestParameters,
+    async execute(_toolCallId, params, signal, _onUpdate, ctx) {
+      const base = baseBranch(pi);
+      if (base === undefined) {
+        throw new Error("base branch unknown; pull requests disabled");
+      }
+      const title = params.title.trim();
+      if (title === "") {
+        throw new Error("The pull request title is empty.");
+      }
+      if ([...title].length > MAX_PR_TITLE_CHARS) {
+        throw new Error(`The pull request title is longer than ${MAX_PR_TITLE_CHARS} characters.`);
+      }
+      if (params.body.length > MAX_PR_BODY_CHARS) {
+        throw new Error(`The pull request body is longer than ${MAX_PR_BODY_CHARS} characters.`);
+      }
+      const draft = params.draft === true;
+
+      const cwd = ctx.cwd;
+      const branch = await currentBranch(pi, cwd, signal);
+      if (!isAgentBranch(branch, base)) {
+        throw new Error(
+          `pull requests only from agent/* branches other than the base (current branch: ${branch})`,
+        );
+      }
+
+      // The branch must exist on origin under the same name, with nothing left unpushed.
+      const remoteHeads = await gitOk(pi, cwd, signal, [
+        "ls-remote",
+        "--heads",
+        "origin",
+        `refs/heads/${branch}`,
+      ]);
+      const onRemote = remoteHeads
+        .split("\n")
+        .some((line) => line.endsWith(`\trefs/heads/${branch}`));
+      if (!onRemote) {
+        throw new Error("The branch is not on origin yet; use git_push first.");
+      }
+      const unpushedOutput = await gitOk(pi, cwd, signal, [
+        "rev-list",
+        "--count",
+        "HEAD",
+        "--not",
+        "--remotes=origin",
+      ]);
+      const unpushed = Number(unpushedOutput.trim());
+      if (!Number.isInteger(unpushed)) {
+        throw new Error("Could not count the commits that are not pushed.");
+      }
+      if (unpushed > 0) {
+        throw new Error("The branch has commits that are not pushed; use git_push first.");
+      }
+
+      const autoPush = pi.getFlag(AUTO_PUSH_FLAG) === true;
+      if (!autoPush) {
+        const confirmed = await ctx.ui.confirm(
+          encodeQuestionTitle("confirm", `Create a pull request from ${branch} into ${base}?`),
+          `Title: ${title}`,
+        );
+        if (!confirmed) {
+          throw new Error("Pull request not confirmed by the user.");
+        }
+      }
+
+      const result = await pi.exec(
+        "gh",
+        [
+          "pr",
+          "create",
+          // "--flag=value": a title or body starting with "-" is never read as a flag.
+          `--base=${base}`,
+          `--head=${branch}`,
+          `--title=${title}`,
+          `--body=${params.body}`,
+          ...(draft ? ["--draft"] : []),
+        ],
+        { cwd, signal, timeout: GH_TIMEOUT_MS },
+      );
+      if (result.code !== 0) {
+        const stderr = result.stderr.trim().slice(0, MAX_STDERR_CHARS);
+        throw new Error(`gh pr create failed (exit ${result.code}): ${stderr}`);
+      }
+
+      const urls = result.stdout
+        .split("\n")
+        .map((line) => line.trim())
+        .filter((line) => line.startsWith("https://"));
+      const url = urls[urls.length - 1];
+      if (url === undefined) {
+        throw new Error("gh pr create did not print the pull request URL");
+      }
+      return {
+        content: [{ type: "text", text: `Created pull request ${url}` }],
+        details: { url, base, branch, draft },
       };
     },
   });
