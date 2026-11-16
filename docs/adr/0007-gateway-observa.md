@@ -25,6 +25,13 @@ protocolo RPC no tiene un canal genérico de eventos de extensión, y
 5. **Tipo de pregunta:** las extensiones anteponen `cna:<kind>:` al título del diálogo; el
    códec vive en `@cna/shared`. Sin prefijo se trata como `ask_user`.
 
+Nota (fase 2): en vez del `entryId` se guarda cuántos mensajes de usuario tiene la rama al
+crear el checkpoint (`get_fork_messages`). Al restaurar la conversación se pide de nuevo
+`get_fork_messages` y se hace `fork` con el `entryId` del mensaje en esa posición, que es el
+primero posterior al checkpoint. Así no hace falta seguir el mensaje siguiente cuando llega.
+Restaurar con conversación descarta los checkpoints posteriores, que quedan en la rama
+abandonada.
+
 ## Consecuencias
 - (+) Menos código dentro de Pi y menos superficie expuesta a cambios de su API.
 - (+) Checkpoints y registro funcionan aunque una extensión falle.

@@ -73,6 +73,8 @@ ejecutar tests y subir los cambios. Se controla por API REST, una web UI sencill
   evento `entry_appended`.
 - **Contrato interno `edge` ↔ gateway** (ADR-0008). `providers.yaml` se monta en solo
   lectura en los dos contenedores para que `edge` permita los proveedores sin fiarse del agente.
+- **Servicios auxiliares** (ADR-0009). `notifications.yaml` y `web.yaml` siguen el mismo
+  camino: solo lectura en los dos contenedores, y `edge` permite sus hosts.
 
 ## API REST (borrador v1)
 
@@ -108,9 +110,11 @@ DELETE /session                         cierra y limpia el workspace. 409 si hay
 
 Endpoints de red (los atiende `edge`, no el gateway):
 ```
-GET    /network/log                     conexiones de la sesión (host, puerto, decisión, bytes)
-GET    /network/policy                  modo + allowlist/denylist efectivas
-PUT    /network/policy                  cambiar modo o listas
+GET    /network/log?limit=N             últimas conexiones desde que arrancó edge (host, puerto,
+                                        decisión, bytes); máx. 1000, por defecto 200
+GET    /network/policy                  modo, allowlist del usuario, base, servicios y puertos
+PUT    /network/policy                  {mode?, allow?}: cambiar el modo o reemplazar la
+                                        allowlist del usuario
 ```
 
 Como hay una sesión por réplica, la API usa `/session` en singular. Un hub futuro
@@ -127,8 +131,9 @@ expondría `/sessions/:id` y redirigiría a la réplica correspondiente.
 
 **Eventos SSE** (normalizados desde los eventos RPC de Pi y del proxy):
 `status`, `message_delta`, `thinking_delta`, `message`, `tool_start`, `tool_update`,
-`tool_end`, `question`, `question_resolved`, `network`, `todo`, `checkpoint`,
-`compaction`, `retry`, `notify`, `error`.
+`tool_end`, `question`, `question_resolved`, `network`, `todo`, `checkpoint`
+(`action: created|restored`), `mode` (al aprobar el plan), `compaction`, `retry`, `notify`,
+`error`.
 - Pi solo envía deltas en `message_update`; el mensaje definitivo es el de `message_end`.
 - `question.kind`: `ask_user`, `confirm` (push/PR), `plan` (*aprobar*, *pedir cambios*) o
   `network` (*permitir esta vez*, *permitir siempre*, *denegar*).
@@ -156,9 +161,9 @@ repo sí se carga, como texto no fiable.
 | `ask_user` | Tool `ask_user({question, options?, multiline?})`. Usa `ctx.ui.select` / `ctx.ui.input` / `ctx.ui.editor`; el gateway lo publica como `question{kind:"ask_user"}`. |
 | `git` | Tools `git_status`, `git_commit`, `git_push`, `create_pr` (con `gh`). `git_push` y `create_pr` piden confirmación con `ctx.ui.confirm` salvo `autoPush: true`. Ramas siempre `agent/<slug>`; nunca push a la rama base. |
 | `todo` | Tool `todo` (crear/actualizar/completar). El estado va en `details` del resultado; el gateway lo lee de `tool_execution_end` y emite `todo`. Basada en `examples/extensions/todo.ts`. |
-| `plan-mode` | Con `mode: "plan"` (flag `--plan`) solo activa tools de lectura y añade `submit_plan`. El plan se presenta como `question{kind:"plan"}`; al aprobarlo se activan el resto de tools. Avisa del cambio de modo con `pi.appendEntry("cna.mode", …)`. Basada en `examples/extensions/plan-mode`. |
+| `plan-mode` | Con `mode: "plan"` (flag `--cna-plan`) solo activa tools de lectura y añade `submit_plan`. El plan se presenta como `question{kind:"plan"}`; al aprobarlo se activan el resto de tools. Avisa del cambio de modo con `pi.appendEntry("cna.mode", …)`. Basada en `examples/extensions/plan-mode`. |
 | `guard` | Hook `tool_call` que bloquea comandos peligrosos evidentes (`git push` directo por `bash`, `--force`, `rm -rf /`, `docker run`…). Es una ayuda contra despistes del modelo, no una barrera de seguridad. |
-| `web` | Tools `web_search` (SearXNG autoalojado o API tipo Brave/Tavily) y `web_fetch` (descarga y convierte a texto). El resultado se marca como contenido externo no fiable. Su tráfico pasa por el proxy como el resto. |
+| `web` | Tools `web_search` (SearXNG autoalojado, Brave o Tavily según `config/web.yaml`, que recibe con `--cna-web-config`) y `web_fetch` (descarga y convierte a texto). El resultado se marca como contenido externo no fiable. Su tráfico pasa por el proxy como el resto. |
 
 No hay extensión `audit` ni `checkpoint`: lo hace el gateway (ADR-0007).
 
@@ -323,7 +328,7 @@ deploy/
   compose/        docker-compose.yml (1..N réplicas; SearXNG opcional con un profile)
   k8s/            manifiestos / kustomize para k3s/kind
 config/
-  providers.example.yaml, network.example.yaml, notifications.example.yaml
+  providers.example.yaml, notifications.example.yaml, web.example.yaml
 docs/
   PLAN.md, fase-1.5.md, adr/
 ```
@@ -361,13 +366,17 @@ la fase 2. La especificación de cada tarea (qué hay, qué se quiere, ficheros,
 criterio de terminado) está en [`fase-1.5.md`](fase-1.5.md).
 
 1. Verificar con Docker las imágenes y `scripts/verify-egress.sh`, y cerrar la allowlist base.
-2. Fijar las versiones exactas de los toolchains en `docker/mise/config.toml`.
+   **Pendiente:** necesita Docker con red normal (ver `fase-1.5.md`).
+2. Fijar las versiones exactas de los toolchains en `docker/mise/config.toml`. **Pendiente**,
+   depende de la 1.
 3. Partir `SessionManager`: preguntas pendientes con sus timeouts y comprobación del
    workspace, sin cambiar el comportamiento.
 4. Test conjunto de `edge` y gateway que recorra una pregunta de red de extremo a extremo.
 5. Aclarar la versión de Node en ADR-0005.
 
 ### Fase 2 — PR y funcionalidades
+Hecha, salvo la comprobación con las imágenes construidas (como las tareas 1 y 2 de la fase
+1.5): la imagen de SearXNG del profile `search` y las notificaciones reales no se han probado.
 - `create_pr` con `gh`.
 - Extensiones `todo` (1), `plan-mode` (2), `guard` y `web`.
 - Endpoints `/network/*`.

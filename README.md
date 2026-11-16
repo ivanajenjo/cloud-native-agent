@@ -6,10 +6,12 @@ Docker en una Raspberry Pi 4, un MacBook o un PC con Windows, clona repos de Git
 trabaja en ellos (Java, Node, Python, Go), ejecuta tests y sube los cambios a una rama.
 Uso personal, mono-usuario.
 
-> **Estado:** fase 1 (MVP conversacional por API): sesiones con Pi, preguntas al usuario,
-> rama `agent/<slug>` con commit y push, y red saliente en modo `ask`. La web UI y el CLI
-> llegan en la fase 3. Antes de la fase 2 hay una fase 1.5 de consolidación. Ver
-> [`docs/PLAN.md`](docs/PLAN.md#fases).
+> **Estado:** fase 2 (PR y funcionalidades): sobre el MVP conversacional de la fase 1
+> (sesiones con Pi, preguntas al usuario, rama `agent/<slug>`, red saliente en modo `ask`)
+> añade pull requests, lista de tareas, modo plan, diff y checkpoints, bloqueo de comandos
+> peligrosos, búsqueda web, notificaciones push y la API de red. La web UI y el CLI llegan en
+> la fase 3. Quedan pendientes dos tareas de la fase 1.5 que necesitan Docker con red normal.
+> Ver [`docs/PLAN.md`](docs/PLAN.md#fases).
 
 ## Cómo funciona
 
@@ -95,6 +97,9 @@ docker compose -f deploy/compose/docker-compose.yml down              # parar (c
 | `ANTHROPIC_API_KEY`, `OPENAI_API_KEY` | según el modelo | Claves de los proveedores LLM. |
 | `CNA_GIT_USER_NAME`, `CNA_GIT_USER_EMAIL` | recomendadas | Autor de los commits del agente. |
 | `EDGE_ASK_TIMEOUT_MS` | no | Tiempo para responder una pregunta de red antes de denegarla (por defecto 120000). |
+| `NTFY_TOKEN`, `TELEGRAM_BOT_TOKEN` | según `notifications.yaml` | Tokens de las notificaciones push, referenciados como `$VARIABLE`. |
+| `BRAVE_API_KEY`, `TAVILY_API_KEY` | según `web.yaml` | API key de la búsqueda web, referenciada como `$VARIABLE`. |
+| `SEARXNG_SECRET` | con el profile `search` | Secreto del SearXNG del compose (`openssl rand -hex 32`). |
 
 Los modelos se configuran en `config/providers.yaml` (copia de
 [`config/providers.example.yaml`](config/providers.example.yaml)), montado en solo lectura
@@ -103,6 +108,18 @@ en los dos contenedores. Se traduce al `models.json` de Pi al arrancar, y los ho
 (Anthropic, OpenAI…) no hay `baseUrl`: la primera llamada al modelo genera una pregunta de
 red (`api.anthropic.com:443`, por ejemplo); respóndela con `allow_always` y no vuelve a
 preguntar.
+
+Dos ficheros opcionales más, en `config/` y con el mismo tratamiento (ADR-0009):
+
+- `config/notifications.yaml` (copia de
+  [`notifications.example.yaml`](config/notifications.example.yaml)): avisos por ntfy o
+  Telegram cuando la sesión espera una respuesta, termina o falla.
+- `config/web.yaml` (copia de [`web.example.yaml`](config/web.example.yaml)): buscador de
+  `web_search`. Para SearXNG local, arranca con
+  `docker compose -f deploy/compose/docker-compose.yml --profile search up -d`.
+
+`edge` permite sus hosts automáticamente. Sin estos ficheros no hay notificaciones y
+`web_search` responde que no está configurada (`web_fetch` funciona igual).
 
 No subas nunca el `.env` (está en `.gitignore`). Recomendado: un *ruleset* en GitHub que
 proteja la rama base y un límite de gasto en los proveedores LLM.
@@ -141,6 +158,32 @@ pregunta con `ask_user`, pide confirmación antes de `git_push` (salvo `autoPush
 nunca hace push a la rama base. Las preguntas de red (`kind: "network"`, ids `net-…`) se
 responden igual, con `{"value":"allow_once"|"allow_always"|"deny"}`; sin respuesta en el
 timeout se deniegan. *Permitir siempre* se guarda en `/edge-data/policy.json`.
+
+Fase 2:
+
+```sh
+# Modo plan: solo lectura hasta que apruebes el plan (pregunta kind "plan":
+# {"value":"approve"} o {"value":"request_changes"} y después el texto de los cambios)
+curl -s -H "$AUTH" -H 'content-type: application/json' -X POST $API/session \
+  -d '{"repo":"tu-usuario/tu-repo","prompt":"Migra el parser a zod","mode":"plan"}'
+
+curl -s -H "$AUTH" $API/session/todos                 # lista de tareas del agente
+curl -s -H "$AUTH" $API/session/diff                  # cambios frente a la rama base
+curl -s -H "$AUTH" $API/session/checkpoints           # snapshots: tras clonar y tras cada ejecución con cambios
+curl -s -H "$AUTH" "$API/session/diff?checkpoint=1"   # cambios desde un checkpoint
+curl -s -H "$AUTH" -H 'content-type: application/json' -X POST \
+  $API/session/checkpoints/1/restore -d '{"conversation":true}'   # deshacer ficheros (y conversación)
+
+curl -s -H "$AUTH" $API/network/policy                # modo, allowlist y servicios permitidos
+curl -s -H "$AUTH" "$API/network/log?limit=50"        # últimas conexiones salientes
+curl -s -H "$AUTH" -H 'content-type: application/json' -X PUT $API/network/policy \
+  -d '{"mode":"ask","allow":["*.example.com"]}'
+```
+
+El agente abre el pull request con `create_pr` (pide confirmación salvo `autoPush: true`) y
+la extensión `guard` bloquea en `bash` comandos como `git push`, `--force`, `sudo`, `docker` o
+`rm -rf /`. Cada ejecución de una tool queda en `/data/logs/tools.jsonl` del agente, con los
+secretos sustituidos.
 
 Referencia completa de rutas y eventos en [`docs/PLAN.md`](docs/PLAN.md#api-rest-borrador-v1).
 
