@@ -16,7 +16,7 @@ Reglas comunes:
 |---|---|---|---|---|
 | 1 | Verificar las imágenes y la salida por el proxy | sí | — | pendiente |
 | 2 | Fijar las versiones de los toolchains | sí | 1 | pendiente |
-| 3 | Partir `SessionManager` | no | — | pendiente |
+| 3 | Partir `SessionManager` | no | — | hecha |
 | 4 | Test conjunto de `edge` y gateway | no | — | pendiente |
 | 5 | Aclarar la versión de Node en ADR-0005 | no | — | hecha |
 

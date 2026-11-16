@@ -11,6 +11,7 @@ import {
   gitEnv,
   prepareWorkspace,
   slugify,
+  workspaceState,
 } from "../src/workspace/git.js";
 
 /** Isolated from the machine's git config; identity only for the commits made by the helpers. */
@@ -273,5 +274,68 @@ describe("gitEnv", () => {
 
   it("drops undefined values and keeps the rest", () => {
     expect(gitEnv({ A: "1", B: undefined })).toEqual({ A: "1", GIT_TERMINAL_PROMPT: "0" });
+  });
+});
+
+describe("workspaceState", () => {
+  async function cloneWorkspace(): Promise<string> {
+    const dir = workspaceDir();
+    await prepareWorkspace({
+      git,
+      repo: "octo/hello",
+      dir,
+      slug: "state",
+      remoteBase,
+    });
+    return dir;
+  }
+
+  async function commitFile(dir: string, name: string): Promise<void> {
+    await writeFile(join(dir, name), `${name}\n`);
+    await git(["add", name], { cwd: dir });
+    await git(["commit", "-m", `add ${name}`], { cwd: dir });
+  }
+
+  it("is clean for a freshly cloned workspace", async () => {
+    const dir = await cloneWorkspace();
+    expect(await workspaceState(git, dir, { checkUnpushed: true })).toBe("clean");
+  });
+
+  it("is uncommitted when there is an untracked file", async () => {
+    const dir = await cloneWorkspace();
+    await writeFile(join(dir, "new.txt"), "x\n");
+    expect(await workspaceState(git, dir, { checkUnpushed: true })).toBe("uncommitted");
+  });
+
+  it("is unpushed when there is a commit not on the remote", async () => {
+    const dir = await cloneWorkspace();
+    await commitFile(dir, "local.txt");
+    expect(await workspaceState(git, dir, { checkUnpushed: true })).toBe("unpushed");
+  });
+
+  it("is clean once the branch has been pushed", async () => {
+    const dir = await cloneWorkspace();
+    await commitFile(dir, "local.txt");
+    await git(["push", "origin", "HEAD"], { cwd: dir });
+    expect(await workspaceState(git, dir, { checkUnpushed: true })).toBe("clean");
+  });
+
+  it("is clean when the directory has no .git", async () => {
+    const dir = join(root, "plain");
+    await mkdir(dir, { recursive: true });
+    await writeFile(join(dir, "file.txt"), "x\n");
+    expect(await workspaceState(git, dir, { checkUnpushed: true })).toBe("clean");
+  });
+
+  it("ignores unpushed commits when checkUnpushed is false", async () => {
+    const dir = await cloneWorkspace();
+    await commitFile(dir, "local.txt");
+    expect(await workspaceState(git, dir, { checkUnpushed: false })).toBe("clean");
+  });
+
+  it("rejects when git fails", async () => {
+    const dir = join(root, "plain-with-git");
+    await mkdir(join(dir, ".git"), { recursive: true });
+    await expect(workspaceState(git, dir, { checkUnpushed: false })).rejects.toThrow(GitError);
   });
 });

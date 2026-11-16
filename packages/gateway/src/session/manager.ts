@@ -1,7 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { existsSync } from "node:fs";
 import { rm } from "node:fs/promises";
-import { join } from "node:path";
 import {
   ACTIVE_SESSION_STATUSES,
   type AnswerRequest,
@@ -34,9 +32,10 @@ import {
   type RpcEvent,
   type RpcExit,
 } from "../rpc/bridge.js";
-import { type GitRunner, prepareWorkspace, slugify } from "../workspace/git.js";
+import { type GitRunner, prepareWorkspace, slugify, workspaceState } from "../workspace/git.js";
 import { normalizeRpcEvent, uiRequestToNotify, uiRequestToQuestion } from "./normalize.js";
-import { answerToUiResponse, outcomeOfAnswer, QuestionRegistry } from "./questions.js";
+import { PendingQuestions } from "./pending-questions.js";
+import { answerToUiResponse, outcomeOfAnswer } from "./questions.js";
 import { SessionError, type SessionService } from "./service.js";
 
 /** What the manager needs from a running Pi (RpcBridge implements it). */
@@ -97,9 +96,15 @@ export class SessionManager implements SessionService {
 
   private info: SessionInfo | null = null;
   private pi: PiProcess | null = null;
-  private readonly questions = new QuestionRegistry();
-  /** Timeouts of the Pi questions that have one. */
-  private readonly questionTimers = new Map<string, NodeJS.Timeout>();
+  private readonly questions = new PendingQuestions({
+    onResolved: (questionId, outcome) => {
+      this.emit({ type: "question_resolved", questionId, outcome });
+      // A timeout changes the pending set outside any other operation, so the status is recomputed.
+      if (outcome === "timeout") {
+        this.refreshStatus();
+      }
+    },
+  });
   /** True when no run is in progress (Pi reported agent_settled, or never started). */
   private settled = true;
   /** True while close() is running; events and background work then count as stale. */
@@ -153,8 +158,7 @@ export class SessionManager implements SessionService {
       const previousPi = this.pi;
       this.pi = null;
       stopping = previousPi !== null ? this.stopPiQuietly(previousPi) : undefined;
-      this.clearQuestionTimers();
-      this.questions.clear();
+      this.questions.discardAll();
     }
     // A new session starts with an empty replay buffer, also after a close (ids keep growing).
     this.events.clear();
@@ -234,7 +238,7 @@ export class SessionManager implements SessionService {
         throw new SessionError("invalid_state", "Pi is not running");
       }
       pi.respondUi(check.response);
-      this.resolveQuestion(questionId, outcomeOfAnswer(answer));
+      this.questions.resolve(questionId, outcomeOfAnswer(answer));
       this.refreshStatus();
       return;
     }
@@ -295,7 +299,7 @@ export class SessionManager implements SessionService {
         continue;
       }
       this.pi?.respondUi({ type: "extension_ui_response", id: question.id, cancelled: true });
-      this.resolveQuestion(question.id, "cancelled");
+      this.questions.resolve(question.id, "cancelled");
     }
 
     const pi = this.pi;
@@ -333,21 +337,14 @@ export class SessionManager implements SessionService {
     this.closing = true;
     try {
       if (!options.force && info.status !== "cloning") {
-        await this.assertWorkspaceClean(info);
+        await this.checkWorkspaceState(info);
       }
       const pi = this.pi;
       this.pi = null;
       if (pi !== null) {
         await this.stopPiQuietly(pi);
       }
-      this.clearQuestionTimers();
-      for (const question of this.questions.clear()) {
-        this.emit({
-          type: "question_resolved",
-          questionId: question.id,
-          outcome: "cancelled",
-        });
-      }
+      this.questions.resolveAll("cancelled");
       await rm(this.options.workspaceDir, { recursive: true, force: true });
       this.setStatus("closed");
       this.info = null;
@@ -374,7 +371,7 @@ export class SessionManager implements SessionService {
     if (this.questions.get(questionId)?.source !== "edge") {
       return false;
     }
-    this.resolveQuestion(questionId, outcome);
+    this.questions.resolve(questionId, outcome);
     this.refreshStatus();
     return true;
   }
@@ -449,7 +446,7 @@ export class SessionManager implements SessionService {
     if (pi !== null) {
       await this.stopPiQuietly(pi);
     }
-    this.cancelPiQuestions();
+    this.questions.resolveAll("cancelled", "pi");
     this.setStatus("error", message);
     this.logger.error(`session ${sessionId}: ${message}`);
   }
@@ -516,9 +513,6 @@ export class SessionManager implements SessionService {
     }
     this.questions.add(question, "pi");
     this.emit({ type: "question", question });
-    if (question.timeoutMs !== undefined) {
-      this.armQuestionTimer(question.id, question.timeoutMs);
-    }
     this.refreshStatus();
   }
 
@@ -527,7 +521,7 @@ export class SessionManager implements SessionService {
     if (exit.expected) {
       return;
     }
-    this.cancelPiQuestions();
+    this.questions.resolveAll("cancelled", "pi");
     this.setStatus("error", `pi exited unexpectedly (code ${exit.code}, signal ${exit.signal})`);
   }
 
@@ -564,84 +558,24 @@ export class SessionManager implements SessionService {
     );
   }
 
-  private resolveQuestion(questionId: string, outcome: QuestionOutcome): void {
-    this.clearQuestionTimer(questionId);
-    if (this.questions.resolve(questionId) !== undefined) {
-      this.emit({ type: "question_resolved", questionId, outcome });
-    }
-  }
-
-  private cancelPiQuestions(): void {
-    for (const question of this.questions.list()) {
-      if (this.questions.get(question.id)?.source === "pi") {
-        this.resolveQuestion(question.id, "cancelled");
-      }
-    }
-  }
-
-  private armQuestionTimer(questionId: string, timeoutMs: number): void {
-    const timer = setTimeout(() => {
-      this.questionTimers.delete(questionId);
-      this.expireQuestion(questionId);
-    }, timeoutMs);
-    // A pending question must not keep the process alive by itself.
-    timer.unref();
-    this.questionTimers.set(questionId, timer);
-  }
-
-  /** Pi resolves its own dialogs on timeout, so it is not answered here. */
-  private expireQuestion(questionId: string): void {
-    if (this.questions.get(questionId)?.source !== "pi") {
-      return;
-    }
-    this.resolveQuestion(questionId, "timeout");
-    this.refreshStatus();
-  }
-
-  private clearQuestionTimer(questionId: string): void {
-    const timer = this.questionTimers.get(questionId);
-    if (timer !== undefined) {
-      clearTimeout(timer);
-      this.questionTimers.delete(questionId);
-    }
-  }
-
-  private clearQuestionTimers(): void {
-    for (const timer of this.questionTimers.values()) {
-      clearTimeout(timer);
-    }
-    this.questionTimers.clear();
-  }
-
   /** Throws invalid_state if the workspace has uncommitted changes or commits not pushed. */
-  private async assertWorkspaceClean(info: SessionInfo): Promise<void> {
-    const dir = this.options.workspaceDir;
-    if (!existsSync(join(dir, ".git"))) {
-      return;
-    }
+  private async checkWorkspaceState(info: SessionInfo): Promise<void> {
+    let state: Awaited<ReturnType<typeof workspaceState>>;
     try {
-      const status = await this.options.git(["status", "--porcelain"], { cwd: dir });
-      if (status.stdout.trim() !== "") {
-        throw new SessionError("invalid_state", "uncommitted changes");
-      }
-      if (info.branch !== null) {
-        // Commits that no remote-tracking branch of origin contains (covers a missing remote branch).
-        const unpushed = await this.options.git(
-          ["rev-list", "--count", "HEAD", "--not", "--remotes=origin"],
-          { cwd: dir },
-        );
-        if (Number.parseInt(unpushed.stdout.trim(), 10) > 0) {
-          throw new SessionError("invalid_state", "commits not pushed");
-        }
-      }
+      state = await workspaceState(this.options.git, this.options.workspaceDir, {
+        checkUnpushed: info.branch !== null,
+      });
     } catch (error) {
-      if (error instanceof SessionError) {
-        throw error;
-      }
       throw new SessionError(
         "invalid_state",
         this.redactor.redactString(`could not check the workspace: ${errorMessage(error)}`),
       );
+    }
+    if (state === "uncommitted") {
+      throw new SessionError("invalid_state", "uncommitted changes");
+    }
+    if (state === "unpushed") {
+      throw new SessionError("invalid_state", "commits not pushed");
     }
   }
 

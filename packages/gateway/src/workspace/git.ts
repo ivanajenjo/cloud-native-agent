@@ -1,6 +1,7 @@
 import { type ExecFileException, execFile } from "node:child_process";
+import { existsSync } from "node:fs";
 import { mkdir, readdir, stat } from "node:fs/promises";
-import { dirname } from "node:path";
+import { dirname, join } from "node:path";
 
 export interface GitResult {
   stdout: string;
@@ -273,4 +274,29 @@ async function pickBranchName(git: GitRunner, dir: string, slug: string): Promis
 
 function isNodeError(error: unknown): error is NodeJS.ErrnoException {
   return error instanceof Error && "code" in error;
+}
+
+/** "clean", or why the workspace cannot be discarded. Never throws for a dirty tree. */
+export async function workspaceState(
+  git: GitRunner,
+  dir: string,
+  options: { checkUnpushed: boolean },
+): Promise<"clean" | "uncommitted" | "unpushed"> {
+  if (!existsSync(join(dir, ".git"))) {
+    return "clean";
+  }
+  const status = await git(["status", "--porcelain"], { cwd: dir });
+  if (status.stdout.trim() !== "") {
+    return "uncommitted";
+  }
+  if (options.checkUnpushed) {
+    // Commits that no remote-tracking branch of origin contains (covers a missing remote branch).
+    const unpushed = await git(["rev-list", "--count", "HEAD", "--not", "--remotes=origin"], {
+      cwd: dir,
+    });
+    if (Number.parseInt(unpushed.stdout.trim(), 10) > 0) {
+      return "unpushed";
+    }
+  }
+  return "clean";
 }
