@@ -41,10 +41,15 @@ curl -s -o /dev/null -w '%{http_code}\n' localhost:8080/session  # 401 sin token
 |---|---|---|---|
 | `edge` | `AGENT_API_TOKEN` | — (obligatoria) | Bearer de la API. Solo existe en `edge`. |
 | `edge` | `GATEWAY_URL` | `http://agent:8090` | Gateway al que se reenvía la API. |
-| `edge` | `EDGE_DATA_DIR` | `/edge-data` | Volumen de `edge`: `network.jsonl` (y en la fase 1 la política). |
+| `edge` | `EDGE_DATA_DIR` | `/edge-data` | Volumen de `edge`: `network.jsonl` y `policy.json` (modo y *permitir siempre*). |
+| `edge` | `EDGE_PROVIDERS_FILE` | `/config/providers.yaml` | Proveedores cuyos `baseUrl` se permiten aunque sean internos. |
+| `edge` | `EDGE_ASK_TIMEOUT_MS` | `120000` | Tiempo para responder una pregunta de red antes de denegarla. |
 | `edge` | `EDGE_API_PORT` / `EDGE_PROXY_PORT` | `8080` / `3128` | Entrada de la API y proxy de salida. |
 | compose | `CNA_PUBLISH_ADDR` | `127.0.0.1` | Dirección del host donde se publica el `8080`. |
 | `agent` | `GATEWAY_PORT` | `8090` | Puerto del gateway en la red interna. |
+| `agent` | `CNA_DATA_DIR` | `/data` | Volumen del agente: `workspace/repo`, `sessions/`, `config/pi` (generado), `cache/`. |
+| `agent` | `CNA_PROVIDERS_FILE` | `/config/providers.yaml` | Se traduce a `models.json` de Pi al arrancar. |
+| `agent` | `CNA_EXTENSIONS_DIR` | `/app/packages/extensions` | Extensiones de Pi y prompt de sistema (de root, solo lectura para `agent`). |
 | `agent` | `GITHUB_TOKEN`, `ANTHROPIC_API_KEY`, `OPENAI_API_KEY` | vacías | Credenciales (riesgo aceptado en ADR-0006). |
 | `agent` | `CNA_GIT_USER_NAME`, `CNA_GIT_USER_EMAIL` | vacías | Identidad de los commits del agente. |
 
@@ -73,8 +78,30 @@ El registro completo está en el volumen de `edge`:
 docker compose -f deploy/compose/docker-compose.yml exec edge cat /edge-data/network.jsonl
 ```
 
+## Política de red
+
+El modo por defecto es `ask`. Orden de decisión de `edge`:
+1. Host y puerto de un `baseUrl` de `config/providers.yaml` → se permite (aunque sea LAN).
+2. Alguna dirección resuelta interna (loopback, privada, link-local…) → se deniega.
+3. Allowlist base (GitHub, registries, descargas de toolchains) o *permitir siempre* → se permite.
+4. Puerto distinto de 80/443 → se deniega.
+5. Resto: en `ask` se pregunta al usuario por la API (`question` con `kind: "network"`);
+   sin respuesta en `EDGE_ASK_TIMEOUT_MS` o sin sesión activa, se deniega. En `allowlist`
+   se deniega sin preguntar.
+
+La política vive en el volumen de `edge` (`/edge-data/policy.json`), fuera del alcance del
+agente. Para cambiar de modo (por ejemplo a `audit` mientras se ejecuta
+`scripts/verify-egress.sh` con hosts nuevos), edita ese fichero y reinicia `edge`. El
+ejemplo lo sobrescribe entero, así que borra las entradas de *permitir siempre*:
+
+```sh
+docker compose -f deploy/compose/docker-compose.yml exec edge \
+  sh -c 'echo "{\"mode\":\"audit\",\"allow\":[]}" > /edge-data/policy.json'
+docker compose -f deploy/compose/docker-compose.yml restart edge
+```
+
+Los endpoints `/network/*` para verlo y cambiarlo por la API llegan en la fase 2.
+
 ## Estado
-- En la fase 0 el proxy está en modo `audit`: permite cualquier destino externo en los
-  puertos 80/443 y deniega los destinos internos. El modo `ask` llega en la fase 1.
 - No hay CI: la construcción de las imágenes y `scripts/verify-egress.sh` se comprueban
   en local, con un daemon de Docker.

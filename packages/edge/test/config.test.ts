@@ -16,6 +16,8 @@ describe("loadConfig defaults", () => {
       dataDir: "/edge-data",
       apiPort: 8080,
       proxyPort: 3128,
+      providersFile: "/config/providers.yaml",
+      askTimeoutMs: 120000,
     });
   });
 });
@@ -29,6 +31,8 @@ describe("loadConfig overrides", () => {
           EDGE_DATA_DIR: "/srv/edge",
           EDGE_API_PORT: "18080",
           EDGE_PROXY_PORT: "13128",
+          EDGE_PROVIDERS_FILE: "/srv/providers.yaml",
+          EDGE_ASK_TIMEOUT_MS: "5000",
         }),
       ),
     ).toEqual({
@@ -37,6 +41,8 @@ describe("loadConfig overrides", () => {
       dataDir: "/srv/edge",
       apiPort: 18080,
       proxyPort: 13128,
+      providersFile: "/srv/providers.yaml",
+      askTimeoutMs: 5000,
     });
   });
 
@@ -128,5 +134,33 @@ describe("port validation", () => {
     expect(() => loadConfig(env({ EDGE_API_PORT: "9000", EDGE_PROXY_PORT: "9000" }))).toThrow(
       Error,
     );
+  });
+});
+
+describe("EDGE_PROVIDERS_FILE validation", () => {
+  it("throws for a relative path without echoing it", () => {
+    let message = "";
+    try {
+      loadConfig(env({ EDGE_PROVIDERS_FILE: "config/providers.yaml" }));
+    } catch (error) {
+      message = error instanceof Error ? error.message : String(error);
+    }
+    expect(message).toBe("EDGE_PROVIDERS_FILE must be an absolute path");
+  });
+});
+
+describe("EDGE_ASK_TIMEOUT_MS validation", () => {
+  it.each(["999", "3600001", "abc", "1e4", "", "-5000", "5000.5"])(
+    "throws for %j, without echoing it",
+    (value) => {
+      expect(() => loadConfig(env({ EDGE_ASK_TIMEOUT_MS: value }))).toThrow(
+        "EDGE_ASK_TIMEOUT_MS must be an integer between 1000 and 3600000",
+      );
+    },
+  );
+
+  it("accepts the bounds", () => {
+    expect(loadConfig(env({ EDGE_ASK_TIMEOUT_MS: "1000" })).askTimeoutMs).toBe(1000);
+    expect(loadConfig(env({ EDGE_ASK_TIMEOUT_MS: "3600000" })).askTimeoutMs).toBe(3600000);
   });
 });

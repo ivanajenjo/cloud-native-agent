@@ -221,6 +221,41 @@ describe("egress proxy: CONNECT", () => {
     expect(resolve).toHaveBeenCalledTimes(1);
   });
 
+  it("waits for an async policy that allows and then tunnels normally", async () => {
+    const echo = await startEcho();
+    const slowAllow: Policy = async () => {
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      return { decision: "allow", reason: "user_once" };
+    };
+    const proxy = await startProxy({ policy: slowAllow });
+
+    const tunnel = await openTunnel(proxy.port, `example.test:${echo.port}`);
+    expect(tunnel.status).toBe(200);
+    tunnel.socket.write("async ok");
+    await waitUntil(() => Buffer.concat(tunnel.received).toString().endsWith("async ok"));
+    tunnel.socket.end();
+
+    await waitUntil(() => proxy.entries.length === 1);
+    expect(proxy.entries[0]).toMatchObject({ decision: "allow", reason: "user_once" });
+  });
+
+  it("waits for an async policy that denies and answers 403 without connecting", async () => {
+    const echo = await startEcho();
+    const slowDeny: Policy = async () => {
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      return { decision: "deny", reason: "user_denied" };
+    };
+    const connectSpy = vi.fn((target: { host: string; port: number }) => connect(target));
+    const proxy = await startProxy({ policy: slowDeny, connect: connectSpy });
+
+    const tunnel = await openTunnel(proxy.port, `example.test:${echo.port}`);
+    expect(tunnel.status).toBe(403);
+    await waitUntil(() => proxy.entries.length === 1);
+
+    expect(connectSpy).not.toHaveBeenCalled();
+    expect(proxy.entries[0]).toMatchObject({ decision: "deny", reason: "user_denied" });
+  });
+
   it("answers 403 and never connects when the policy denies", async () => {
     const deny: Policy = () => ({ decision: "deny", reason: "port_not_allowed" });
     const connectSpy = vi.fn((target: { host: string; port: number }) => connect(target));

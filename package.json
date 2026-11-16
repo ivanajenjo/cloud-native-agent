@@ -5,7 +5,8 @@
   "workspaces": [
     "packages/shared",
     "packages/gateway",
-    "packages/edge"
+    "packages/edge",
+    "packages/extensions"
   ],
   "engines": {
     "node": ">=22.21.0"
@@ -15,6 +16,7 @@
     "typecheck": "tsc -p tsconfig.json",
     "lint": "biome check .",
     "format": "biome format --write .",
+    "pretest": "npm run build -w @cna/shared",
     "test": "vitest run"
   },
   "devDependencies": {

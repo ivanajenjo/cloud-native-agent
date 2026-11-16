@@ -1,0 +1,706 @@
+import { randomUUID } from "node:crypto";
+import { existsSync } from "node:fs";
+import { rm } from "node:fs/promises";
+import { join } from "node:path";
+import {
+  ACTIVE_SESSION_STATUSES,
+  type AnswerRequest,
+  type CreateSessionRequest,
+  NETWORK_QUESTION_ID_PREFIX,
+  type NetworkLogEntry,
+  type PiMessage,
+  type PostMessageRequest,
+  type PostMessageResponse,
+  type PromptDisposition,
+  type Question,
+  type QuestionOutcome,
+  type SessionEvent,
+  type SessionInfo,
+  type SessionStatus,
+  type SetModelRequest,
+} from "@cna/shared";
+import type {
+  RpcExtensionUIRequest,
+  RpcExtensionUIResponse,
+} from "@earendil-works/pi-coding-agent";
+import type { EventLog } from "../events/event-log.js";
+import type { PiLaunchSpec } from "../pi/launch.js";
+import { buildPiLaunch } from "../pi/launch.js";
+import type { Redactor } from "../redact.js";
+import {
+  type RpcBridgeHandlers,
+  RpcCommandError,
+  type RpcCommandInput,
+  type RpcEvent,
+  type RpcExit,
+} from "../rpc/bridge.js";
+import { type GitRunner, prepareWorkspace, slugify } from "../workspace/git.js";
+import { normalizeRpcEvent, uiRequestToNotify, uiRequestToQuestion } from "./normalize.js";
+import { answerToUiResponse, outcomeOfAnswer, QuestionRegistry } from "./questions.js";
+import { SessionError, type SessionService } from "./service.js";
+
+/** What the manager needs from a running Pi (RpcBridge implements it). */
+export interface PiProcess {
+  send(command: RpcCommandInput, options?: { timeoutMs?: number }): Promise<unknown>;
+  respondUi(response: RpcExtensionUIResponse): void;
+  stop(): Promise<void>;
+  readonly running: boolean;
+}
+
+export interface SessionManagerOptions {
+  events: EventLog;
+  redactor: Redactor;
+  git: GitRunner;
+  /** Production: (spec, handlers) => RpcBridge.start(spec, handlers). Tests: a fake. */
+  startPi: (spec: PiLaunchSpec, handlers: RpcBridgeHandlers) => PiProcess;
+  /** Everything buildPiLaunch needs except cwd, model, thinking, baseBranch, autoPush. */
+  pi: {
+    piCli: string;
+    agentDir: string;
+    sessionDir: string;
+    extensions: string[];
+    systemPromptFile?: string;
+    env: Record<string, string | undefined>;
+  };
+  /** Absolute path of the workspace dir (e.g. /data/workspace/repo). Deleted on close and before each new clone. */
+  workspaceDir: string;
+  /** providers.yaml `default`, used when the request has no model. */
+  defaultModel?: string;
+  gitIdentity?: { name?: string; email?: string };
+  /** Default "https://github.com/" (tests pass a file:// base). */
+  remoteBase?: string;
+  /** Default console. Receives only redacted text. */
+  logger?: { info(message: string): void; error(message: string): void };
+  now?: () => Date;
+  /** Default randomUUID. */
+  newId?: () => string;
+}
+
+/** Timeout of `abort`: Pi answers only once the session is idle again. */
+const ABORT_TIMEOUT_MS = 60_000;
+/** Max length of a stderr line of Pi that reaches the logger. */
+const MAX_LOGGED_LINE_LENGTH = 500;
+const PROMPT_DISPOSITIONS: readonly PromptDisposition[] = ["started", "queued", "handled"];
+const MESSAGE_STATUSES: readonly SessionStatus[] = ["running", "waiting_input", "ready"];
+
+/**
+ * The single session of this replica (ADR-0003): clones the repo, runs Pi in RPC mode on it,
+ * turns Pi's events into SSE events and keeps the state machine of the session.
+ */
+export class SessionManager implements SessionService {
+  private readonly options: SessionManagerOptions;
+  private readonly events: EventLog;
+  private readonly redactor: Redactor;
+  private readonly logger: { info(message: string): void; error(message: string): void };
+  private readonly now: () => Date;
+  private readonly newId: () => string;
+
+  private info: SessionInfo | null = null;
+  private pi: PiProcess | null = null;
+  private readonly questions = new QuestionRegistry();
+  /** Timeouts of the Pi questions that have one. */
+  private readonly questionTimers = new Map<string, NodeJS.Timeout>();
+  /** True when no run is in progress (Pi reported agent_settled, or never started). */
+  private settled = true;
+  /** True while close() is running; events and background work then count as stale. */
+  private closing = false;
+  /**
+   * Background jobs (clone + start Pi) run one at a time: they all use the same workspace dir,
+   * so a new clone must not start while the previous one (of a closed session) still writes.
+   */
+  private workspaceQueue: Promise<void> = Promise.resolve();
+
+  constructor(options: SessionManagerOptions) {
+    this.options = options;
+    this.events = options.events;
+    this.redactor = options.redactor;
+    this.logger = options.logger ?? {
+      info: (message) => console.log(message),
+      error: (message) => console.error(message),
+    };
+    this.now = options.now ?? (() => new Date());
+    this.newId = options.newId ?? randomUUID;
+  }
+
+  /** Stops Pi if running (used on gateway shutdown). Does not delete the workspace. */
+  async shutdown(): Promise<void> {
+    const pi = this.pi;
+    this.pi = null;
+    if (pi !== null) {
+      await this.stopPiQuietly(pi);
+    }
+  }
+
+  get(): SessionInfo | null {
+    return this.info === null ? null : this.snapshot(this.info);
+  }
+
+  async create(request: CreateSessionRequest): Promise<SessionInfo> {
+    const previous = this.info;
+    if (
+      previous !== null &&
+      (this.closing || (previous.status !== "error" && previous.status !== "closed"))
+    ) {
+      throw new SessionError("session_exists");
+    }
+    if (request.mode === "plan") {
+      throw new SessionError("mode_not_supported", "plan mode arrives in phase 2");
+    }
+
+    // A previous session in error is discarded. Its Pi, if still alive, stops before the new clone.
+    let stopping: Promise<void> | undefined;
+    if (previous !== null) {
+      const previousPi = this.pi;
+      this.pi = null;
+      stopping = previousPi !== null ? this.stopPiQuietly(previousPi) : undefined;
+      this.clearQuestionTimers();
+      this.questions.clear();
+    }
+    // A new session starts with an empty replay buffer, also after a close (ids keep growing).
+    this.events.clear();
+
+    const info: SessionInfo = {
+      id: this.newId(),
+      status: "cloning",
+      repo: request.repo,
+      baseBranch: request.baseBranch ?? null,
+      branch: null,
+      model: request.model ?? this.options.defaultModel ?? null,
+      thinking: request.thinking ?? null,
+      mode: "auto",
+      autoPush: request.autoPush ?? false,
+      createdAt: this.now().toISOString(),
+      pendingQuestions: [],
+    };
+    this.info = info;
+    this.settled = true;
+    this.emit({ type: "status", status: "cloning" });
+
+    const sessionId = info.id;
+    const job = this.workspaceQueue.then(async () => {
+      await stopping;
+      await this.start(sessionId, request);
+    });
+    this.workspaceQueue = job.catch(() => undefined);
+    // start() catches its own failures; this is only a last safety net.
+    void job.catch((error: unknown) => {
+      this.logger.error(`session ${sessionId}: ${this.redactor.redactString(errorMessage(error))}`);
+    });
+
+    return this.snapshot(info);
+  }
+
+  async postMessage(request: PostMessageRequest): Promise<PostMessageResponse> {
+    const info = this.info;
+    if (info === null) {
+      throw new SessionError("no_session");
+    }
+    const pi = this.pi;
+    if (pi === null || !MESSAGE_STATUSES.includes(info.status)) {
+      throw new SessionError("invalid_state");
+    }
+
+    const command: RpcCommandInput = this.settled
+      ? { type: "prompt", message: request.text }
+      : {
+          type: "prompt",
+          message: request.text,
+          streamingBehavior: request.mode ?? "followUp",
+        };
+    const data = await this.sendToPi(pi, command);
+    const disposition = dispositionOf(data);
+    if (disposition === undefined) {
+      throw new Error("unexpected response to prompt: no disposition");
+    }
+    if (disposition === "started") {
+      this.settled = false;
+      this.refreshStatus();
+    }
+    return { disposition };
+  }
+
+  async answer(questionId: string, answer: AnswerRequest): Promise<void> {
+    if (this.info === null) {
+      throw new SessionError("no_session");
+    }
+    const entry = this.questions.get(questionId);
+    if (entry?.source === "pi") {
+      const check = answerToUiResponse(entry.question, answer);
+      if (!check.ok) {
+        throw new SessionError("invalid_request", this.redactor.redactString(check.message));
+      }
+      const pi = this.pi;
+      if (pi === null) {
+        throw new SessionError("invalid_state", "Pi is not running");
+      }
+      pi.respondUi(check.response);
+      this.resolveQuestion(questionId, outcomeOfAnswer(answer));
+      this.refreshStatus();
+      return;
+    }
+    // Network questions are answered in edge (ADR-0008) and never get here.
+    if (
+      this.questions.wasResolved(questionId) &&
+      !questionId.startsWith(NETWORK_QUESTION_ID_PREFIX)
+    ) {
+      throw new SessionError("question_resolved");
+    }
+    throw new SessionError("question_not_found");
+  }
+
+  async setModel(request: SetModelRequest): Promise<void> {
+    const info = this.info;
+    if (info === null) {
+      throw new SessionError("no_session");
+    }
+    const pi = this.pi;
+    if (pi === null) {
+      throw new SessionError("invalid_state");
+    }
+    // Provider and model id are split at the first "/": model ids may contain "/" and ":".
+    const slash = request.model.indexOf("/");
+    if (slash <= 0) {
+      throw new SessionError("invalid_request", "model must be provider/model");
+    }
+    const provider = request.model.slice(0, slash);
+    const modelId = request.model.slice(slash + 1);
+
+    try {
+      await pi.send({ type: "set_model", provider, modelId });
+      if (request.thinking !== undefined) {
+        await pi.send({ type: "set_thinking_level", level: request.thinking });
+      }
+    } catch (error) {
+      if (error instanceof RpcCommandError) {
+        const message = this.redactor.redactString(error.message);
+        throw error.reason === "failed"
+          ? new SessionError("unknown_model", message)
+          : new SessionError("invalid_state", message);
+      }
+      throw error;
+    }
+
+    info.model = request.model;
+    if (request.thinking !== undefined) {
+      info.thinking = request.thinking;
+    }
+  }
+
+  async abort(): Promise<void> {
+    if (this.info === null) {
+      throw new SessionError("no_session");
+    }
+    for (const question of this.questions.list()) {
+      if (this.questions.get(question.id)?.source !== "pi") {
+        continue;
+      }
+      this.pi?.respondUi({ type: "extension_ui_response", id: question.id, cancelled: true });
+      this.resolveQuestion(question.id, "cancelled");
+    }
+
+    const pi = this.pi;
+    if (pi !== null) {
+      try {
+        await pi.send({ type: "abort" }, { timeoutMs: ABORT_TIMEOUT_MS });
+        // Pi answers once it is idle again, so the run is over even if agent_settled was lost.
+        this.settled = true;
+      } catch (error) {
+        this.logger.error(`abort: ${this.redactor.redactString(errorMessage(error))}`);
+      }
+    }
+    this.refreshStatus();
+  }
+
+  async messages(): Promise<PiMessage[]> {
+    if (this.info === null) {
+      throw new SessionError("no_session");
+    }
+    const pi = this.pi;
+    if (pi === null) {
+      throw new SessionError("invalid_state");
+    }
+    const data = await this.sendToPi(pi, { type: "get_messages" });
+    const list: unknown = isRecord(data) ? data.messages : undefined;
+    const messages = Array.isArray(list) ? (list as PiMessage[]) : [];
+    return this.redactor.redact(messages);
+  }
+
+  async close(options: { force: boolean }): Promise<void> {
+    const info = this.info;
+    if (info === null || this.closing) {
+      throw new SessionError("no_session");
+    }
+    this.closing = true;
+    try {
+      if (!options.force && info.status !== "cloning") {
+        await this.assertWorkspaceClean(info);
+      }
+      const pi = this.pi;
+      this.pi = null;
+      if (pi !== null) {
+        await this.stopPiQuietly(pi);
+      }
+      this.clearQuestionTimers();
+      for (const question of this.questions.clear()) {
+        this.emit({
+          type: "question_resolved",
+          questionId: question.id,
+          outcome: "cancelled",
+        });
+      }
+      await rm(this.options.workspaceDir, { recursive: true, force: true });
+      this.setStatus("closed");
+      this.info = null;
+    } finally {
+      this.closing = false;
+    }
+  }
+
+  publishNetworkQuestion(question: Question): boolean {
+    const info = this.info;
+    if (info === null || this.closing || !ACTIVE_SESSION_STATUSES.includes(info.status)) {
+      return false;
+    }
+    if (this.questions.get(question.id) !== undefined) {
+      return true;
+    }
+    this.questions.add(question, "edge");
+    this.emit({ type: "question", question });
+    this.refreshStatus();
+    return true;
+  }
+
+  resolveNetworkQuestion(questionId: string, outcome: QuestionOutcome): boolean {
+    if (this.questions.get(questionId)?.source !== "edge") {
+      return false;
+    }
+    this.resolveQuestion(questionId, outcome);
+    this.refreshStatus();
+    return true;
+  }
+
+  publishNetworkEntry(entry: NetworkLogEntry): void {
+    if (this.info === null) {
+      return;
+    }
+    this.emit({ type: "network", entry });
+  }
+
+  /** Clone, branch, start Pi and send the first prompt. Never throws: failures become status `error`. */
+  private async start(sessionId: string, request: CreateSessionRequest): Promise<void> {
+    if (!this.isCurrent(sessionId)) {
+      return;
+    }
+    try {
+      await rm(this.options.workspaceDir, { recursive: true, force: true });
+      const prepared = await prepareWorkspace({
+        git: this.options.git,
+        repo: request.repo,
+        baseBranch: request.baseBranch,
+        dir: this.options.workspaceDir,
+        slug: slugify(request.prompt),
+        userName: this.options.gitIdentity?.name,
+        userEmail: this.options.gitIdentity?.email,
+        remoteBase: this.options.remoteBase,
+      });
+
+      const info = this.current(sessionId);
+      if (info === null) {
+        // Closed while cloning: Pi must not start.
+        await this.removeWorkspaceQuietly();
+        return;
+      }
+      info.baseBranch = prepared.baseBranch;
+      info.branch = prepared.branch;
+
+      const spec = buildPiLaunch({
+        ...this.options.pi,
+        cwd: this.options.workspaceDir,
+        model: info.model ?? undefined,
+        thinking: info.thinking ?? undefined,
+        baseBranch: prepared.baseBranch,
+        autoPush: info.autoPush,
+      });
+      const pi = this.options.startPi(spec, this.handlersFor(sessionId));
+      this.pi = pi;
+      this.settled = false;
+      this.setStatus("running");
+
+      const data = await pi.send({ type: "prompt", message: request.prompt });
+      if (this.isCurrent(sessionId) && dispositionOf(data) === "handled") {
+        // Handled by an extension: there is no run to wait for.
+        this.settled = true;
+        this.refreshStatus();
+      }
+    } catch (error) {
+      await this.failStart(sessionId, error);
+    }
+  }
+
+  private async failStart(sessionId: string, error: unknown): Promise<void> {
+    const message = this.redactor.redactString(errorMessage(error));
+    if (!this.isCurrent(sessionId)) {
+      this.logger.error(`session ${sessionId} was closed while starting: ${message}`);
+      await this.removeWorkspaceQuietly();
+      return;
+    }
+    const pi = this.pi;
+    this.pi = null;
+    if (pi !== null) {
+      await this.stopPiQuietly(pi);
+    }
+    this.cancelPiQuestions();
+    this.setStatus("error", message);
+    this.logger.error(`session ${sessionId}: ${message}`);
+  }
+
+  /** Handlers given to startPi for one session. Events of a session that is no longer current are dropped. */
+  private handlersFor(sessionId: string): RpcBridgeHandlers {
+    return {
+      onEvent: (event) => {
+        if (this.isCurrent(sessionId)) {
+          this.handlePiEvent(event);
+        }
+      },
+      onUiRequest: (request) => {
+        if (this.isCurrent(sessionId)) {
+          this.handleUiRequest(request);
+        }
+      },
+      onExit: (exit) => {
+        if (this.isCurrent(sessionId)) {
+          this.handlePiExit(exit);
+        }
+      },
+      onStderr: (line) => {
+        this.logger.info(
+          `pi: ${this.redactor.redactString(line).slice(0, MAX_LOGGED_LINE_LENGTH)}`,
+        );
+      },
+      onProtocolError: (message) => {
+        this.logger.error(
+          `pi protocol: ${this.redactor.redactString(message).slice(0, MAX_LOGGED_LINE_LENGTH)}`,
+        );
+      },
+    };
+  }
+
+  private handlePiEvent(event: RpcEvent): void {
+    // The end of a run is agent_settled: agent_end can be followed by a retry or queued messages.
+    if (event.type === "agent_start") {
+      this.settled = false;
+      this.refreshStatus();
+    } else if (event.type === "agent_settled") {
+      this.settled = true;
+      this.refreshStatus();
+    }
+    for (const sessionEvent of normalizeRpcEvent(event)) {
+      this.emit(sessionEvent);
+    }
+  }
+
+  private handleUiRequest(request: RpcExtensionUIRequest): void {
+    const question = uiRequestToQuestion(request, this.now());
+    if (question === null) {
+      const notify = uiRequestToNotify(request);
+      if (notify !== null) {
+        this.emit(notify);
+      }
+      return;
+    }
+    if (this.questions.get(question.id) !== undefined) {
+      this.logger.error(
+        `pi: question ${this.redactor.redactString(question.id)} is already pending`,
+      );
+      return;
+    }
+    this.questions.add(question, "pi");
+    this.emit({ type: "question", question });
+    if (question.timeoutMs !== undefined) {
+      this.armQuestionTimer(question.id, question.timeoutMs);
+    }
+    this.refreshStatus();
+  }
+
+  private handlePiExit(exit: RpcExit): void {
+    this.pi = null;
+    if (exit.expected) {
+      return;
+    }
+    this.cancelPiQuestions();
+    this.setStatus("error", `pi exited unexpectedly (code ${exit.code}, signal ${exit.signal})`);
+  }
+
+  /** Recomputes waiting_input / running / ready after a change in the pending questions or in `settled`. */
+  private refreshStatus(): void {
+    const info = this.info;
+    if (info === null || this.closing || info.status === "error" || info.status === "closed") {
+      return;
+    }
+    if (this.questions.size > 0) {
+      this.setStatus("waiting_input");
+    } else if (info.status === "cloning") {
+      this.setStatus("cloning");
+    } else {
+      this.setStatus(this.settled ? "ready" : "running");
+    }
+  }
+
+  private setStatus(status: SessionStatus, error?: string): void {
+    const info = this.info;
+    if (info === null) {
+      return;
+    }
+    const safeError = error === undefined ? undefined : this.redactor.redactString(error);
+    if (info.status === status && info.error === safeError) {
+      return;
+    }
+    info.status = status;
+    info.error = safeError;
+    this.emit(
+      safeError === undefined
+        ? { type: "status", status }
+        : { type: "status", status, error: safeError },
+    );
+  }
+
+  private resolveQuestion(questionId: string, outcome: QuestionOutcome): void {
+    this.clearQuestionTimer(questionId);
+    if (this.questions.resolve(questionId) !== undefined) {
+      this.emit({ type: "question_resolved", questionId, outcome });
+    }
+  }
+
+  private cancelPiQuestions(): void {
+    for (const question of this.questions.list()) {
+      if (this.questions.get(question.id)?.source === "pi") {
+        this.resolveQuestion(question.id, "cancelled");
+      }
+    }
+  }
+
+  private armQuestionTimer(questionId: string, timeoutMs: number): void {
+    const timer = setTimeout(() => {
+      this.questionTimers.delete(questionId);
+      this.expireQuestion(questionId);
+    }, timeoutMs);
+    // A pending question must not keep the process alive by itself.
+    timer.unref();
+    this.questionTimers.set(questionId, timer);
+  }
+
+  /** Pi resolves its own dialogs on timeout, so it is not answered here. */
+  private expireQuestion(questionId: string): void {
+    if (this.questions.get(questionId)?.source !== "pi") {
+      return;
+    }
+    this.resolveQuestion(questionId, "timeout");
+    this.refreshStatus();
+  }
+
+  private clearQuestionTimer(questionId: string): void {
+    const timer = this.questionTimers.get(questionId);
+    if (timer !== undefined) {
+      clearTimeout(timer);
+      this.questionTimers.delete(questionId);
+    }
+  }
+
+  private clearQuestionTimers(): void {
+    for (const timer of this.questionTimers.values()) {
+      clearTimeout(timer);
+    }
+    this.questionTimers.clear();
+  }
+
+  /** Throws invalid_state if the workspace has uncommitted changes or commits not pushed. */
+  private async assertWorkspaceClean(info: SessionInfo): Promise<void> {
+    const dir = this.options.workspaceDir;
+    if (!existsSync(join(dir, ".git"))) {
+      return;
+    }
+    try {
+      const status = await this.options.git(["status", "--porcelain"], { cwd: dir });
+      if (status.stdout.trim() !== "") {
+        throw new SessionError("invalid_state", "uncommitted changes");
+      }
+      if (info.branch !== null) {
+        // Commits that no remote-tracking branch of origin contains (covers a missing remote branch).
+        const unpushed = await this.options.git(
+          ["rev-list", "--count", "HEAD", "--not", "--remotes=origin"],
+          { cwd: dir },
+        );
+        if (Number.parseInt(unpushed.stdout.trim(), 10) > 0) {
+          throw new SessionError("invalid_state", "commits not pushed");
+        }
+      }
+    } catch (error) {
+      if (error instanceof SessionError) {
+        throw error;
+      }
+      throw new SessionError(
+        "invalid_state",
+        this.redactor.redactString(`could not check the workspace: ${errorMessage(error)}`),
+      );
+    }
+  }
+
+  /** Sends a command to Pi; a rejected command becomes invalid_state. */
+  private async sendToPi(pi: PiProcess, command: RpcCommandInput): Promise<unknown> {
+    try {
+      return await pi.send(command);
+    } catch (error) {
+      if (error instanceof RpcCommandError) {
+        throw new SessionError("invalid_state", this.redactor.redactString(error.message));
+      }
+      throw error;
+    }
+  }
+
+  private async stopPiQuietly(pi: PiProcess): Promise<void> {
+    try {
+      await pi.stop();
+    } catch (error) {
+      this.logger.error(`pi stop: ${this.redactor.redactString(errorMessage(error))}`);
+    }
+  }
+
+  private async removeWorkspaceQuietly(): Promise<void> {
+    try {
+      await rm(this.options.workspaceDir, { recursive: true, force: true });
+    } catch (error) {
+      this.logger.error(`workspace removal: ${this.redactor.redactString(errorMessage(error))}`);
+    }
+  }
+
+  /** The session if it is still the current one (same id, not closing). */
+  private current(sessionId: string): SessionInfo | null {
+    return this.isCurrent(sessionId) ? this.info : null;
+  }
+
+  private isCurrent(sessionId: string): boolean {
+    return !this.closing && this.info?.id === sessionId;
+  }
+
+  /** Every event goes through the redactor before it reaches the log (AGENTS.md invariant). */
+  private emit(event: SessionEvent): void {
+    this.events.append(this.redactor.redact(event));
+  }
+
+  private snapshot(info: SessionInfo): SessionInfo {
+    return { ...info, pendingQuestions: this.questions.list() };
+  }
+}
+
+function dispositionOf(data: unknown): PromptDisposition | undefined {
+  const value = isRecord(data) ? data.disposition : undefined;
+  return PROMPT_DISPOSITIONS.find((disposition) => disposition === value);
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function errorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}

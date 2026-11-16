@@ -1,5 +1,258 @@
-import { describe, expect, it } from "vitest";
-import { createAuditPolicy, systemResolver } from "../src/egress/policy.js";
+import type { NetworkMode, ProviderEndpoint } from "@cna/shared";
+import { describe, expect, it, vi } from "vitest";
+import { parseAllowlistEntry } from "../src/egress/allowlist.js";
+import type { AskResult } from "../src/egress/ask.js";
+import {
+  createAuditPolicy,
+  createNetworkPolicy,
+  type NetworkPolicyOptions,
+  systemResolver,
+} from "../src/egress/policy.js";
+
+const PUBLIC = "93.184.216.34";
+const PRIVATE = "10.0.0.5";
+const PRIVATE_LAN = "192.168.1.50";
+
+interface Fixture {
+  policy: ReturnType<typeof createNetworkPolicy>;
+  ask: ReturnType<typeof vi.fn<(host: string, port: number) => Promise<AskResult>>>;
+  addAllow: ReturnType<typeof vi.fn<(entry: string) => Promise<void>>>;
+  onPersistError: ReturnType<typeof vi.fn<(error: unknown) => void>>;
+  setMode: (mode: NetworkMode) => void;
+}
+
+/** Network policy over an in-memory store and a fake ask coordinator. */
+function fixture(
+  options: {
+    mode?: NetworkMode;
+    allow?: string[];
+    providers?: ProviderEndpoint[];
+    answer?: AskResult;
+  } = {},
+): Fixture {
+  const state: { mode: NetworkMode; allow: string[] } = {
+    mode: options.mode ?? "ask",
+    allow: [...(options.allow ?? [])],
+  };
+  const addAllow = vi.fn(async (entry: string): Promise<void> => {
+    if (!state.allow.includes(entry)) state.allow.push(entry);
+  });
+  const ask = vi.fn(async (_host: string, _port: number): Promise<AskResult> => {
+    return options.answer ?? "deny";
+  });
+  const onPersistError = vi.fn<(error: unknown) => void>();
+  const store: NetworkPolicyOptions["store"] = {
+    get: () => ({ mode: state.mode, allow: [...state.allow] }),
+    entries: () => state.allow.map((text) => parseAllowlistEntry(text)),
+    addAllow,
+  };
+  const policy = createNetworkPolicy({
+    store,
+    baseAllowlist: ["github.com", "*.npmjs.org"].map((text) => parseAllowlistEntry(text)),
+    providers: options.providers ?? [],
+    ask: { ask },
+    onPersistError,
+  });
+  return {
+    policy,
+    ask,
+    addAllow,
+    onPersistError,
+    setMode: (mode) => {
+      state.mode = mode;
+    },
+  };
+}
+
+describe("createNetworkPolicy", () => {
+  it("denies dns_error without asking when there are no addresses", async () => {
+    const f = fixture();
+    await expect(f.policy({ host: "unknown.dev", port: 443, addresses: [] })).resolves.toEqual({
+      decision: "deny",
+      reason: "dns_error",
+    });
+    expect(f.ask).not.toHaveBeenCalled();
+  });
+
+  it("allows a provider IP literal even when internal, but not on another port", async () => {
+    const providers: ProviderEndpoint[] = [{ provider: "ollama", host: PRIVATE_LAN, port: 11434 }];
+    const f = fixture({ providers });
+    await expect(
+      f.policy({ host: PRIVATE_LAN, port: 11434, addresses: [PRIVATE_LAN] }),
+    ).resolves.toEqual({ decision: "allow", reason: "provider" });
+    await expect(
+      f.policy({ host: PRIVATE_LAN, port: 443, addresses: [PRIVATE_LAN] }),
+    ).resolves.toEqual({
+      decision: "deny",
+      reason: "internal_destination",
+    });
+    expect(f.ask).not.toHaveBeenCalled();
+  });
+
+  it("allows a provider by name when it resolves to an internal address", async () => {
+    const providers: ProviderEndpoint[] = [{ provider: "ollama", host: "ollama.lan", port: 11434 }];
+    const f = fixture({ providers });
+    await expect(
+      f.policy({ host: "ollama.lan", port: 11434, addresses: [PRIVATE] }),
+    ).resolves.toEqual({ decision: "allow", reason: "provider" });
+    expect(f.ask).not.toHaveBeenCalled();
+  });
+
+  it("allows a public allowlisted host without asking", async () => {
+    const f = fixture();
+    await expect(f.policy({ host: "github.com", port: 443, addresses: [PUBLIC] })).resolves.toEqual(
+      {
+        decision: "allow",
+        reason: "allowlist",
+      },
+    );
+    expect(f.ask).not.toHaveBeenCalled();
+  });
+
+  it("denies an allowlisted host that also resolves to a private address", async () => {
+    const f = fixture();
+    await expect(
+      f.policy({ host: "github.com", port: 443, addresses: [PUBLIC, PRIVATE] }),
+    ).resolves.toEqual({ decision: "deny", reason: "internal_destination" });
+    expect(f.ask).not.toHaveBeenCalled();
+  });
+
+  it("matches a wildcard base entry", async () => {
+    const f = fixture();
+    await expect(
+      f.policy({ host: "registry.npmjs.org", port: 443, addresses: [PUBLIC] }),
+    ).resolves.toEqual({ decision: "allow", reason: "allowlist" });
+    expect(f.ask).not.toHaveBeenCalled();
+  });
+
+  it("matches an entry added with allow always", async () => {
+    const f = fixture({ allow: ["example.org"] });
+    await expect(
+      f.policy({ host: "example.org", port: 443, addresses: [PUBLIC] }),
+    ).resolves.toEqual({ decision: "allow", reason: "allowlist" });
+    expect(f.ask).not.toHaveBeenCalled();
+  });
+
+  it("denies a disallowed port without asking", async () => {
+    const f = fixture();
+    await expect(f.policy({ host: "github.com", port: 22, addresses: [PUBLIC] })).resolves.toEqual({
+      decision: "deny",
+      reason: "port_not_allowed",
+    });
+    expect(f.ask).not.toHaveBeenCalled();
+  });
+
+  describe("mode audit", () => {
+    it("allows an external destination on an allowed port", async () => {
+      const f = fixture({ mode: "audit" });
+      await expect(
+        f.policy({ host: "unknown.dev", port: 443, addresses: [PUBLIC] }),
+      ).resolves.toEqual({
+        decision: "allow",
+        reason: "audit",
+      });
+      expect(f.ask).not.toHaveBeenCalled();
+    });
+
+    it("denies a disallowed port", async () => {
+      const f = fixture({ mode: "audit" });
+      await expect(
+        f.policy({ host: "unknown.dev", port: 8080, addresses: [PUBLIC] }),
+      ).resolves.toEqual({ decision: "deny", reason: "port_not_allowed" });
+    });
+
+    it("denies an internal destination", async () => {
+      const f = fixture({ mode: "audit" });
+      await expect(
+        f.policy({ host: "unknown.dev", port: 443, addresses: [PRIVATE] }),
+      ).resolves.toEqual({ decision: "deny", reason: "internal_destination" });
+    });
+  });
+
+  describe("mode allowlist", () => {
+    it("denies an unlisted host with not_allowed, without asking", async () => {
+      const f = fixture({ mode: "allowlist" });
+      await expect(
+        f.policy({ host: "unknown.dev", port: 443, addresses: [PUBLIC] }),
+      ).resolves.toEqual({ decision: "deny", reason: "not_allowed" });
+      expect(f.ask).not.toHaveBeenCalled();
+    });
+  });
+
+  describe("mode ask", () => {
+    it("allows once when the user answers allow_once", async () => {
+      const f = fixture({ answer: "allow_once" });
+      await expect(
+        f.policy({ host: "unknown.dev", port: 443, addresses: [PUBLIC] }),
+      ).resolves.toEqual({ decision: "allow", reason: "user_once" });
+      expect(f.ask).toHaveBeenCalledWith("unknown.dev", 443);
+      expect(f.addAllow).not.toHaveBeenCalled();
+    });
+
+    it("persists the host and allows when the user answers allow_always", async () => {
+      const f = fixture({ answer: "allow_always" });
+      await expect(
+        f.policy({ host: "unknown.dev", port: 443, addresses: [PUBLIC] }),
+      ).resolves.toEqual({ decision: "allow", reason: "user_always" });
+      expect(f.addAllow).toHaveBeenCalledWith("unknown.dev");
+      expect(f.onPersistError).not.toHaveBeenCalled();
+    });
+
+    it("still allows when persisting allow always fails and reports the error", async () => {
+      const f = fixture({ answer: "allow_always" });
+      const failure = new Error("disk full");
+      f.addAllow.mockRejectedValueOnce(failure);
+      await expect(
+        f.policy({ host: "unknown.dev", port: 443, addresses: [PUBLIC] }),
+      ).resolves.toEqual({ decision: "allow", reason: "user_always" });
+      expect(f.onPersistError).toHaveBeenCalledWith(failure);
+    });
+
+    it("denies when the user answers deny", async () => {
+      const f = fixture({ answer: "deny" });
+      await expect(
+        f.policy({ host: "unknown.dev", port: 443, addresses: [PUBLIC] }),
+      ).resolves.toEqual({ decision: "deny", reason: "user_denied" });
+    });
+
+    it("denies with ask_timeout when nobody answers", async () => {
+      const f = fixture({ answer: "timeout" });
+      await expect(
+        f.policy({ host: "unknown.dev", port: 443, addresses: [PUBLIC] }),
+      ).resolves.toEqual({ decision: "deny", reason: "ask_timeout" });
+    });
+
+    it("denies with no_session when there is no session to ask", async () => {
+      const f = fixture({ answer: "no_session" });
+      await expect(
+        f.policy({ host: "unknown.dev", port: 443, addresses: [PUBLIC] }),
+      ).resolves.toEqual({ decision: "deny", reason: "no_session" });
+    });
+
+    it("reads the mode on every decision", async () => {
+      const f = fixture({ mode: "allowlist", answer: "allow_once" });
+      await expect(
+        f.policy({ host: "unknown.dev", port: 443, addresses: [PUBLIC] }),
+      ).resolves.toEqual({ decision: "deny", reason: "not_allowed" });
+      f.setMode("ask");
+      await expect(
+        f.policy({ host: "unknown.dev", port: 443, addresses: [PUBLIC] }),
+      ).resolves.toEqual({ decision: "allow", reason: "user_once" });
+      expect(f.ask).toHaveBeenCalledTimes(1);
+    });
+
+    it("normalizes the host to lowercase without a trailing dot", async () => {
+      const f = fixture({ answer: "allow_once" });
+      await expect(
+        f.policy({ host: "Unknown.DEV.", port: 443, addresses: [PUBLIC] }),
+      ).resolves.toEqual({ decision: "allow", reason: "user_once" });
+      expect(f.ask).toHaveBeenCalledWith("unknown.dev", 443);
+      await expect(
+        f.policy({ host: "GitHub.COM.", port: 443, addresses: [PUBLIC] }),
+      ).resolves.toEqual({ decision: "allow", reason: "allowlist" });
+    });
+  });
+});
 
 describe("createAuditPolicy", () => {
   const policy = createAuditPolicy();

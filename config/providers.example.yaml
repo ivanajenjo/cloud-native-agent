@@ -1,0 +1,35 @@
+# Ejemplo de configuración de proveedores y modelos (ADR-0008).
+#
+# El fichero real es `config/providers.yaml`. No se versiona (está en .gitignore) porque puede
+# contener API keys: copia este fichero a `config/providers.yaml` y ajústalo.
+# Se monta en solo lectura en /config de los contenedores `agent` y `edge`. Si no existe,
+# ambos arrancan sin proveedores.
+#
+# - El gateway lo traduce a `models.json` de Pi al arrancar.
+# - `edge` lee los `baseUrl` para permitir esos hosts en la red automáticamente, aunque sean
+#   internos (p. ej. Ollama en la LAN) o usen un puerto distinto de 80/443.
+# - `contextWindow` debe coincidir con `OLLAMA_CONTEXT_LENGTH` (num_ctx) del servidor Ollama.
+#   Si no coinciden, Pi trabaja con un contexto que el modelo no tiene.
+
+# Modelo por defecto para `POST /session` cuando no se indica `model`: <proveedor>/<modelo>.
+default: ollama/qwen3-coder:30b
+
+providers:
+  # Ollama en otra máquina de la red (p. ej. el MacBook). En la Raspberry Pi 4 no es viable
+  # ejecutar un modelo útil en local.
+  ollama:
+    baseUrl: http://host.docker.internal:11434/v1
+    api: openai-completions
+    models:
+      - id: qwen3-coder:30b
+        # Debe coincidir con OLLAMA_CONTEXT_LENGTH en el servidor Ollama.
+        contextWindow: 65536
+
+  # Ejemplo comentado: proveedor con API key. Los proveedores integrados de Pi no necesitan
+  # `baseUrl` ni `apiKey`: Pi lee la clave de su variable de entorno (ANTHROPIC_API_KEY).
+  # La clave llega al contenedor por el entorno (deploy/compose/.env), nunca en este fichero.
+  # Para usarlo, descomenta el bloque, pon el id de un modelo de Pi y cambia `default`.
+  #
+  # anthropic:
+  #   models:
+  #     - id: <id-del-modelo-anthropic>
