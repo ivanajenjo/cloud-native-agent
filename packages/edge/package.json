@@ -1,0 +1,15 @@
+{
+  "name": "@cna/edge",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "start": "node dist/main.js"
+  },
+  "dependencies": {
+    "@cna/shared": "*",
+    "@hono/node-server": "2.1.8",
+    "hono": "4.13.19"
+  }
+}
