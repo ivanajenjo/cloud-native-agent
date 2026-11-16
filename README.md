@@ -260,7 +260,7 @@ docker/       Dockerfile (agent), Dockerfile.edge, config de mise/Maven/Gradle
 deploy/
   compose/    docker-compose.yml y .env.example
 scripts/      verify-egress.sh
-docs/         PLAN.md (plan y fases), adr/ (decisiones), despliegue-local.md
+docs/         PLAN.md (plan y fases), fase-1.5.md (tareas pendientes), adr/ (decisiones), despliegue-local.md
 ```
 
 ### Contribuir
