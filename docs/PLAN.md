@@ -245,7 +245,7 @@ docs/
   PLAN.md, adr/
 ```
 
-Monorepo con npm workspaces, TypeScript estricto, `vitest` para tests, `biome` para lint/format.
+Monorepo con npm workspaces, Node 22 LTS, TypeScript estricto, Hono (HTTP), zod (validación de la API), typebox (tools de Pi), `vitest` para tests, `biome` para lint/format. Convenciones detalladas en `AGENTS.md`.
 
 ## Fases
 
