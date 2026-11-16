@@ -17,6 +17,7 @@ import {
   ResolveQuestionRequestSchema,
   type SetModelRequest,
   SetModelRequestSchema,
+  type TodosResponse,
 } from "@cna/shared";
 import { type Context, Hono } from "hono";
 import { bodyLimit } from "hono/body-limit";
@@ -117,6 +118,11 @@ export function createApp(options: AppOptions): Hono {
       heartbeatMs: options.sseHeartbeatMs,
     }),
   );
+
+  app.get("/session/todos", (c) => {
+    const body: TodosResponse = { todos: session.todos() };
+    return c.json(body);
+  });
 
   app.get("/session/messages", async (c) => {
     const body: MessagesResponse = { messages: await session.messages() };

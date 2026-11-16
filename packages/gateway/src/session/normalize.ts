@@ -1,4 +1,13 @@
-import { decodeQuestionTitle, type PiMessage, type Question, type SessionEvent } from "@cna/shared";
+import {
+  decodeQuestionTitle,
+  type PiMessage,
+  parseModeEntry,
+  parseTodoDetails,
+  type Question,
+  type SessionEvent,
+  TODO_TOOL_NAME,
+  type TodoItem,
+} from "@cna/shared";
 import type { RpcExtensionUIRequest } from "@earendil-works/pi-coding-agent";
 
 /** A raw Pi session event (any stdout record that is not a response nor a UI request). */
@@ -73,16 +82,16 @@ export function normalizeRpcEvent(event: RpcEvent): SessionEvent[] {
       if (!hasToolIds(event)) {
         return [];
       }
-      return [
-        {
-          type: "tool_end",
-          toolCallId: event.toolCallId,
-          toolName: event.toolName,
-          result: event.result ?? null,
-          isError: event.isError === true,
-          ...(typeof event.durationMs === "number" ? { durationMs: event.durationMs } : {}),
-        },
-      ];
+      const toolEnd: SessionEvent = {
+        type: "tool_end",
+        toolCallId: event.toolCallId,
+        toolName: event.toolName,
+        result: event.result ?? null,
+        isError: event.isError === true,
+        ...(typeof event.durationMs === "number" ? { durationMs: event.durationMs } : {}),
+      };
+      const todos = todoOfToolEnd(event);
+      return todos === null ? [toolEnd] : [toolEnd, { type: "todo", todos }];
     }
 
     case "compaction_start": {
@@ -146,8 +155,13 @@ export function normalizeRpcEvent(event: RpcEvent): SessionEvent[] {
       return [{ type: "error", message: `extension error: ${event.error}` }];
     }
 
+    case "entry_appended": {
+      const mode = parseModeEntry(event.entry);
+      return mode === null ? [] : [{ type: "mode", mode }];
+    }
+
     default:
-      // agent_start/agent_end/agent_settled, turn_*, message_start, queue_update, entry_appended...
+      // agent_start/agent_end/agent_settled, turn_*, message_start, queue_update...
       // The run state belongs to the SessionManager, not to these events.
       return [];
   }
@@ -170,6 +184,15 @@ function normalizeMessageUpdate(event: Obj): SessionEvent[] {
     default:
       return [];
   }
+}
+
+/** Task list of a successful `todo` call with valid details; null otherwise. */
+function todoOfToolEnd(event: Obj): TodoItem[] | null {
+  if (event.toolName !== TODO_TOOL_NAME || event.isError === true) {
+    return null;
+  }
+  const result = isObject(event.result) ? event.result : undefined;
+  return parseTodoDetails(result?.details);
 }
 
 function hasToolIds(event: Obj): event is Obj & { toolCallId: string; toolName: string } {

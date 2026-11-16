@@ -3,10 +3,11 @@ import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
-import type { Question, SessionEvent, StreamEvent } from "@cna/shared";
+import type { CreateSessionRequest, Question, SessionEvent, StreamEvent } from "@cna/shared";
 import type { RpcExtensionUIRequest } from "@earendil-works/pi-coding-agent";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { EventLog } from "../src/events/event-log.js";
+import type { ToolLog } from "../src/logs/tool-log.js";
 import type { PiLaunchSpec } from "../src/pi/launch.js";
 import { createRedactor } from "../src/redact.js";
 import {
@@ -135,7 +136,12 @@ interface Harness {
   logs: string[];
 }
 
-function harness(wrapGit: GitWrapper = (real) => real): Harness {
+interface HarnessOptions {
+  webConfigFile?: string;
+  toolLog?: ToolLog;
+}
+
+function harness(wrapGit: GitWrapper = (real) => real, options: HarnessOptions = {}): Harness {
   const events = new EventLog();
   const pis: FakePi[] = [];
   const startPi = vi.fn((spec: PiLaunchSpec, handlers: RpcBridgeHandlers) => {
@@ -156,8 +162,10 @@ function harness(wrapGit: GitWrapper = (real) => real): Harness {
       agentDir: join(root, "agent"),
       sessionDir: join(root, "sessions"),
       extensions: [join(root, "ext", "git.ts")],
+      ...(options.webConfigFile !== undefined ? { webConfigFile: options.webConfigFile } : {}),
       env: {},
     },
+    ...(options.toolLog !== undefined ? { toolLog: options.toolLog } : {}),
     defaultModel: "ollama/qwen3-coder:30b",
     remoteBase,
     logger: {
@@ -208,7 +216,7 @@ function waitForEvent(
 const isStatus = (status: string) => (event: SessionEvent) =>
   event.type === "status" && event.status === status;
 
-async function createAndRun(h: Harness, request = REQUEST): Promise<FakePi> {
+async function createAndRun(h: Harness, request: CreateSessionRequest = REQUEST): Promise<FakePi> {
   await h.manager.create(request);
   await waitForEvent(h.events, isStatus("running"));
   return onlyPi(h);
@@ -461,16 +469,11 @@ describe("SessionManager", () => {
     });
   });
 
-  it("refuses a second session while one is active, and plan mode", async () => {
+  it("refuses a second session while one is active", async () => {
     const h = harness();
     await h.manager.create(REQUEST);
     await expect(h.manager.create(REQUEST)).rejects.toMatchObject({ code: "session_exists" });
     await waitForEvent(h.events, isStatus("running"));
-
-    const plan = harness();
-    await expect(plan.manager.create({ ...REQUEST, mode: "plan" })).rejects.toMatchObject({
-      code: "mode_not_supported",
-    });
   });
 
   it("goes to error when the clone fails, and a new session can be created afterwards", async () => {
@@ -645,6 +648,183 @@ describe("SessionManager", () => {
     });
   });
 
+  describe("plan mode", () => {
+    it("starts in plan mode with --cna-plan, and in auto mode without it by default", async () => {
+      const planned = harness();
+      await createAndRun(planned, { ...REQUEST, mode: "plan" });
+      expect(planned.manager.get()?.mode).toBe("plan");
+      expect(onlyPi(planned).spec.args).toContain("--cna-plan");
+
+      const auto = harness();
+      await createAndRun(auto);
+      expect(auto.manager.get()?.mode).toBe("auto");
+      expect(onlyPi(auto).spec.args).not.toContain("--cna-plan");
+    });
+
+    it("switches to auto and emits mode once when the plan is approved, and not again", async () => {
+      const h = harness();
+      const pi = await createAndRun(h, { ...REQUEST, mode: "plan" });
+      const modeEntry = {
+        type: "entry_appended",
+        entry: { type: "custom", customType: "cna.mode", data: { mode: "auto" } },
+      };
+
+      pi.emit(modeEntry);
+      expect(h.manager.get()?.mode).toBe("auto");
+      pi.emit(modeEntry);
+
+      const modes = h.events.since(0).events.filter((stored) => stored.event.type === "mode");
+      expect(modes.map((stored) => stored.event)).toEqual([{ type: "mode", mode: "auto" }]);
+    });
+  });
+
+  describe("task list", () => {
+    function todoEnd(toolCallId: string, todos: unknown[], isError = false): RpcEvent {
+      return {
+        type: "tool_execution_end",
+        toolCallId,
+        toolName: "todo",
+        result: { content: [{ type: "text", text: "ok" }], details: { todos } },
+        isError,
+      };
+    }
+
+    const FIRST = [{ id: 1, text: "Read the code", status: "in_progress" }];
+    const SECOND = [
+      { id: 1, text: "Read the code", status: "completed" },
+      { id: 2, text: "Write the tests", status: "pending" },
+    ];
+
+    it("emits todo after a valid todo call and replaces the list on the next one", async () => {
+      const h = harness();
+      const pi = await createAndRun(h);
+      expect(h.manager.todos()).toEqual([]);
+
+      pi.emit(todoEnd("call-1", FIRST));
+      expect(h.events.since(0).events).toContainEqual(
+        expect.objectContaining({ event: { type: "todo", todos: FIRST } }),
+      );
+      expect(h.manager.todos()).toEqual(FIRST);
+
+      pi.emit(todoEnd("call-2", SECOND));
+      expect(h.manager.todos()).toEqual(SECOND);
+    });
+
+    it("returns a copy of the list", async () => {
+      const h = harness();
+      const pi = await createAndRun(h);
+      pi.emit(todoEnd("call-1", FIRST));
+
+      h.manager.todos()[0] = { id: 9, text: "changed", status: "pending" };
+      expect(h.manager.todos()).toEqual(FIRST);
+    });
+
+    it("ignores a todo call that failed: no event and the list does not change", async () => {
+      const h = harness();
+      const pi = await createAndRun(h);
+      pi.emit(todoEnd("call-1", FIRST));
+      const before = h.events.lastId;
+
+      pi.emit(todoEnd("call-2", SECOND, true));
+
+      expect(h.events.lastId).toBe(before + 1);
+      expect(eventTypes(h).filter((type) => type === "todo")).toHaveLength(1);
+      expect(h.manager.todos()).toEqual(FIRST);
+    });
+
+    it("throws no_session without a session, and a new session starts empty", async () => {
+      const h = harness();
+      expect(() => h.manager.todos()).toThrow(SessionError);
+      let caught: unknown;
+      try {
+        h.manager.todos();
+      } catch (error) {
+        caught = error;
+      }
+      expect(caught).toMatchObject({ code: "no_session" });
+
+      const pi = await createAndRun(h);
+      pi.emit(todoEnd("call-1", FIRST));
+      await h.manager.close({ force: true });
+      expect(h.manager.get()).toBeNull();
+
+      await createAndRun(h);
+      expect(h.manager.todos()).toEqual([]);
+    });
+  });
+
+  describe("tool log", () => {
+    it("records the start and the end of a tool with the session id", async () => {
+      const toolLog = { start: vi.fn(), end: vi.fn(), close: vi.fn(async () => undefined) };
+      const h = harness(undefined, { toolLog });
+      const pi = await createAndRun(h);
+      const sessionId = h.manager.get()?.id;
+
+      pi.emit({
+        type: "tool_execution_start",
+        toolCallId: "call-1",
+        toolName: "bash",
+        args: { command: "ls" },
+      });
+      pi.emit({
+        type: "tool_execution_end",
+        toolCallId: "call-1",
+        toolName: "bash",
+        result: { content: [{ type: "text", text: "README.md" }] },
+        isError: false,
+        durationMs: 12,
+      });
+
+      expect(toolLog.start).toHaveBeenCalledWith(sessionId, {
+        toolCallId: "call-1",
+        toolName: "bash",
+        args: { command: "ls" },
+      });
+      expect(toolLog.end).toHaveBeenCalledWith(sessionId, {
+        toolCallId: "call-1",
+        toolName: "bash",
+        result: { content: [{ type: "text", text: "README.md" }] },
+        isError: false,
+        durationMs: 12,
+      });
+    });
+
+    it("keeps emitting the session events when the tool log throws", async () => {
+      const toolLog = {
+        start: vi.fn(() => {
+          throw new Error("disk full");
+        }),
+        end: vi.fn(() => {
+          throw new Error("disk full");
+        }),
+        close: vi.fn(async () => undefined),
+      };
+      const h = harness(undefined, { toolLog });
+      const pi = await createAndRun(h);
+
+      expect(() =>
+        pi.emit({
+          type: "tool_execution_start",
+          toolCallId: "call-1",
+          toolName: "bash",
+          args: {},
+        }),
+      ).not.toThrow();
+      pi.emit({
+        type: "tool_execution_end",
+        toolCallId: "call-1",
+        toolName: "bash",
+        result: null,
+        isError: false,
+      });
+
+      expect(toolLog.start).toHaveBeenCalledTimes(1);
+      expect(eventTypes(h)).toContain("tool_start");
+      expect(eventTypes(h)).toContain("tool_end");
+      expect(h.logs).toContainEqual(expect.stringContaining("tool log: disk full"));
+    });
+  });
+
   describe("setModel", () => {
     it("splits the model at the first slash and sends the thinking level", async () => {
       const h = harness();
@@ -689,6 +869,15 @@ describe("SessionManager", () => {
         code: "no_session",
       });
     });
+  });
+
+  it("passes the web config file to Pi with --cna-web-config", async () => {
+    const webConfigFile = join(root, "config", "web.yaml");
+    const h = harness(undefined, { webConfigFile });
+    await createAndRun(h);
+
+    const args = onlyPi(h).spec.args;
+    expect(args[args.indexOf("--cna-web-config") + 1]).toBe(webConfigFile);
   });
 
   it("publishes no event for a second identical status and keeps the session readable", async () => {

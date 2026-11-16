@@ -95,22 +95,28 @@ function configFor(overrides: Partial<GatewayConfig> = {}): GatewayConfig {
 }
 
 /** Env with the git isolation, identity, PATH and a GitHub token that must never leak. */
-function testEnv(): Record<string, string | undefined> {
+function testEnv(
+  extra: Record<string, string | undefined> = {},
+): Record<string, string | undefined> {
   return {
     ...GIT_ENV,
     PATH: process.env.PATH,
     GITHUB_TOKEN: TOKEN,
+    ...extra,
   };
 }
 
-async function start(config: GatewayConfig = configFor()) {
+async function start(
+  config: GatewayConfig = configFor(),
+  extraEnv: Record<string, string | undefined> = {},
+) {
   const startPi = vi.fn<(spec: PiLaunchSpec, handlers: RpcBridgeHandlers) => PiProcess>(
     () => new FakePi(),
   );
   const runtime = await createGatewayRuntime({
     config,
     version: "0.0.0-test",
-    env: testEnv(),
+    env: testEnv(extraEnv),
     startPi,
     piCli: join(root, "pi", "cli.js"),
     remoteBase,
@@ -276,6 +282,63 @@ describe("createGatewayRuntime", () => {
         piCli: join(root, "pi", "cli.js"),
       }),
     ).rejects.toThrow(/providers\.yaml/);
+  });
+
+  it("passes web.yaml to Pi with --cna-web-config", async () => {
+    const config = configFor();
+    await writeFile(
+      config.webFile,
+      "search:\n  provider: searxng\n  url: http://searx.example.invalid\n",
+    );
+    const { app, startPi } = await start(config);
+
+    await app.request("/session", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ repo: "octo/hello", prompt: "hola" }),
+    });
+    await waitForRunning(app);
+
+    const spec = startPi.mock.calls[0]?.[0] as PiLaunchSpec;
+    expect(spec.args[spec.args.indexOf("--cna-web-config") + 1]).toBe(config.webFile);
+  }, 15_000);
+
+  it("redacts the search API key of web.yaml from the events", async () => {
+    const apiKey = "brave-key-0123456789";
+    const config = configFor();
+    // web.yaml is read when the runtime is created, so it must exist before start().
+    await writeFile(config.webFile, "search:\n  provider: brave\n  apiKey: $TEST_WEB_KEY\n");
+    const { app, startPi } = await start(config, { TEST_WEB_KEY: apiKey });
+
+    await app.request("/session", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ repo: "octo/hello", prompt: "hola" }),
+    });
+    await waitForRunning(app);
+
+    const handlers = startPi.mock.calls[0]?.[1];
+    handlers?.onEvent({
+      type: "message_end",
+      message: { role: "assistant", content: `the key is ${apiKey}, web-leak` },
+    });
+
+    const events = await readEventsUntil(app, "web-leak");
+    expect(events).toContain("the key is [REDACTED], web-leak");
+    expect(events).not.toContain(apiKey);
+  }, 15_000);
+
+  it("rejects when web.yaml is invalid", async () => {
+    await writeFile(join(root, "web.yaml"), "search:\n  provider: brave\n  bogus: 1\n");
+
+    await expect(
+      createGatewayRuntime({
+        config: configFor(),
+        version: "0.0.0-test",
+        env: testEnv(),
+        piCli: join(root, "pi", "cli.js"),
+      }),
+    ).rejects.toThrow(/web\.yaml/);
   });
 
   it("rejects when an extension file is missing", async () => {

@@ -10,6 +10,7 @@ import type {
   QuestionOutcome,
   SessionInfo,
   SetModelRequest,
+  TodoItem,
 } from "@cna/shared";
 
 /**
@@ -39,8 +40,9 @@ export interface SessionService {
   /**
    * Starts a session and returns at once with status "cloning"; cloning, starting Pi and sending
    * the first prompt continue in the background (progress goes out as `status` events).
-   * Throws session_exists if a session exists whose status is not "error" nor "closed";
-   * mode_not_supported for mode "plan" (phase 2).
+   * Throws session_exists if a session exists whose status is not "error" nor "closed".
+   * `mode` defaults to "auto"; "plan" starts read-only until a plan is approved. The task list
+   * is reset to empty.
    */
   create(request: CreateSessionRequest): Promise<SessionInfo>;
 
@@ -64,6 +66,9 @@ export interface SessionService {
 
   /** Aborts the current run and cancels the pending Pi questions. Throws no_session. */
   abort(): Promise<void>;
+
+  /** Current task list (last report of the `todo` tool), a copy. Throws no_session. */
+  todos(): TodoItem[];
 
   /** Full conversation from Pi (`get_messages`), redacted. Throws no_session; invalid_state if Pi is not running. */
   messages(): Promise<PiMessage[]>;

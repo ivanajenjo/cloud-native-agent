@@ -16,12 +16,14 @@ import {
   type SessionInfo,
   type SessionStatus,
   type SetModelRequest,
+  type TodoItem,
 } from "@cna/shared";
 import type {
   RpcExtensionUIRequest,
   RpcExtensionUIResponse,
 } from "@earendil-works/pi-coding-agent";
 import type { EventLog } from "../events/event-log.js";
+import type { ToolLog } from "../logs/tool-log.js";
 import type { PiLaunchSpec } from "../pi/launch.js";
 import { buildPiLaunch } from "../pi/launch.js";
 import type { Redactor } from "../redact.js";
@@ -52,15 +54,19 @@ export interface SessionManagerOptions {
   git: GitRunner;
   /** Production: (spec, handlers) => RpcBridge.start(spec, handlers). Tests: a fake. */
   startPi: (spec: PiLaunchSpec, handlers: RpcBridgeHandlers) => PiProcess;
-  /** Everything buildPiLaunch needs except cwd, model, thinking, baseBranch, autoPush. */
+  /** Everything buildPiLaunch needs except cwd, model, thinking, baseBranch, autoPush, plan. */
   pi: {
     piCli: string;
     agentDir: string;
     sessionDir: string;
     extensions: string[];
     systemPromptFile?: string;
+    /** web.yaml, read by the web extension (--cna-web-config). */
+    webConfigFile?: string;
     env: Record<string, string | undefined>;
   };
+  /** Tool execution log (/data/logs/tools.jsonl). Failures never affect the session. */
+  toolLog?: ToolLog;
   /** Absolute path of the workspace dir (e.g. /data/workspace/repo). Deleted on close and before each new clone. */
   workspaceDir: string;
   /** providers.yaml `default`, used when the request has no model. */
@@ -96,6 +102,8 @@ export class SessionManager implements SessionService {
 
   private info: SessionInfo | null = null;
   private pi: PiProcess | null = null;
+  /** Complete task list, as last reported by the `todo` tool. Reset by create(). */
+  private todoList: TodoItem[] = [];
   private readonly questions = new PendingQuestions({
     onResolved: (questionId, outcome) => {
       this.emit({ type: "question_resolved", questionId, outcome });
@@ -148,9 +156,6 @@ export class SessionManager implements SessionService {
     ) {
       throw new SessionError("session_exists");
     }
-    if (request.mode === "plan") {
-      throw new SessionError("mode_not_supported", "plan mode arrives in phase 2");
-    }
 
     // A previous session in error is discarded. Its Pi, if still alive, stops before the new clone.
     let stopping: Promise<void> | undefined;
@@ -162,6 +167,7 @@ export class SessionManager implements SessionService {
     }
     // A new session starts with an empty replay buffer, also after a close (ids keep growing).
     this.events.clear();
+    this.todoList = [];
 
     const info: SessionInfo = {
       id: this.newId(),
@@ -171,7 +177,7 @@ export class SessionManager implements SessionService {
       branch: null,
       model: request.model ?? this.options.defaultModel ?? null,
       thinking: request.thinking ?? null,
-      mode: "auto",
+      mode: request.mode ?? "auto",
       autoPush: request.autoPush ?? false,
       createdAt: this.now().toISOString(),
       pendingQuestions: [],
@@ -192,6 +198,13 @@ export class SessionManager implements SessionService {
     });
 
     return this.snapshot(info);
+  }
+
+  todos(): TodoItem[] {
+    if (this.info === null) {
+      throw new SessionError("no_session");
+    }
+    return this.todoList.map((item) => ({ ...item }));
   }
 
   async postMessage(request: PostMessageRequest): Promise<PostMessageResponse> {
@@ -417,6 +430,8 @@ export class SessionManager implements SessionService {
         thinking: info.thinking ?? undefined,
         baseBranch: prepared.baseBranch,
         autoPush: info.autoPush,
+        plan: info.mode === "plan",
+        webConfigFile: this.options.pi.webConfigFile,
       });
       const pi = this.options.startPi(spec, this.handlersFor(sessionId));
       this.pi = pi;
@@ -483,6 +498,7 @@ export class SessionManager implements SessionService {
   }
 
   private handlePiEvent(event: RpcEvent): void {
+    this.recordTool(event);
     // The end of a run is agent_settled: agent_end can be followed by a retry or queued messages.
     if (event.type === "agent_start") {
       this.settled = false;
@@ -492,7 +508,45 @@ export class SessionManager implements SessionService {
       this.refreshStatus();
     }
     for (const sessionEvent of normalizeRpcEvent(event)) {
+      if (sessionEvent.type === "todo") {
+        this.todoList = sessionEvent.todos;
+      } else if (sessionEvent.type === "mode") {
+        const info = this.info;
+        // The plan-mode extension may report the mode it already has: no event then.
+        if (info === null || info.mode === sessionEvent.mode) {
+          continue;
+        }
+        info.mode = sessionEvent.mode;
+      }
       this.emit(sessionEvent);
+    }
+  }
+
+  /** Feeds the tool execution log. Errors are logged and never reach the event flow. */
+  private recordTool(event: RpcEvent): void {
+    const toolLog = this.options.toolLog;
+    const sessionId = this.info?.id;
+    if (toolLog === undefined || sessionId === undefined) {
+      return;
+    }
+    const { toolCallId, toolName } = event;
+    if (typeof toolCallId !== "string" || typeof toolName !== "string") {
+      return;
+    }
+    try {
+      if (event.type === "tool_execution_start") {
+        toolLog.start(sessionId, { toolCallId, toolName, args: event.args ?? null });
+      } else if (event.type === "tool_execution_end") {
+        toolLog.end(sessionId, {
+          toolCallId,
+          toolName,
+          result: event.result ?? null,
+          isError: event.isError === true,
+          ...(typeof event.durationMs === "number" ? { durationMs: event.durationMs } : {}),
+        });
+      }
+    } catch (error) {
+      this.logger.error(`tool log: ${this.redactor.redactString(errorMessage(error))}`);
     }
   }
 

@@ -1,4 +1,11 @@
-import type { ModelsResponse, PiMessage, Question, SessionEvent, SessionInfo } from "@cna/shared";
+import type {
+  ModelsResponse,
+  PiMessage,
+  Question,
+  SessionEvent,
+  SessionInfo,
+  TodoItem,
+} from "@cna/shared";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { type AppOptions, createApp } from "../src/app.js";
 import { EventLog } from "../src/events/event-log.js";
@@ -396,6 +403,36 @@ describe("DELETE /session", () => {
 
     expect(res.status).toBe(204);
     expect(session.close).toHaveBeenCalledWith({ force: false });
+  });
+});
+
+describe("GET /session/todos", () => {
+  it("answers 200 with { todos } from todos()", async () => {
+    const todos: TodoItem[] = [
+      { id: 1, text: "Read the code", status: "completed" },
+      { id: 2, text: "Write the tests", status: "in_progress" },
+    ];
+    const session = fakeSession({ todos: vi.fn(() => todos) });
+    const app = createApp({ version: "1", session, events: new EventLog(), models: () => MODELS });
+
+    const res = await app.request("/session/todos");
+
+    expect(res.status).toBe(200);
+    expect(await res.json()).toEqual({ todos });
+  });
+
+  it("answers 404 no_session when there is no session", async () => {
+    const session = fakeSession({
+      todos: vi.fn(() => {
+        throw new SessionError("no_session");
+      }),
+    });
+    const app = createApp({ version: "1", session, events: new EventLog(), models: () => MODELS });
+
+    const res = await app.request("/session/todos");
+
+    expect(res.status).toBe(404);
+    expect(((await res.json()) as { error: string }).error).toBe("no_session");
   });
 });
 
