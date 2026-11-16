@@ -71,6 +71,8 @@ ejecutar tests y subir los cambios. Se controla por API REST, una web UI sencill
   y registro de tools los hace el gateway a partir de los eventos RPC. Cuando una
   extensión necesita avisar al gateway usa `pi.appendEntry()`, que llega por RPC como
   evento `entry_appended`.
+- **Contrato interno `edge` ↔ gateway** (ADR-0008). `providers.yaml` se monta en solo
+  lectura en los dos contenedores para que `edge` permita los proveedores sin fiarse del agente.
 
 ## API REST (borrador v1)
 
@@ -135,6 +137,10 @@ expondría `/sessions/:id` y redirigiría a la réplica correspondiente.
 - Las preguntas `network` las crea `edge` y las publica a través del gateway para que
   salgan en el mismo flujo SSE. Su respuesta llega a `POST /session/answers/:id` como las
   demás, pero `edge` la intercepta (ids con prefijo `net-`) y no la reenvía.
+- Contrato interno `edge` → gateway (ADR-0008): `POST /internal/questions`,
+  `POST /internal/questions/:id/resolved` y `POST /internal/network`. `edge` nunca reenvía
+  `/internal/*` desde fuera. Las opciones de una pregunta `network` son `allow_once`,
+  `allow_always` y `deny`.
 
 La web UI no puede usar `EventSource` (no permite cabeceras): lee SSE con `fetch`.
 
