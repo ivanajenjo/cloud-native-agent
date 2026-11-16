@@ -7,3 +7,6 @@ coverage/
 .data/
 # Real providers file (may hold API keys); the versioned example is config/providers.example.yaml.
 config/providers.yaml
+# Real service files (may hold tokens); the versioned examples are *.example.yaml.
+config/notifications.yaml
+config/web.yaml

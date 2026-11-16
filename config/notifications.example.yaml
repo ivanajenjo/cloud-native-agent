@@ -1,0 +1,28 @@
+# Ejemplo de notificaciones push (funcionalidad 5, ADR-0009).
+#
+# El fichero real es `config/notifications.yaml` (no se versiona). Se monta en solo lectura en
+# /config de `agent` y `edge`. Si no existe, no se envían notificaciones.
+#
+# - El gateway avisa cuando la sesión espera una respuesta (`waiting_input`), termina (`ready`)
+#   o falla (`error`).
+# - `edge` permite el host del servicio automáticamente, aunque esté en la LAN.
+# - Los tokens se escriben como `$VARIABLE` y llegan por el entorno del contenedor `agent`
+#   (deploy/compose/.env). El gateway los sustituye por [REDACTED] en eventos y logs.
+
+provider: ntfy
+
+# Eventos que avisan. Por defecto, todos.
+events: [waiting_input, ready, error]
+
+ntfy:
+  # ntfy.sh o un servidor propio.
+  url: https://ntfy.sh
+  # Elige un topic difícil de adivinar: en ntfy.sh cualquiera que lo conozca lo lee.
+  topic: cna-cambia-este-topic
+  # Opcional, para servidores con autenticación.
+  # token: $NTFY_TOKEN
+
+# Alternativa: Telegram. Cambia `provider: telegram`.
+# telegram:
+#   botToken: $TELEGRAM_BOT_TOKEN
+#   chatId: "123456789"

@@ -1,0 +1,10 @@
+# Minimal SearXNG settings for cna (profile "search"). The secret comes from SEARXNG_SECRET.
+use_default_settings: true
+server:
+  limiter: false
+  image_proxy: false
+search:
+  # web_search reads the JSON API.
+  formats:
+    - html
+    - json

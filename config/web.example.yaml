@@ -1,0 +1,20 @@
+# Ejemplo de búsqueda web para la tool `web_search` (ADR-0009).
+#
+# El fichero real es `config/web.yaml` (no se versiona). Se monta en solo lectura en /config
+# de `agent` y `edge`. Sin él, `web_search` responde que no está configurada; `web_fetch`
+# funciona igual (cada dominio nuevo pasa por la política de red).
+#
+# `edge` permite el host del buscador automáticamente, aunque sea interno (SearXNG en el
+# compose). Las API keys se escriben como `$VARIABLE` y llegan por el entorno de `agent`.
+
+search:
+  # SearXNG autoalojado: docker compose --profile search up (servicio `searxng`).
+  provider: searxng
+  url: http://searxng:8080
+
+  # Alternativas con API key (quita `url`):
+  # provider: brave
+  # apiKey: $BRAVE_API_KEY
+  #
+  # provider: tavily
+  # apiKey: $TAVILY_API_KEY

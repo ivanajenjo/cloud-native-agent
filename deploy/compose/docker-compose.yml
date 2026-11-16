@@ -16,12 +16,18 @@ services:
     # No `ports`: the agent is only reachable from edge.
     volumes:
       - agent-data:/data
-      # Read-only: the providers file (ADR-0008). Mount the directory, not the file.
+      # Read-only: providers.yaml, notifications.yaml and web.yaml (ADR-0008, ADR-0009).
+      # Mount the directory, not the files.
       - ../../config:/config:ro
     environment:
       GITHUB_TOKEN: ${GITHUB_TOKEN:-}
       ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
       OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      # Referenced as $VARIABLE from notifications.yaml and web.yaml (ADR-0009).
+      NTFY_TOKEN: ${NTFY_TOKEN:-}
+      TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:-}
+      BRAVE_API_KEY: ${BRAVE_API_KEY:-}
+      TAVILY_API_KEY: ${TAVILY_API_KEY:-}
       CNA_GIT_USER_NAME: ${CNA_GIT_USER_NAME:-}
       CNA_GIT_USER_EMAIL: ${CNA_GIT_USER_EMAIL:-}
     security_opt:
@@ -45,7 +51,8 @@ services:
       EDGE_ASK_TIMEOUT_MS: ${EDGE_ASK_TIMEOUT_MS:-120000}
     volumes:
       - edge-data:/edge-data
-      # Read-only: edge reads the allowed provider endpoints from here (ADR-0008).
+      # Read-only: edge reads the allowed provider and service endpoints from here
+      # (ADR-0008, ADR-0009).
       - ../../config:/config:ro
     # Linux (Raspberry) needs this for http://host.docker.internal in providers.yaml; Docker
     # Desktop already provides it. Only edge resolves and connects to providers.
@@ -59,6 +66,21 @@ services:
       - ALL
     restart: unless-stopped
     init: true
+
+  # Optional web search for `web_search` (ADR-0009): docker compose --profile search up.
+  # Only on `external`: the agent reaches it through edge (web.yaml: http://searxng:8080).
+  searxng:
+    image: searxng/searxng:2026.10.30-ffa88e3ba
+    profiles: [search]
+    networks:
+      - external
+    volumes:
+      - ./searxng/settings.yml:/etc/searxng/settings.yml:ro
+    environment:
+      SEARXNG_SECRET: ${SEARXNG_SECRET:-}
+    security_opt:
+      - "no-new-privileges:true"
+    restart: unless-stopped
 
 networks:
   # No gateway to the outside.
