@@ -25,7 +25,7 @@ import {
 } from "../src/rpc/bridge.js";
 import { type PiProcess, SessionManager } from "../src/session/manager.js";
 import { SessionError } from "../src/session/service.js";
-import { createGitRunner, type GitRunner } from "../src/workspace/git.js";
+import { createGitRunner, GitError, type GitRunner } from "../src/workspace/git.js";
 
 const SECRET = "ghp_supersecret123";
 
@@ -1120,6 +1120,7 @@ describe("SessionManager", () => {
       pi.emit({ type: "agent_settled" });
       await waitForEvent(h.events, checkpointEvent(1, "created"));
 
+      await writeFile(join(h.workspaceDir, "NEW.md"), "new\n");
       pi.responders.set("get_fork_messages", () => ({ messages: forkMessages(["e1", "e2"]) }));
       pi.responders.set("fork", () => ({ cancelled: true }));
 
@@ -1127,8 +1128,142 @@ describe("SessionManager", () => {
         code: "invalid_state",
         message: "fork cancelled",
       });
+      // The files are as they were before the call, not as checkpoint 0 (hello, no NEW.md).
       expect(await readFile(join(h.workspaceDir, "README.md"), "utf8")).toBe("one\n");
+      expect(await readFile(join(h.workspaceDir, "NEW.md"), "utf8")).toBe("new\n");
       expect(h.manager.checkpoints().map((checkpoint) => checkpoint.id)).toEqual([0, 1]);
+    });
+
+    it("puts the files back when the fork fails with a Pi error, keeping untracked files", async () => {
+      const h = harness();
+      const pi = await createAndRun(h);
+      pi.responders.set("get_fork_messages", () => ({ messages: forkMessages(["e1"]) }));
+      await writeFile(join(h.workspaceDir, "README.md"), "one\n");
+      pi.emit({ type: "agent_settled" });
+      await waitForEvent(h.events, checkpointEvent(1, "created"));
+
+      // Created after checkpoint 1: restoring checkpoint 0 would delete it, a failed fork must not.
+      await writeFile(join(h.workspaceDir, "NEW.md"), "new\n");
+      await writeFile(join(h.workspaceDir, "README.md"), "later\n");
+      pi.responders.set("fork", () => {
+        throw new RpcCommandError("fork failed in Pi", "fork", "failed");
+      });
+
+      await expect(h.manager.restoreCheckpoint(0, { conversation: true })).rejects.toMatchObject({
+        code: "invalid_state",
+        message: "fork failed in Pi",
+      });
+      expect(await readFile(join(h.workspaceDir, "README.md"), "utf8")).toBe("later\n");
+      expect(await readFile(join(h.workspaceDir, "NEW.md"), "utf8")).toBe("new\n");
+      expect(h.manager.checkpoints().map((checkpoint) => checkpoint.id)).toEqual([0, 1]);
+      expect(h.manager.get()?.status).toBe("ready");
+    });
+
+    it("reports that the files could not be put back, and logs it, when the rollback also fails", async () => {
+      // Counts only the checkout-index of the restore under test: the first one is the restore itself.
+      let counting = false;
+      let checkouts = 0;
+      const h = harness((real) => async (args, options) => {
+        if (counting && args[0] === "checkout-index") {
+          checkouts += 1;
+          if (checkouts === 2) {
+            throw new Error("checkout-index broke");
+          }
+        }
+        return real(args, options);
+      });
+      const pi = await createAndRun(h);
+      pi.responders.set("get_fork_messages", () => ({ messages: forkMessages(["e1"]) }));
+      await writeFile(join(h.workspaceDir, "README.md"), "one\n");
+      pi.emit({ type: "agent_settled" });
+      await waitForEvent(h.events, checkpointEvent(1, "created"));
+
+      pi.responders.set("get_fork_messages", () => ({ messages: forkMessages(["e1", "e2"]) }));
+      pi.responders.set("fork", () => ({ cancelled: true }));
+      counting = true;
+
+      await expect(h.manager.restoreCheckpoint(0, { conversation: true })).rejects.toMatchObject({
+        code: "invalid_state",
+        message: expect.stringMatching(
+          /^fork cancelled; the files could not be put back: .*checkout-index broke$/,
+        ),
+      });
+      expect(h.logs).toContainEqual(expect.stringContaining("could not be put back"));
+      expect(checkouts).toBe(2);
+    });
+
+    it("puts the files back and does not fork when the file restore itself fails", async () => {
+      let counting = false;
+      let checkouts = 0;
+      const h = harness((real) => async (args, options) => {
+        if (counting && args[0] === "checkout-index") {
+          checkouts += 1;
+          if (checkouts === 1) {
+            throw new GitError("git checkout-index failed", {
+              args,
+              exitCode: 128,
+              stderr: "checkout-index broke",
+            });
+          }
+        }
+        return real(args, options);
+      });
+      const pi = await createAndRun(h);
+      pi.responders.set("get_fork_messages", () => ({ messages: forkMessages(["e1"]) }));
+      await writeFile(join(h.workspaceDir, "README.md"), "one\n");
+      pi.emit({ type: "agent_settled" });
+      await waitForEvent(h.events, checkpointEvent(1, "created"));
+
+      pi.responders.set("get_fork_messages", () => ({ messages: forkMessages(["e1", "e2"]) }));
+      await writeFile(join(h.workspaceDir, "NEW.md"), "new\n");
+      counting = true;
+
+      await expect(h.manager.restoreCheckpoint(0, { conversation: true })).rejects.toMatchObject({
+        code: "invalid_state",
+      });
+      expect(pi.send.mock.calls.map(([command]) => command.type)).not.toContain("fork");
+      expect(await readFile(join(h.workspaceDir, "README.md"), "utf8")).toBe("one\n");
+      expect(await readFile(join(h.workspaceDir, "NEW.md"), "utf8")).toBe("new\n");
+      expect(checkouts).toBe(2);
+    });
+
+    it("takes a safety snapshot, restores the files, then forks, in that order", async () => {
+      const order: string[] = [];
+      let recording = false;
+      const h = harness((real) => async (args, options) => {
+        if (recording && args[0] === "commit-tree" && args.includes("cna restore safety")) {
+          order.push("safety snapshot");
+        }
+        if (recording && args[0] === "checkout-index") {
+          order.push("restore files");
+        }
+        return real(args, options);
+      });
+      const pi = await createAndRun(h);
+      pi.responders.set("get_fork_messages", () => ({ messages: forkMessages(["e1"]) }));
+      await writeFile(join(h.workspaceDir, "README.md"), "one\n");
+      pi.emit({ type: "agent_settled" });
+      await waitForEvent(h.events, checkpointEvent(1, "created"));
+
+      pi.responders.set("get_fork_messages", () => ({ messages: forkMessages(["e1", "e2"]) }));
+      pi.responders.set("fork", () => {
+        order.push("fork");
+        return { cancelled: false };
+      });
+      const eventsBefore = eventTypes(h).length;
+      recording = true;
+
+      await h.manager.restoreCheckpoint(0, { conversation: true });
+
+      expect(order).toEqual(["safety snapshot", "restore files", "fork"]);
+      expect(pi.send).toHaveBeenCalledWith({ type: "fork", entryId: "e1" });
+      // The safety snapshot is neither a checkpoint nor an event: only the restored event is new.
+      expect(h.manager.checkpoints().map((checkpoint) => checkpoint.id)).toEqual([0]);
+      expect(eventTypes(h).slice(eventsBefore)).toEqual(["todo", "checkpoint"]);
+      const refs = await realGit(["for-each-ref", "--format=%(refname)", "refs/cna/"], {
+        cwd: h.workspaceDir,
+      });
+      expect(refs.stdout.trim().split("\n")).toEqual(["refs/cna/checkpoints/0"]);
     });
 
     it("refuses a conversation restore when the position of the checkpoint is unknown", async () => {
@@ -1271,6 +1406,67 @@ describe("SessionManager", () => {
       expect(h.manager.get()?.status).toBe("running");
       expect(h.manager.checkpoints()).toEqual([]);
       expect(h.logs).toContainEqual(expect.stringContaining("checkpoint 0: disk full"));
+    });
+
+    it("takes no checkpoint for a run without changes right after its checkpoint", async () => {
+      const h = harness();
+      const pi = await createAndRun(h);
+      pi.emit({ type: "agent_settled" });
+      // postMessage waits for the queued checkpoint job: it is the barrier before the check.
+      await h.manager.postMessage({ text: "again" });
+
+      expect(h.manager.checkpoints().map((checkpoint) => checkpoint.id)).toEqual([0]);
+    });
+
+    it("compares a run with the restored files, not with the last checkpoint, after a files-only restore", async () => {
+      const h = harness();
+      const pi = await createAndRun(h);
+      pi.responders.set("get_fork_messages", () => ({ messages: forkMessages(["e1"]) }));
+      await writeFile(join(h.workspaceDir, "README.md"), "one\n");
+      pi.emit({ type: "agent_settled" });
+      await waitForEvent(h.events, checkpointEvent(1, "created"));
+      await writeFile(join(h.workspaceDir, "README.md"), "two\n");
+      pi.emit({ type: "agent_settled" });
+      await waitForEvent(h.events, checkpointEvent(2, "created"));
+
+      await h.manager.restoreCheckpoint(0, { conversation: false });
+      expect(await readFile(join(h.workspaceDir, "README.md"), "utf8")).toBe("hello\n");
+
+      // A run that changes nothing must not add a copy of checkpoint 0.
+      pi.emit({ type: "agent_settled" });
+      await h.manager.postMessage({ text: "nothing changed" });
+      expect(h.manager.checkpoints().map((checkpoint) => checkpoint.id)).toEqual([0, 1, 2]);
+
+      // A run that changes the files gets the next id after the last one.
+      await writeFile(join(h.workspaceDir, "README.md"), "three\n");
+      pi.emit({ type: "agent_settled" });
+      await h.manager.postMessage({ text: "changed" });
+      expect(h.manager.checkpoints().map((checkpoint) => checkpoint.id)).toEqual([0, 1, 2, 3]);
+      expect(h.manager.checkpoints()[3]).toMatchObject({ id: 3, reason: "run" });
+    });
+
+    it("takes no checkpoint for a run without changes after a conversation restore", async () => {
+      const h = harness();
+      const pi = await createAndRun(h);
+      const entries = forkMessages(["e1"]);
+      pi.responders.set("get_fork_messages", () => ({ messages: entries }));
+      pi.responders.set("fork", () => ({ cancelled: false }));
+      await writeFile(join(h.workspaceDir, "README.md"), "one\n");
+      pi.emit({ type: "agent_settled" });
+      await waitForEvent(h.events, checkpointEvent(1, "created"));
+
+      entries.push(...forkMessages(["e2"]));
+      await h.manager.postMessage({ text: "second prompt" });
+      await writeFile(join(h.workspaceDir, "README.md"), "two\n");
+      pi.emit({ type: "agent_settled" });
+      await waitForEvent(h.events, checkpointEvent(2, "created"));
+
+      await h.manager.restoreCheckpoint(1, { conversation: true });
+      expect(h.manager.checkpoints().map((checkpoint) => checkpoint.id)).toEqual([0, 1]);
+
+      pi.emit({ type: "agent_settled" });
+      await h.manager.postMessage({ text: "nothing changed" });
+      expect(h.manager.checkpoints().map((checkpoint) => checkpoint.id)).toEqual([0, 1]);
     });
   });
 

@@ -158,6 +158,12 @@ export class SessionManager implements SessionService {
   private workspaceQueue: Promise<void> = Promise.resolve();
   /** Checkpoints of the current session, oldest first. Reset by create() and close(). */
   private checkpointList: CheckpointRecord[] = [];
+  /**
+   * Tree of the working tree as last checkpointed or restored: a run that leaves it unchanged gets no
+   * checkpoint. Not the last checkpoint's tree: after a restore the files may match an older one.
+   * Reset by create() and close(), together with checkpointList.
+   */
+  private baselineTree: string | null = null;
   /** Run checkpoints are chained here, and so are the requests that need them. Never rejects. */
   private checkpointQueue: Promise<void> = Promise.resolve();
   /** True while a checkpoint is being restored: no new prompt or restore may start meanwhile. */
@@ -209,6 +215,7 @@ export class SessionManager implements SessionService {
     this.events.clear();
     this.todoList = [];
     this.checkpointList = [];
+    this.baselineTree = null;
     this.checkpointQueue = Promise.resolve();
 
     const info: SessionInfo = {
@@ -398,9 +405,9 @@ export class SessionManager implements SessionService {
 
   /**
    * Restores the working tree to a checkpoint and, with `conversation`, also the conversation (Pi
-   * `fork`). The conversation is forked first: a fork that fails or is cancelled leaves the files alone.
+   * `fork`). With `conversation`, a fork that fails or is cancelled puts the files back as they were.
    * Throws no_session, invalid_state (not ready, unknown conversation position, fork cancelled, git or
-   * Pi failure) and checkpoint_not_found.
+   * Pi failure, files not put back) and checkpoint_not_found.
    */
   async restoreCheckpoint(
     id: number,
@@ -427,15 +434,30 @@ export class SessionManager implements SessionService {
     if (this.restoring) {
       throw new SessionError("invalid_state", "a checkpoint is being restored");
     }
+    // Checked before anything is touched: a restore that cannot fork must not move the files.
+    const pi = this.pi;
+    if (options.conversation) {
+      if (pi === null) {
+        throw new SessionError("invalid_state", "Pi is not running");
+      }
+      if (record.forkIndex < 0) {
+        throw new SessionError(
+          "invalid_state",
+          "the conversation position of this checkpoint is unknown",
+        );
+      }
+    }
 
     const git = this.options.git;
     const dir = this.options.workspaceDir;
     this.restoring = true;
     try {
-      if (options.conversation) {
-        await this.forkToCheckpoint(record);
+      if (pi !== null && options.conversation) {
+        await this.restoreFilesAndConversation(pi, record);
+      } else {
+        await restoreWorkingTree(git, dir, record.checkpoint.commit);
       }
-      await restoreWorkingTree(git, dir, record.checkpoint.commit);
+      this.baselineTree = record.tree;
       if (options.conversation) {
         await deleteCheckpointRefsAfter(git, dir, id);
         this.checkpointList = this.checkpointList.filter((item) => item.checkpoint.id <= id);
@@ -525,6 +547,7 @@ export class SessionManager implements SessionService {
       this.setStatus("closed");
       this.info = null;
       this.checkpointList = [];
+      this.baselineTree = null;
       this.checkpointQueue = Promise.resolve();
     } finally {
       this.closing = false;
@@ -639,6 +662,7 @@ export class SessionManager implements SessionService {
       };
       // The conversation is empty: the first user message is fork index 0.
       this.checkpointList.push({ checkpoint, tree, forkIndex: 0, todos: [] });
+      this.baselineTree = tree;
       this.emit({ type: "checkpoint", action: "created", checkpoint: { ...checkpoint } });
     } catch (error) {
       this.logger.error(`checkpoint 0: ${this.redactor.redactString(errorMessage(error))}`);
@@ -661,10 +685,10 @@ export class SessionManager implements SessionService {
     const dir = this.options.workspaceDir;
     try {
       const { commit, tree } = await snapshotWorkingTree(git, dir, "cna checkpoint");
-      const last = this.checkpointList.at(-1);
-      if (last !== undefined && last.tree === tree) {
+      if (this.baselineTree === tree) {
         return;
       }
+      const last = this.checkpointList.at(-1);
       const id = last === undefined ? 0 : last.checkpoint.id + 1;
       await saveCheckpointRef(git, dir, id, commit);
       const forkIndex = await this.countForkEntries(pi);
@@ -683,6 +707,7 @@ export class SessionManager implements SessionService {
         forkIndex,
         todos: this.todoList.map((item) => ({ ...item })),
       });
+      this.baselineTree = tree;
       this.emit({ type: "checkpoint", action: "created", checkpoint: { ...checkpoint } });
     } catch (error) {
       this.logger.error(`checkpoint: ${this.redactor.redactString(errorMessage(error))}`);
@@ -699,18 +724,36 @@ export class SessionManager implements SessionService {
     }
   }
 
+  /**
+   * Restores the files to the checkpoint and the conversation with Pi's `fork`, as one step: if the fork
+   * fails, the files go back to the state they had before (safety snapshot, not a checkpoint). Throws
+   * the original error, or invalid_state if the files could not be put back either.
+   */
+  private async restoreFilesAndConversation(
+    pi: PiProcess,
+    record: CheckpointRecord,
+  ): Promise<void> {
+    const git = this.options.git;
+    const dir = this.options.workspaceDir;
+    const safety = await snapshotWorkingTree(git, dir, "cna restore safety");
+    try {
+      // A failure half way through the file restore is rolled back like a failed fork.
+      await restoreWorkingTree(git, dir, record.checkpoint.commit);
+      await this.forkToCheckpoint(pi, record);
+    } catch (error) {
+      try {
+        await restoreWorkingTree(git, dir, safety.commit);
+      } catch (putBackError) {
+        const message = `${errorMessage(error)}; the files could not be put back: ${errorMessage(putBackError)}`;
+        this.logger.error(`restore: ${this.redactor.redactString(message)}`);
+        throw new SessionError("invalid_state", this.redactor.redactString(message));
+      }
+      throw error;
+    }
+  }
+
   /** Moves the conversation back to the checkpoint with Pi's `fork`. Throws invalid_state. */
-  private async forkToCheckpoint(record: CheckpointRecord): Promise<void> {
-    const pi = this.pi;
-    if (pi === null) {
-      throw new SessionError("invalid_state", "Pi is not running");
-    }
-    if (record.forkIndex < 0) {
-      throw new SessionError(
-        "invalid_state",
-        "the conversation position of this checkpoint is unknown",
-      );
-    }
+  private async forkToCheckpoint(pi: PiProcess, record: CheckpointRecord): Promise<void> {
     const entries = forkEntriesOf(await this.sendToPi(pi, { type: "get_fork_messages" }));
     if (entries === null) {
       throw new SessionError("invalid_state", "Pi did not list the conversation messages");
