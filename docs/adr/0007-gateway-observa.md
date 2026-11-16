@@ -30,7 +30,9 @@ crear el checkpoint (`get_fork_messages`). Al restaurar la conversación se pide
 `get_fork_messages` y se hace `fork` con el `entryId` del mensaje en esa posición, que es el
 primero posterior al checkpoint. Así no hace falta seguir el mensaje siguiente cuando llega.
 Restaurar con conversación descarta los checkpoints posteriores, que quedan en la rama
-abandonada.
+abandonada, y es todo o nada: antes se toma un snapshot de seguridad del árbol y, si falla la
+restauración de ficheros o el `fork`, los ficheros vuelven a él. Un checkpoint nuevo solo se
+crea si el árbol difiere del último checkpoint creado o restaurado.
 
 ## Consecuencias
 - (+) Menos código dentro de Pi y menos superficie expuesta a cambios de su API.
