@@ -5,8 +5,12 @@ import { join } from "node:path";
 import {
   type NetworkLogEntry,
   type ProviderEndpoint,
+  parseNotificationsConfig,
   parseProvidersConfig,
+  parseWebConfig,
   providerEndpoints,
+  type ServiceEndpoint,
+  serviceEndpoints,
 } from "@cna/shared";
 import type { Hono } from "hono";
 import type { EdgeConfig } from "./config.js";
@@ -22,6 +26,10 @@ import { createIngressApp } from "./ingress.js";
 export interface EdgeRuntime {
   ingress: Hono;
   proxy: Server;
+  /** Endpoints of providers.yaml (read-only). */
+  providers: readonly ProviderEndpoint[];
+  /** Endpoints of notifications.yaml and web.yaml (read-only). */
+  services: readonly ServiceEndpoint[];
   /** Cancels pending network questions and closes the network log. */
   close(): Promise<void>;
   /** Current mode, for the startup log line. */
@@ -43,7 +51,8 @@ export interface WiringOptions {
 
 /**
  * Builds edge's runtime: policy, ask coordinator, gateway client, network log, egress proxy and
- * ingress. Throws (startup must fail) if the policy file or providers.yaml cannot be read or parsed.
+ * ingress. Throws (startup must fail) if the policy file, providers.yaml, notifications.yaml or
+ * web.yaml cannot be read or parsed.
  */
 export async function createEdgeRuntime(options: WiringOptions): Promise<EdgeRuntime> {
   const { config, version } = options;
@@ -53,6 +62,10 @@ export async function createEdgeRuntime(options: WiringOptions): Promise<EdgeRun
 
   const store = await PolicyStore.load(join(config.dataDir, "policy.json"));
   const providers = await loadProviderEndpoints(config.providersFile);
+  const services = await loadServiceEndpoints({
+    notificationsFile: config.notificationsFile,
+    webFile: config.webFile,
+  });
 
   const gateway = createGatewayClient({ gatewayUrl: config.gatewayUrl, fetch });
   const ask = new AskCoordinator({ gateway, timeoutMs: config.askTimeoutMs });
@@ -60,6 +73,7 @@ export async function createEdgeRuntime(options: WiringOptions): Promise<EdgeRun
     store,
     baseAllowlist: BASE_ALLOWLIST.map(parseAllowlistEntry),
     providers,
+    services,
     ask,
     onPersistError: (error) =>
       logError(
@@ -91,6 +105,8 @@ export async function createEdgeRuntime(options: WiringOptions): Promise<EdgeRun
   return {
     ingress,
     proxy,
+    providers,
+    services,
     async close() {
       ask.cancelAll();
       await log.close();
@@ -116,6 +132,36 @@ export async function loadProviderEndpoints(path: string): Promise<ProviderEndpo
     throw error;
   }
   return providerEndpoints(parseProvidersConfig(text));
+}
+
+/**
+ * Reads notifications.yaml and web.yaml and returns the service endpoints edge must allow. A
+ * missing file means that service is disabled and contributes nothing. Parse and validation
+ * errors propagate: edge must not start with a configuration it does not understand.
+ */
+export async function loadServiceEndpoints(paths: {
+  notificationsFile: string;
+  webFile: string;
+}): Promise<ServiceEndpoint[]> {
+  const notifications = await readOptionalFile(paths.notificationsFile);
+  const web = await readOptionalFile(paths.webFile);
+  return serviceEndpoints({
+    notifications:
+      notifications === undefined ? undefined : parseNotificationsConfig(notifications),
+    web: web === undefined ? undefined : parseWebConfig(web),
+  });
+}
+
+/** File contents, or undefined when the file does not exist. */
+async function readOptionalFile(path: string): Promise<string | undefined> {
+  try {
+    return await readFile(path, "utf8");
+  } catch (error) {
+    if (isMissingFile(error)) {
+      return undefined;
+    }
+    throw error;
+  }
 }
 
 function isMissingFile(error: unknown): boolean {

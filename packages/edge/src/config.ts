@@ -9,6 +9,10 @@ export interface EdgeConfig {
   proxyPort: number;
   /** providers.yaml mounted read-only (EDGE_PROVIDERS_FILE, default "/config/providers.yaml"). Absolute path. */
   providersFile: string;
+  /** notifications.yaml mounted read-only (EDGE_NOTIFICATIONS_FILE, default "/config/notifications.yaml"). Absolute path. */
+  notificationsFile: string;
+  /** web.yaml mounted read-only (EDGE_WEB_FILE, default "/config/web.yaml"). Absolute path. */
+  webFile: string;
   /** Network question timeout (EDGE_ASK_TIMEOUT_MS, default 120000). Integer in [1000, 3600000]. */
   askTimeoutMs: number;
 }
@@ -17,6 +21,8 @@ const MIN_TOKEN_LENGTH = 32;
 const DEFAULT_GATEWAY_URL = "http://agent:8090";
 const DEFAULT_DATA_DIR = "/edge-data";
 const DEFAULT_PROVIDERS_FILE = "/config/providers.yaml";
+const DEFAULT_NOTIFICATIONS_FILE = "/config/notifications.yaml";
+const DEFAULT_WEB_FILE = "/config/web.yaml";
 const DEFAULT_ASK_TIMEOUT_MS = 120_000;
 const MIN_ASK_TIMEOUT_MS = 1000;
 const MAX_ASK_TIMEOUT_MS = 3_600_000;
@@ -41,14 +47,34 @@ export function loadConfig(env: Record<string, string | undefined>): EdgeConfig 
     env.EDGE_PROXY_PORT,
     DEFAULT_PORTS.edgeProxy,
   );
-  const providersFile = parseProvidersFile(env.EDGE_PROVIDERS_FILE ?? DEFAULT_PROVIDERS_FILE);
+  const providersFile = parseAbsolutePath(
+    "EDGE_PROVIDERS_FILE",
+    env.EDGE_PROVIDERS_FILE,
+    DEFAULT_PROVIDERS_FILE,
+  );
+  const notificationsFile = parseAbsolutePath(
+    "EDGE_NOTIFICATIONS_FILE",
+    env.EDGE_NOTIFICATIONS_FILE,
+    DEFAULT_NOTIFICATIONS_FILE,
+  );
+  const webFile = parseAbsolutePath("EDGE_WEB_FILE", env.EDGE_WEB_FILE, DEFAULT_WEB_FILE);
   const askTimeoutMs = parseAskTimeout(env.EDGE_ASK_TIMEOUT_MS);
 
   if (apiPort === proxyPort) {
     throw new Error("EDGE_API_PORT and EDGE_PROXY_PORT must be different");
   }
 
-  return { token, gatewayUrl, dataDir, apiPort, proxyPort, providersFile, askTimeoutMs };
+  return {
+    token,
+    gatewayUrl,
+    dataDir,
+    apiPort,
+    proxyPort,
+    providersFile,
+    notificationsFile,
+    webFile,
+    askTimeoutMs,
+  };
 }
 
 function parseToken(value: string | undefined): string {
@@ -94,11 +120,13 @@ function parseDataDir(value: string): string {
   return value;
 }
 
-function parseProvidersFile(value: string): string {
-  if (!isAbsolute(value)) {
-    throw new Error("EDGE_PROVIDERS_FILE must be an absolute path");
+/** Config file path: absolute, or absent (then the default). Names the variable on error. */
+function parseAbsolutePath(name: string, value: string | undefined, fallback: string): string {
+  const path = value ?? fallback;
+  if (!isAbsolute(path)) {
+    throw new Error(`${name} must be an absolute path`);
   }
-  return value;
+  return path;
 }
 
 /** Milliseconds, digits only. Absent → default. Never echoes the value. */

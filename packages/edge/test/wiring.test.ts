@@ -6,7 +6,12 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { type EdgeConfig, loadConfig } from "../src/config.js";
-import { createEdgeRuntime, type EdgeRuntime, loadProviderEndpoints } from "../src/wiring.js";
+import {
+  createEdgeRuntime,
+  type EdgeRuntime,
+  loadProviderEndpoints,
+  loadServiceEndpoints,
+} from "../src/wiring.js";
 
 const TOKEN = "0123456789abcdef".repeat(4);
 const GATEWAY = "http://gw.test:8090";
@@ -83,29 +88,42 @@ function fakeResolver(records: Record<string, string[]>) {
   };
 }
 
-function configFor(providersFile: string): EdgeConfig {
+/** Config with the given files; the ones not given point at files that do not exist. */
+function configFor(paths: {
+  providersFile?: string;
+  notificationsFile?: string;
+  webFile?: string;
+}): EdgeConfig {
   return loadConfig({
     AGENT_API_TOKEN: TOKEN,
     GATEWAY_URL: GATEWAY,
     EDGE_DATA_DIR: dataDir,
-    EDGE_PROVIDERS_FILE: providersFile,
+    EDGE_PROVIDERS_FILE: paths.providersFile ?? missingFile("no-providers.yaml"),
+    EDGE_NOTIFICATIONS_FILE: paths.notificationsFile ?? missingFile("no-notifications.yaml"),
+    EDGE_WEB_FILE: paths.webFile ?? missingFile("no-web.yaml"),
   });
 }
 
+function missingFile(name: string): string {
+  return join(dataDir, name);
+}
+
 function missingProvidersFile(): string {
-  return join(dataDir, "no-providers.yaml");
+  return missingFile("no-providers.yaml");
 }
 
 async function startRuntime(
   options: {
     providersFile?: string;
+    notificationsFile?: string;
+    webFile?: string;
     records?: Record<string, string[]>;
     gateway?: FakeGateway;
   } = {},
 ): Promise<{ runtime: EdgeRuntime; gateway: FakeGateway }> {
   const gateway = options.gateway ?? fakeGateway();
   const runtime = await createEdgeRuntime({
-    config: configFor(options.providersFile ?? missingProvidersFile()),
+    config: configFor(options),
     version: VERSION,
     fetch: gateway.fetch,
     resolver: fakeResolver(options.records ?? {}),
@@ -209,12 +227,75 @@ describe("loadProviderEndpoints", () => {
   });
 });
 
+describe("loadServiceEndpoints", () => {
+  const NTFY_YAML = [
+    "provider: ntfy",
+    "ntfy:",
+    "  url: http://ntfy.lan:8081",
+    "  topic: cna-alerts",
+    "",
+  ].join("\n");
+  const SEARXNG_YAML = ["search:", "  provider: searxng", "  url: http://searxng:8080", ""].join(
+    "\n",
+  );
+
+  it("returns no endpoints when both files do not exist", async () => {
+    await expect(
+      loadServiceEndpoints({
+        notificationsFile: missingFile("no-notifications.yaml"),
+        webFile: missingFile("no-web.yaml"),
+      }),
+    ).resolves.toEqual([]);
+  });
+
+  it("returns the ntfy and SearXNG endpoints when both files exist", async () => {
+    const notificationsFile = join(dataDir, "notifications.yaml");
+    const webFile = join(dataDir, "web.yaml");
+    await writeFile(notificationsFile, NTFY_YAML);
+    await writeFile(webFile, SEARXNG_YAML);
+    await expect(loadServiceEndpoints({ notificationsFile, webFile })).resolves.toEqual([
+      { service: "notifications", host: "ntfy.lan", port: 8081 },
+      { service: "web_search", host: "searxng", port: 8080 },
+    ]);
+  });
+
+  it("returns only the endpoint of the file that exists", async () => {
+    const webFile = join(dataDir, "web.yaml");
+    await writeFile(webFile, SEARXNG_YAML);
+    await expect(
+      loadServiceEndpoints({
+        notificationsFile: missingFile("no-notifications.yaml"),
+        webFile,
+      }),
+    ).resolves.toEqual([{ service: "web_search", host: "searxng", port: 8080 }]);
+  });
+
+  it("throws with a message that starts with notifications.yaml: for an invalid file", async () => {
+    const notificationsFile = join(dataDir, "notifications.yaml");
+    await writeFile(notificationsFile, "provider: [unclosed\n");
+    await expect(
+      loadServiceEndpoints({ notificationsFile, webFile: missingFile("no-web.yaml") }),
+    ).rejects.toThrow(/^notifications\.yaml:/);
+  });
+
+  it("throws with a message that starts with web.yaml: for an invalid file", async () => {
+    const webFile = join(dataDir, "web.yaml");
+    await writeFile(webFile, "search:\n  provider: brave\n");
+    await expect(
+      loadServiceEndpoints({
+        notificationsFile: missingFile("no-notifications.yaml"),
+        webFile,
+      }),
+    ).rejects.toThrow(/^web\.yaml:/);
+  });
+});
+
 describe("createEdgeRuntime startup", () => {
   it("rejects when policy.json is corrupt", async () => {
     await writeFile(join(dataDir, "policy.json"), "{not json");
     await expect(
       createEdgeRuntime({
-        config: configFor(missingProvidersFile()),
+        config: configFor({}),
         version: VERSION,
         fetch: fakeGateway().fetch,
       }),
@@ -224,6 +305,51 @@ describe("createEdgeRuntime startup", () => {
   it("reports ask as the mode when there is no policy.json", async () => {
     const { runtime } = await startRuntime();
     expect(runtime.mode()).toBe("ask");
+  });
+
+  it("exposes empty providers and services when no file exists", async () => {
+    const { runtime } = await startRuntime();
+    expect(runtime.providers).toEqual([]);
+    expect(runtime.services).toEqual([]);
+  });
+
+  it("exposes the endpoints of the provider and service files", async () => {
+    const providersFile = join(dataDir, "providers.yaml");
+    const notificationsFile = join(dataDir, "notifications.yaml");
+    const webFile = join(dataDir, "web.yaml");
+    await writeFile(
+      providersFile,
+      ["providers:", "  ollama:", "    baseUrl: http://192.168.1.50:11434/v1", ""].join("\n"),
+    );
+    await writeFile(
+      notificationsFile,
+      ["provider: ntfy", "ntfy:", "  url: http://ntfy.lan:8081", "  topic: cna-alerts", ""].join(
+        "\n",
+      ),
+    );
+    await writeFile(
+      webFile,
+      ["search:", "  provider: searxng", "  url: http://searxng:8080", ""].join("\n"),
+    );
+
+    const { runtime } = await startRuntime({ providersFile, notificationsFile, webFile });
+    expect(runtime.providers).toEqual([{ provider: "ollama", host: "192.168.1.50", port: 11434 }]);
+    expect(runtime.services).toEqual([
+      { service: "notifications", host: "ntfy.lan", port: 8081 },
+      { service: "web_search", host: "searxng", port: 8080 },
+    ]);
+  });
+
+  it("refuses to start when web.yaml is invalid", async () => {
+    const webFile = join(dataDir, "web.yaml");
+    await writeFile(webFile, "search:\n  provider: brave\n");
+    await expect(
+      createEdgeRuntime({
+        config: configFor({ webFile }),
+        version: VERSION,
+        fetch: fakeGateway().fetch,
+      }),
+    ).rejects.toThrow(/^web\.yaml:/);
   });
 });
 
@@ -293,6 +419,46 @@ describe("egress proxy with the ask flow", () => {
     expect(questionCall(gateway)).toBeUndefined();
     connect.req.destroy();
     void connect.answered.catch(() => undefined);
+  });
+
+  it("allows a service endpoint on an internal address without asking", async () => {
+    const echo = track(
+      createServer((socket) => {
+        socket.on("error", () => undefined);
+        socket.pipe(socket);
+      }),
+    );
+    const echoPort = await listen(echo);
+
+    const notificationsFile = join(dataDir, "notifications.yaml");
+    await writeFile(
+      notificationsFile,
+      [
+        "provider: ntfy",
+        "ntfy:",
+        `  url: http://ntfy.lan:${echoPort}`,
+        "  topic: cna-alerts",
+        "",
+      ].join("\n"),
+    );
+
+    const { runtime, gateway } = await startRuntime({
+      notificationsFile,
+      records: { "ntfy.lan": ["127.0.0.1"] },
+    });
+    const port = await listen(track(runtime.proxy));
+
+    const connect = openConnect(port, `ntfy.lan:${echoPort}`);
+    const connected = await connect.answered;
+    expect(connected.status).toBe(200);
+    expect(questionCall(gateway)).toBeUndefined();
+    connected.socket.destroy();
+
+    const lines = await waitFor(async () => {
+      const found = await networkLogLines();
+      return found?.some((line) => line.reason === "service") ? found : undefined;
+    });
+    expect(lines.some((line) => line.host === "ntfy.lan" && line.decision === "allow")).toBe(true);
   });
 
   it("allows a provider endpoint on a non-default port without asking", async () => {

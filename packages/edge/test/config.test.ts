@@ -17,6 +17,8 @@ describe("loadConfig defaults", () => {
       apiPort: 8080,
       proxyPort: 3128,
       providersFile: "/config/providers.yaml",
+      notificationsFile: "/config/notifications.yaml",
+      webFile: "/config/web.yaml",
       askTimeoutMs: 120000,
     });
   });
@@ -32,6 +34,8 @@ describe("loadConfig overrides", () => {
           EDGE_API_PORT: "18080",
           EDGE_PROXY_PORT: "13128",
           EDGE_PROVIDERS_FILE: "/srv/providers.yaml",
+          EDGE_NOTIFICATIONS_FILE: "/srv/notifications.yaml",
+          EDGE_WEB_FILE: "/srv/web.yaml",
           EDGE_ASK_TIMEOUT_MS: "5000",
         }),
       ),
@@ -42,6 +46,8 @@ describe("loadConfig overrides", () => {
       apiPort: 18080,
       proxyPort: 13128,
       providersFile: "/srv/providers.yaml",
+      notificationsFile: "/srv/notifications.yaml",
+      webFile: "/srv/web.yaml",
       askTimeoutMs: 5000,
     });
   });
@@ -146,6 +152,28 @@ describe("EDGE_PROVIDERS_FILE validation", () => {
       message = error instanceof Error ? error.message : String(error);
     }
     expect(message).toBe("EDGE_PROVIDERS_FILE must be an absolute path");
+  });
+});
+
+describe("EDGE_NOTIFICATIONS_FILE and EDGE_WEB_FILE validation", () => {
+  it("accepts absolute paths", () => {
+    const config = loadConfig(
+      env({ EDGE_NOTIFICATIONS_FILE: "/run/notifications.yaml", EDGE_WEB_FILE: "/run/web.yaml" }),
+    );
+    expect(config.notificationsFile).toBe("/run/notifications.yaml");
+    expect(config.webFile).toBe("/run/web.yaml");
+  });
+
+  it("throws for a relative EDGE_NOTIFICATIONS_FILE and names the variable", () => {
+    expect(() => loadConfig(env({ EDGE_NOTIFICATIONS_FILE: "config/notifications.yaml" }))).toThrow(
+      "EDGE_NOTIFICATIONS_FILE must be an absolute path",
+    );
+  });
+
+  it("throws for a relative EDGE_WEB_FILE and names the variable", () => {
+    expect(() => loadConfig(env({ EDGE_WEB_FILE: "web.yaml" }))).toThrow(
+      "EDGE_WEB_FILE must be an absolute path",
+    );
   });
 });
 
