@@ -4,6 +4,14 @@ Agente de programación "Claude Code lite" auto-hospedado, basado en Pi
 (`@mariozechner/pi-coding-agent`), que corre en Docker (Raspberry Pi 4 arm64, MacBook)
 y más adelante en k8s local. Uso personal, solo GitHub.
 
+## Desarrollo con agentes (Claude Code)
+El desarrollo se hace con dos agentes definidos en `.claude/agents/`:
+- **`tech-lead`** (Opus): agente principal de la sesión (`.claude/settings.json`, o
+  `claude --agent tech-lead`). Trocea la fase en curso, delega, revisa y hace los commits.
+- **`implementer`** (Haiku): subagente que escribe el código y los tests de cada tarea.
+
+Si eres `implementer`, sigue el encargo recibido y esta guía; no replanifiques.
+
 ## Antes de escribir código
 1. Lee `docs/PLAN.md` entero y los ADR de `docs/adr/`. Son la fuente de verdad.
 2. Identifica la **fase** en la que estás (sección "Fases" del plan). Implementa **solo esa
