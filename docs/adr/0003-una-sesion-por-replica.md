@@ -23,3 +23,8 @@ Docker (equivale a dar root al agente) o usando la API de Kubernetes (no funcion
 - (−) Para ver todas las sesiones en un solo sitio hará falta un "hub" ligero que conozca
   las réplicas (fase 5).
 - (−) Cada réplica ocupa memoria aunque esté libre (unos cientos de MB en reposo).
+
+## Actualización (ADR-0004)
+Una réplica pasa a estar formada por dos contenedores: `agent` (gateway + Pi + toolchains)
+y `edge` (proxy de entrada/salida). Sigue siendo una unidad de despliegue con una sesión
+como máximo.

@@ -20,27 +20,35 @@ ejecutar tests y subir los cambios. Se controla por API REST, una web UI sencill
 | Concurrencia | **1 sesión por réplica**; más sesiones = más réplicas |
 | Servicios | El agente ejecuta tests, pero **no** levanta servicios (sin Docker-in-Docker) |
 | Push / PR | El agente **pregunta** antes de hacer push/PR, salvo que el prompt lo autorice |
+| Red saliente | Todo el tráfico sale por un proxy propio. Modo por defecto **`ask`**: dominios fuera de la allowlist se preguntan al usuario |
 
 ## Arquitectura
 
 ```
- Web UI / CLI / curl
-        │  REST + SSE  (Bearer token)
-        ▼
-┌───────────────────── réplica (1 contenedor) ─────────────────────┐
-│ gateway (TS, Node)                                               │
-│  · API REST + SSE · sirve la web UI estática                     │
-│  · SessionManager (máx. 1 sesión activa)                         │
-│  · RpcBridge ── spawn ──► pi --mode rpc  (subproceso)            │
-│                               │ JSONL stdin/stdout               │
-│                               ▼                                  │
-│                    Pi + extensiones propias:                     │
-│                     · ask_user   → extension_ui_request          │
-│                     · git_*/create_pr (vía gh)                   │
-│                     · política de push/PR                        │
-│ Toolchains (mise): Java+Maven/Gradle, Node+pnpm, Python+uv, Go   │
-│ /data/workspace   /data/sessions   /data/cache  (volumen)        │
-└──────────────────────────────────────────────────────────────────┘
+ Web UI / CLI / curl                                   internet
+        │  REST + SSE (Bearer token)                       ▲
+        ▼                                                  │ allowlist / ask
+┌─────────────────────────── edge (TS) ────────────────────┴─────┐
+│ · reverse proxy de entrada :8080 → gateway                     │
+│ · proxy de salida (HTTP CONNECT) :3128 · registro + política   │
+│ · única pieza con acceso a la red externa                      │
+└──────────────┬──────────────────────────────────▲──────────────┘
+  red interna  │ (sin salida a internet)          │ HTTPS_PROXY y
+               ▼                                  │ consultas "ask"
+┌───────────────────────── agent (contenedor) ────┴──────────────┐
+│ gateway (TS, Node)                                             │
+│  · API REST + SSE · sirve la web UI estática                   │
+│  · SessionManager (máx. 1 sesión activa)                       │
+│  · RpcBridge ── spawn ──► pi --mode rpc (subproceso)           │
+│                              │ JSONL stdin/stdout              │
+│                              ▼                                 │
+│                    Pi + extensiones propias:                   │
+│                     · ask_user → extension_ui_request          │
+│                     · git_*/create_pr (vía gh), política PR    │
+│                     · guard, audit, web_search/web_fetch       │
+│ Toolchains (mise): Java+Maven/Gradle, Node+pnpm, Python+uv, Go │
+│ /data/workspace  /data/sessions  /data/cache  (volumen)        │
+└────────────────────────────────────────────────────────────────┘
 ```
 
 ### Decisiones clave
@@ -55,6 +63,9 @@ ejecutar tests y subir los cambios. Se controla por API REST, una web UI sencill
 - **Imagen única multi-arch** (`linux/amd64`, `linux/arm64`) con toolchains vía `mise`.
   Si el repo trae `.tool-versions`/`mise.toml`, se respetan.
 - **GitHub con PAT fine-grained** limitado a los repos propios + `gh` CLI.
+- **Control de red con proxy de salida propio** (ADR-0004). El contenedor del agente está
+  en una red interna sin salida; todo pasa por el contenedor `edge`, que registra cada
+  conexión y aplica la política. Modo por defecto `ask`.
 
 ## API REST (borrador v1)
 
@@ -77,9 +88,20 @@ expondría `/sessions/:id` y redirigiría a la réplica correspondiente.
 
 **Estados:** `idle → cloning → running ⇄ waiting_input → ready → closed` (+ `error`).
 
-**Eventos SSE** (normalizados desde los eventos RPC de Pi):
+**Eventos SSE** (normalizados desde los eventos RPC de Pi y del proxy):
 `status`, `message_delta`, `message`, `tool_start`, `tool_update`, `tool_end`,
-`question`, `question_resolved`, `notify`, `error`.
+`question`, `question_resolved`, `network`, `notify`, `error`.
+
+Los eventos `question` llevan un `kind`: `ask_user` (pregunta del agente), `confirm`
+(push/PR) o `network` (acceso a un dominio nuevo; opciones: *permitir esta vez*,
+*permitir siempre*, *denegar*).
+
+Endpoints de red:
+```
+GET    /network/log                     conexiones de la sesión (host, puerto, decisión, bytes)
+GET    /network/policy                  modo + allowlist/denylist efectivas
+PUT    /network/policy                  cambiar modo o listas
+```
 
 ## Extensiones de Pi
 
@@ -88,6 +110,8 @@ expondría `/sessions/:id` y redirigiría a la réplica correspondiente.
 | `ask_user` | Tool `ask_user({question, options?, multiline?})`. Usa `ctx.ui.select` / `ctx.ui.input` / `ctx.ui.editor`; en RPC se convierte en `extension_ui_request` que el gateway publica como evento `question`. |
 | `git` | Tools `git_status`, `git_commit`, `git_push`, `create_pr`. `git_push` y `create_pr` piden confirmación con `ctx.ui.confirm` salvo que la sesión se haya creado con `autoPush: true` / el prompt lo autorice. Ramas siempre `agent/<slug>`; nunca push a la rama base. |
 | `guard` | Hook `tool_call` que bloquea comandos peligrosos (`git push --force` a la rama base, `rm -rf /`, intentos de `docker run`…). |
+| `audit` | Hook `tool_call`/`tool_result` que registra todas las llamadas a tools y las publica por SSE. |
+| `web` | Tools `web_search` (SearXNG autoalojado o API tipo Brave/Tavily) y `web_fetch` (descarga y convierte a texto). El resultado se marca como contenido externo no fiable. Su tráfico pasa por el proxy como el resto. |
 
 Además se añade un prompt de sistema (`--append-system-prompt`) que explica el entorno:
 toolchains disponibles, que no hay Docker ni servicios externos, y la política de PR.
@@ -110,6 +134,37 @@ providers:
 > En la Raspberry Pi 4 no es viable ejecutar un modelo útil con Ollama local:
 > Ollama debería correr en el MacBook u otra máquina de la red, o usar API keys.
 
+## Control de red saliente (egress)
+
+Detalle en ADR-0004.
+
+- **Topología (compose):** red `internal` (`internal: true`, sin salida) con `agent` y
+  `edge`; red `external` solo con `edge`. El puerto de la API se publica en `edge`, que
+  hace de reverse proxy hacia el gateway (Docker no publica puertos de redes internas).
+- **Proxy:** HTTP `CONNECT` sin interceptar TLS: se ve dominio y puerto, no URL ni contenido.
+  En el agente: `HTTPS_PROXY`/`HTTP_PROXY`/`NO_PROXY`, y para Java `JAVA_TOOL_OPTIONS`
+  con `-Dhttps.proxyHost`… + configuración de Maven/Gradle en la imagen. Lo que ignore el
+  proxy no tiene ruta de salida: **falla cerrado**.
+- **Modos:**
+  - `ask` (**por defecto**): allowlist base + preguntar por cualquier dominio nuevo.
+  - `allowlist`: solo allowlist; el resto se deniega sin preguntar.
+  - `audit`: permite todo y lo registra (útil para descubrir qué necesita un stack).
+- **Allowlist base:** GitHub (`github.com`, `api.github.com`, `codeload.github.com`,
+  `objects.githubusercontent.com`…), registries (npm, PyPI, Maven Central, Gradle plugins,
+  `proxy.golang.org`, `sum.golang.org`), los hosts de los proveedores de
+  `providers.yaml` (incluida la IP/host de Ollama) y el buscador configurado para `web_search`.
+- **Flujo `ask`:** el proxy retiene el `CONNECT`, pregunta al gateway por un endpoint interno
+  (autenticado con un secreto compartido), el gateway emite `question{kind:"network"}`
+  y espera la respuesta. *Permitir siempre* se persiste en `/data/policy/network.yaml`.
+  Sin respuesta en el timeout (configurable, 2 min por defecto) o sin sesión activa → **denegar**.
+  Para evitar avalanchas, peticiones concurrentes al mismo dominio comparten la misma pregunta.
+- **Registro:** cada conexión (timestamp, host, puerto, decisión, bytes, duración) va a
+  `/data/logs/network.jsonl` y se emite como evento SSE `network`.
+- **Limitación aceptada:** la resolución DNS la hace Docker, así que la exfiltración vía
+  DNS es posible en teoría.
+- **Futuro:** inyección de credenciales en el proxy (`GITHUB_TOKEN`, API keys) para que el
+  contenedor del agente no las vea nunca (requiere terminar TLS para esos dominios).
+
 ## Contenedor
 
 - Base: `debian:bookworm-slim` + Node LTS (para gateway y Pi).
@@ -117,6 +172,7 @@ providers:
 - `mise` con versiones LTS preinstaladas de Java (Temurin) + Maven + Gradle, Node + pnpm,
   Python + uv, Go.
 - Usuario `agent` (uid 1000), sin privilegios.
+- Variables de proxy apuntando a `edge:3128`; `NO_PROXY` solo para `edge`/`localhost`.
 - Volumen `/data`: `workspace/` (repo clonado), `sessions/` (JSONL de Pi para reanudar),
   `cache/` (Maven, Gradle, npm, pip/uv, Go): sobrevive a reinicios.
 - Tamaño estimado: 2–3 GB. Build multi-arch con `docker buildx`.
@@ -136,9 +192,11 @@ packages/
   extensions/     extensiones de Pi (ask_user, git, guard) + prompt de sistema
   cli/            cliente de terminal (crear sesión, chatear, responder preguntas)
   web/            web UI sencilla (estática, servida por el gateway)
+  edge/           reverse proxy de entrada + proxy de salida con política
   shared/         tipos del protocolo API/eventos compartidos
 docker/
-  Dockerfile
+  Dockerfile        imagen del agente (gateway + Pi + toolchains)
+  Dockerfile.edge   imagen ligera del proxy
 deploy/
   compose/        docker-compose.yml (1..N réplicas)
   k8s/            manifiestos / kustomize para k3s/kind
@@ -155,23 +213,31 @@ Monorepo con npm workspaces, TypeScript estricto, `vitest` para tests, `biome` p
 ### Fase 0 — Esqueleto y contenedor
 - Monorepo, tooling (tsconfig, biome, vitest), CI de GitHub Actions (lint + test + build imagen).
 - Dockerfile multi-arch con toolchains y Pi instalado. `docker compose up` arranca un gateway con `/health`.
+- `edge` mínimo: reverse proxy de entrada + proxy `CONNECT` con registro, y la topología
+  de redes de compose (el agente sin salida directa). Verificar que npm, pip, Maven,
+  Gradle, Go, git y gh funcionan a través del proxy.
 
 ### Fase 1 — MVP conversacional (API)
 - RpcBridge: spawn de `pi --mode rpc`, parser JSONL conforme (split solo en `\n`), correlación de respuestas.
 - SessionManager: clonar repo (con `GITHUB_TOKEN`), crear rama `agent/<slug>`, arrancar Pi en el workspace.
 - Endpoints `/session*` + SSE con replay (buffer de eventos y `Last-Event-ID`).
 - Extensión `ask_user` y respuesta vía `/session/answers/:id`.
-- Configuración de proveedores (`providers.yaml` → `models.json`).
+- Configuración de proveedores (`providers.yaml` → `models.json`); sus hosts entran en la allowlist.
+- Política de red con modo `ask` por defecto: endpoint interno edge → gateway, pregunta
+  `network` por SSE, persistencia de *permitir siempre*, denegar por timeout.
 - Tests: unitarios del parser/bridge con un Pi falso; e2e con un modelo mock.
 
 ### Fase 2 — Git y flujo de PR
 - Extensión `git` (commit, push, PR con `gh`) con la política de confirmación.
-- Extensión `guard`.
+- Extensiones `guard` y `audit`.
+- Extensión `web` (`web_search`, `web_fetch`).
+- Endpoints `/network/*`.
 - Prompt de sistema del entorno.
 
 ### Fase 3 — CLI y web UI
 - CLI: `cna run <repo> "<prompt>"`, chat interactivo en terminal, responder preguntas, `cna status/abort/close`.
-- Web UI: formulario de nueva sesión, chat con streaming, tarjetas de tool calls, diálogo de preguntas, botón de abortar.
+- Web UI: formulario de nueva sesión, chat con streaming, tarjetas de tool calls, diálogo de preguntas
+  (incluidas las de red), panel de conexiones de red, botón de abortar.
 
 ### Fase 4 — Persistencia y robustez
 - Reanudar sesión tras reinicio del contenedor (JSONL de Pi + estado en disco).
@@ -179,6 +245,8 @@ Monorepo con npm workspaces, TypeScript estricto, `vitest` para tests, `biome` p
 
 ### Fase 5 — Kubernetes y múltiples réplicas
 - Manifiestos para k3s/kind (StatefulSet con PVC por réplica, Secret, Service).
+- `edge` como Deployment aparte + NetworkPolicy que solo permite salida del agente hacia
+  `edge` (como sidecar no sirve: compartiría la red del pod y se podría esquivar).
 - Hub opcional: registro de réplicas, asignación de sesiones a réplicas libres, UI con todas las sesiones.
 
 ## Fuera de alcance (por ahora)
