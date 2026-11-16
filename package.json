@@ -5,7 +5,8 @@
   "workspaces": [
     "packages/shared",
     "packages/gateway",
-    "packages/edge"
+    "packages/edge",
+    "packages/extensions"
   ],
   "engines": {
     "node": ">=22.21.0"
