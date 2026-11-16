@@ -187,7 +187,12 @@ providers:
   relleno si falta.
 - Para Ollama y similares, `compat.supportsDeveloperRole: false` y
   `compat.supportsReasoningEffort: false` por defecto, configurables.
-- Los hosts de los proveedores entran en la allowlist de red automáticamente.
+- Los hosts de los proveedores con `baseUrl` entran en la allowlist de red automáticamente.
+  Un proveedor integrado de Pi sin `baseUrl` (Anthropic, OpenAI…) no declara su host, así
+  que `edge` no lo conoce: en modo `ask` la primera llamada genera una pregunta `network`
+  (p. ej. `api.anthropic.com:443`) y basta con responder *permitir siempre* una vez.
+- Las API keys escritas en `providers.yaml` (literales o `$VARIABLE`) se añaden a los
+  secretos que el gateway sustituye en eventos y logs.
 
 > En la Raspberry Pi 4 no es viable ejecutar un modelo útil con Ollama local:
 > Ollama debería correr en el MacBook u otra máquina de la red, o usar API keys.

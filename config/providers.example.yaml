@@ -29,6 +29,8 @@ providers:
   # `baseUrl` ni `apiKey`: Pi lee la clave de su variable de entorno (ANTHROPIC_API_KEY).
   # La clave llega al contenedor por el entorno (deploy/compose/.env), nunca en este fichero.
   # Para usarlo, descomenta el bloque, pon el id de un modelo de Pi y cambia `default`.
+  # Como no hay `baseUrl`, `edge` no conoce su host: la primera llamada genera una pregunta
+  # de red (p. ej. api.anthropic.com:443); responde `allow_always` una vez.
   #
   # anthropic:
   #   models:

@@ -95,7 +95,10 @@ docker compose -f deploy/compose/docker-compose.yml down              # parar (c
 Los modelos se configuran en `config/providers.yaml` (copia de
 [`config/providers.example.yaml`](config/providers.example.yaml)), montado en solo lectura
 en los dos contenedores. Se traduce al `models.json` de Pi al arrancar, y los hosts de sus
-`baseUrl` se permiten en la red aunque estén en la LAN.
+`baseUrl` se permiten en la red aunque estén en la LAN. Con un proveedor integrado de Pi
+(Anthropic, OpenAI…) no hay `baseUrl`: la primera llamada al modelo genera una pregunta de
+red (`api.anthropic.com:443`, por ejemplo); respóndela con `allow_always` y no vuelve a
+preguntar.
 
 No subas nunca el `.env` (está en `.gitignore`). Recomendado: un *ruleset* en GitHub que
 proteja la rama base y un límite de gasto en los proveedores LLM.
