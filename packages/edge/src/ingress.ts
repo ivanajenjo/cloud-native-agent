@@ -20,6 +20,8 @@ export interface IngressOptions {
   fetch?: typeof globalThis.fetch;
   /** Answers network questions (ids "net-*") locally. Normally AskCoordinator. */
   networkAnswers?: { answer(id: string, value: string): AnswerResult };
+  /** Answers `/network/*` (network policy and log). Never forwarded to the gateway. */
+  networkApi?: Hono;
 }
 
 /** Largest accepted body of `POST /session/answers/:id`. */
@@ -139,7 +141,7 @@ export function isInternalPath(path: string): boolean {
 
 function apiError(
   c: Context,
-  status: 400 | 404 | 409 | 413,
+  status: 400 | 404 | 405 | 409 | 413,
   error: ApiError["error"],
   message?: string,
 ): Response {
@@ -147,11 +149,54 @@ function apiError(
   return c.json(body, status);
 }
 
+/** True for `/network` and every path under `/network/` (compared lowercased). */
+function isNetworkPath(effective: string): boolean {
+  const lower = effective.toLowerCase();
+  return lower === "/network" || lower.startsWith("/network/");
+}
+
+/**
+ * Hands a `/network/*` request to the network API, with the effective path (dot segments and
+ * percent-encoding resolved) and the original query. Never reaches the gateway (ADR-0006).
+ */
+function answerNetworkApi(
+  c: Context,
+  networkApi: Hono | undefined,
+  effective: string,
+  target: string,
+): Promise<Response> | Response {
+  if (networkApi === undefined) {
+    return apiError(c, 404, "not_found");
+  }
+  const url = new URL("http://edge/");
+  url.pathname = effective;
+  const queryStart = target.indexOf("?");
+  if (queryStart !== -1) {
+    url.search = target.slice(queryStart);
+  }
+
+  const request = c.req.raw;
+  // Only the content type is passed on: the network API must not see the Bearer token.
+  const headers = new Headers();
+  const contentType = request.headers.get("content-type");
+  if (contentType !== null) {
+    headers.set("content-type", contentType);
+  }
+  const hasBody = request.body !== null && request.method !== "GET" && request.method !== "HEAD";
+  const init: ProxyRequestInit = {
+    method: request.method,
+    headers,
+    signal: request.signal,
+    ...(hasBody ? { body: request.body, duplex: "half" as const } : {}),
+  };
+  return networkApi.fetch(new Request(url, init));
+}
+
 /**
  * Reads the body as UTF-8 text, stopping as soon as it exceeds `limit` bytes.
  * Returns null when the limit is exceeded.
  */
-async function readLimitedText(
+export async function readLimitedText(
   body: ReadableStream<Uint8Array> | null,
   limit: number,
 ): Promise<string | null> {
@@ -273,6 +318,12 @@ export function createIngressApp(options: IngressOptions): Hono {
       !isAuthorized(c.req.header("authorization"), options.token)
     ) {
       return c.json({ error: "unauthorized" }, 401, { "WWW-Authenticate": "Bearer" });
+    }
+
+    // Network policy and log are answered by edge, with the Bearer token already checked.
+    const effective = effectivePath(path);
+    if (effective !== null && isNetworkPath(effective)) {
+      return answerNetworkApi(c, options.networkApi, effective, target);
     }
 
     // Network answers are decided by edge and never reach the gateway (ADR-0006, ADR-0008).

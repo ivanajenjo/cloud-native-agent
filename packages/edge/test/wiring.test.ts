@@ -517,3 +517,75 @@ describe("egress proxy with the ask flow", () => {
     expect(resolved.body).toEqual({ outcome: "cancelled" });
   });
 });
+
+describe("network API wiring", () => {
+  const bearer = { authorization: `Bearer ${TOKEN}` };
+
+  it("GET /network/log returns the connections that went through the proxy", async () => {
+    const echo = track(
+      createServer((socket) => {
+        socket.on("error", () => undefined);
+        socket.pipe(socket);
+      }),
+    );
+    const echoPort = await listen(echo);
+
+    const providersFile = join(dataDir, "providers.yaml");
+    await writeFile(
+      providersFile,
+      ["providers:", "  local:", `    baseUrl: http://127.0.0.1:${echoPort}/v1`, ""].join("\n"),
+    );
+
+    const { runtime } = await startRuntime({ providersFile });
+    const port = await listen(track(runtime.proxy));
+
+    const connect = openConnect(port, `127.0.0.1:${echoPort}`);
+    const connected = await connect.answered;
+    expect(connected.status).toBe(200);
+    connected.socket.destroy();
+
+    const entries = await waitFor(async () => {
+      const response = await runtime.ingress.request("/network/log", { headers: bearer });
+      expect(response.status).toBe(200);
+      const body = (await response.json()) as { entries: Array<Record<string, unknown>> };
+      return body.entries.some((entry) => entry.reason === "provider") ? body.entries : undefined;
+    });
+    expect(entries.some((entry) => entry.host === "127.0.0.1" && entry.decision === "allow")).toBe(
+      true,
+    );
+  });
+
+  it("GET /network/log without Bearer is rejected", async () => {
+    const { runtime } = await startRuntime();
+    const response = await runtime.ingress.request("/network/log");
+    expect(response.status).toBe(401);
+  });
+
+  it("GET /network/policy lists the configured provider endpoint", async () => {
+    const providersFile = join(dataDir, "providers.yaml");
+    await writeFile(
+      providersFile,
+      ["providers:", "  ollama:", "    baseUrl: http://192.168.1.50:11434/v1", ""].join("\n"),
+    );
+    const { runtime } = await startRuntime({ providersFile });
+    const response = await runtime.ingress.request("/network/policy", { headers: bearer });
+    expect(response.status).toBe(200);
+    const body = (await response.json()) as Record<string, unknown>;
+    expect(body.mode).toBe("ask");
+    expect(body.services).toEqual(["192.168.1.50:11434"]);
+    expect(body.allowedPorts).toEqual([80, 443]);
+    expect(body.base).toContain("github.com");
+  });
+
+  it("PUT /network/policy {mode:'allowlist'} changes the effective mode", async () => {
+    const { runtime } = await startRuntime();
+    expect(runtime.mode()).toBe("ask");
+    const response = await runtime.ingress.request("/network/policy", {
+      method: "PUT",
+      headers: { ...bearer, "content-type": "application/json" },
+      body: JSON.stringify({ mode: "allowlist" }),
+    });
+    expect(response.status).toBe(200);
+    expect(runtime.mode()).toBe("allowlist");
+  });
+});

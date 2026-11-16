@@ -54,6 +54,47 @@ describe("PolicyStore", () => {
     expect(reloaded.get().mode).toBe("audit");
   });
 
+  it("setAllow replaces the list, canonicalizes, deduplicates and persists", async () => {
+    const store = await PolicyStore.load(path);
+    await store.addAllow("old.example.org");
+    await store.setAllow(["GitHub.com.", "github.com", "*.Example.com:8443"]);
+    expect(store.get().allow).toEqual(["github.com", "*.example.com:8443"]);
+
+    const reloaded = await PolicyStore.load(path);
+    expect(reloaded.get()).toEqual({
+      mode: "ask",
+      allow: ["github.com", "*.example.com:8443"],
+    });
+  });
+
+  it("setAllow keeps the current mode", async () => {
+    const store = await PolicyStore.load(path);
+    await store.setMode("audit");
+    await store.setAllow(["github.com"]);
+    expect(store.get()).toEqual({ mode: "audit", allow: ["github.com"] });
+
+    const reloaded = await PolicyStore.load(path);
+    expect(reloaded.get().mode).toBe("audit");
+  });
+
+  it("setAllow with an invalid entry throws and changes neither memory nor disk", async () => {
+    const store = await PolicyStore.load(path);
+    await store.addAllow("github.com");
+    await expect(store.setAllow(["pypi.org", "https://x.com"])).rejects.toThrow(
+      /invalid allowlist entry/,
+    );
+    expect(store.get().allow).toEqual(["github.com"]);
+
+    const reloaded = await PolicyStore.load(path);
+    expect(reloaded.get().allow).toEqual(["github.com"]);
+  });
+
+  it("setAllow with an invalid entry on a missing file does not create it", async () => {
+    const store = await PolicyStore.load(path);
+    await expect(store.setAllow(["x.com/path"])).rejects.toThrow(/invalid allowlist entry/);
+    await expect(stat(path)).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
   it("keeps both entries when addAllow runs concurrently", async () => {
     const store = await PolicyStore.load(path);
     await Promise.all([store.addAllow("a.example.org"), store.addAllow("b.example.org")]);

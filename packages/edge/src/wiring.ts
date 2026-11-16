@@ -3,6 +3,7 @@ import type { Server } from "node:http";
 import type { Socket } from "node:net";
 import { join } from "node:path";
 import {
+  NETWORK_LOG_CAPACITY,
   type NetworkLogEntry,
   type ProviderEndpoint,
   parseNotificationsConfig,
@@ -14,14 +15,21 @@ import {
 } from "@cna/shared";
 import type { Hono } from "hono";
 import type { EdgeConfig } from "./config.js";
-import { BASE_ALLOWLIST, parseAllowlistEntry } from "./egress/allowlist.js";
+import { BASE_ALLOWLIST, formatAllowlistEntry, parseAllowlistEntry } from "./egress/allowlist.js";
 import { AskCoordinator } from "./egress/ask.js";
 import { createFileNetworkLog, type NetworkLog } from "./egress/log.js";
-import { createNetworkPolicy, type Resolver, systemResolver } from "./egress/policy.js";
+import {
+  createNetworkPolicy,
+  DEFAULT_ALLOWED_PORTS,
+  type Resolver,
+  systemResolver,
+} from "./egress/policy.js";
 import { PolicyStore } from "./egress/policy-store.js";
 import { createEgressProxy } from "./egress/proxy.js";
+import { createRecentNetworkLog } from "./egress/recent-log.js";
 import { createGatewayClient } from "./gateway-client.js";
 import { createIngressApp } from "./ingress.js";
+import { createNetworkApi, formatEndpoint } from "./network-api.js";
 
 export interface EdgeRuntime {
   ingress: Hono;
@@ -81,11 +89,14 @@ export async function createEdgeRuntime(options: WiringOptions): Promise<EdgeRun
       ),
   });
 
-  // Each entry goes to the SSE stream (fire and forget) and to network.jsonl (edge's volume).
+  // Each entry goes to the SSE stream (fire and forget), to the recent buffer served by
+  // GET /network/log, and to network.jsonl (edge's volume).
   const fileLog = createFileNetworkLog(join(config.dataDir, "network.jsonl"));
+  const recentLog = createRecentNetworkLog(NETWORK_LOG_CAPACITY);
   const log: NetworkLog = {
     append(entry: NetworkLogEntry) {
       void gateway.publishNetworkEntry(entry);
+      recentLog.append(entry);
       return fileLog.append(entry);
     },
     close() {
@@ -94,12 +105,20 @@ export async function createEdgeRuntime(options: WiringOptions): Promise<EdgeRun
   };
 
   const proxy = createEgressProxy({ policy, log, resolver, connect: options.connect });
+  const networkApi = createNetworkApi({
+    store,
+    base: BASE_ALLOWLIST.map((text) => formatAllowlistEntry(parseAllowlistEntry(text))),
+    services: [...new Set([...providers, ...services].map((e) => formatEndpoint(e.host, e.port)))],
+    allowedPorts: DEFAULT_ALLOWED_PORTS,
+    recentLog,
+  });
   const ingress = createIngressApp({
     token: config.token,
     gatewayUrl: config.gatewayUrl,
     version,
     fetch,
     networkAnswers: ask,
+    networkApi,
   });
 
   return {
