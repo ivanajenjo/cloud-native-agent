@@ -1,0 +1,62 @@
+# cna: `agent` is only on the `internal` network (no internet access); all its outbound
+# traffic goes through `edge`, the only piece also on `external` and the only one that
+# publishes a port (8080, Bearer-protected API; proxy 3128 is not published).
+# Usage:
+#   cp deploy/compose/.env.example deploy/compose/.env   # fill in AGENT_API_TOKEN
+#   docker compose -f deploy/compose/docker-compose.yml up --build -d
+name: cna
+
+services:
+  agent:
+    build:
+      context: ../..
+      dockerfile: docker/Dockerfile
+    networks:
+      - internal
+    # No `ports`: the agent is only reachable from edge.
+    volumes:
+      - agent-data:/data
+    environment:
+      GITHUB_TOKEN: ${GITHUB_TOKEN:-}
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      CNA_GIT_USER_NAME: ${CNA_GIT_USER_NAME:-}
+      CNA_GIT_USER_EMAIL: ${CNA_GIT_USER_EMAIL:-}
+    security_opt:
+      - "no-new-privileges:true"
+    cap_drop:
+      - ALL
+    restart: unless-stopped
+    init: true
+
+  edge:
+    build:
+      context: ../..
+      dockerfile: docker/Dockerfile.edge
+    networks:
+      - internal
+      - external
+    ports:
+      - "${CNA_PUBLISH_ADDR:-127.0.0.1}:8080:8080"
+    environment:
+      AGENT_API_TOKEN: ${AGENT_API_TOKEN:?set AGENT_API_TOKEN}
+    volumes:
+      - edge-data:/edge-data
+    depends_on:
+      - agent
+    security_opt:
+      - "no-new-privileges:true"
+    cap_drop:
+      - ALL
+    restart: unless-stopped
+    init: true
+
+networks:
+  # No gateway to the outside.
+  internal:
+    internal: true
+  external: {}
+
+volumes:
+  agent-data: {}
+  edge-data: {}
