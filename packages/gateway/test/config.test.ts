@@ -14,6 +14,7 @@ describe("loadGatewayConfig", () => {
     expect(config.webFile).toBe("/config/web.yaml");
     expect(config.extensionsDir.endsWith("/packages/extensions")).toBe(true);
     expect(existsSync(join(config.extensionsDir, "src", "ask-user.ts"))).toBe(true);
+    expect(config.webUiDir.endsWith("/packages/web/dist")).toBe(true);
   });
 
   it("reads the values of the variables", () => {
@@ -24,6 +25,7 @@ describe("loadGatewayConfig", () => {
       CNA_NOTIFICATIONS_FILE: "/etc/cna/notifications.yaml",
       CNA_WEB_FILE: "/etc/cna/web.yaml",
       CNA_EXTENSIONS_DIR: "/opt/cna/extensions",
+      CNA_WEB_UI_DIR: "/opt/cna/web",
       CNA_GIT_USER_NAME: "Agent",
       CNA_GIT_USER_EMAIL: "agent@example.invalid",
     });
@@ -35,6 +37,7 @@ describe("loadGatewayConfig", () => {
       notificationsFile: "/etc/cna/notifications.yaml",
       webFile: "/etc/cna/web.yaml",
       extensionsDir: "/opt/cna/extensions",
+      webUiDir: "/opt/cna/web",
       gitUserName: "Agent",
       gitUserEmail: "agent@example.invalid",
     });
@@ -52,6 +55,9 @@ describe("loadGatewayConfig", () => {
     }
     expect(() => loadGatewayConfig({ CNA_EXTENSIONS_DIR: "rel-ext-value" })).toThrow(
       "CNA_EXTENSIONS_DIR must be an absolute path",
+    );
+    expect(() => loadGatewayConfig({ CNA_WEB_UI_DIR: "rel-web-value" })).toThrow(
+      "CNA_WEB_UI_DIR must be an absolute path",
     );
   });
 
@@ -104,6 +110,7 @@ describe("gatewayPaths", () => {
       notificationsFile: "/config/notifications.yaml",
       webFile: "/config/web.yaml",
       extensionsDir: "/app/packages/extensions",
+      webUiDir: "/app/packages/web/dist",
     };
 
     expect(gatewayPaths(config)).toStrictEqual({

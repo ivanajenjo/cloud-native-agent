@@ -88,6 +88,7 @@ function configFor(overrides: Partial<GatewayConfig> = {}): GatewayConfig {
     notificationsFile: join(root, "notifications.yaml"),
     webFile: join(root, "web.yaml"),
     extensionsDir: loadGatewayConfig({}).extensionsDir,
+    webUiDir: join(root, "web-ui"),
     gitUserName: "Agent",
     gitUserEmail: "agent@example.invalid",
     ...overrides,

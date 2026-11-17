@@ -122,6 +122,7 @@ export async function createGatewayRuntime(options: GatewayWiringOptions): Promi
     session: manager,
     events,
     models: () => listModels(providers),
+    webUiDir: config.webUiDir,
   });
 
   return {
