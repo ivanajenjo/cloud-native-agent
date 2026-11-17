@@ -223,7 +223,7 @@ providers:
 | 4 | **Checkpoints y deshacer** | 2 | El gateway crea un snapshot git al terminar cada ejecución con cambios. Restaura ficheros y, opcionalmente, la conversación (`fork` de Pi). |
 | 5 | **Notificaciones push** | 2 | El gateway avisa cuando la sesión pasa a `waiting_input`, termina o falla. Proveedor configurable: **ntfy** (autoalojable) o Telegram. `config/notifications.yaml`; el host entra en la allowlist automáticamente. |
 | 6 | **Instrucciones del proyecto** | 1 | Pi carga el `AGENTS.md`/`CLAUDE.md` del repo. Añadimos un `AGENTS.md` global en el directorio de configuración de Pi. |
-| 7 | **Trabajar sobre un PR existente** | 4 | `POST /session` con `pr: <número>`: checkout de la rama del PR; el agente lee los comentarios de revisión con `gh` y los atiende; push a la misma rama. |
+| 7 | **Trabajar sobre un PR existente** | 4 | `POST /session` con `pr: <número>`: checkout de la rama del PR; el agente lee los comentarios de revisión con `gh` y los atiende; push a la misma rama. Solo PRs abiertos del propio agente (rama `agent/*`, ADR-0011). |
 | 8 | **Procesos en segundo plano** | Backlog | Tool `bash_bg` (`start`, `logs`, `stop`, `list`). Limitado a 1–2 procesos por la RAM de la Pi. |
 | 9 | **Tokens y coste por sesión** | 4 | `get_session_stats` de Pi expuesto en `GET /session/stats`. |
 | 10 | **Historial de sesiones** | 4 | Listar y retomar sesiones pasadas de la réplica. |
@@ -404,6 +404,8 @@ el build de Vite servido por un backend falso, no dentro del contenedor.
   checkpoints, panel de conexiones de red, botón de abortar.
 
 ### Fase 4 — Persistencia y robustez
+Hecha (ADR-0011), salvo la comprobación con las imágenes construidas (límites de recursos del
+compose) y el trabajo sobre PR contra GitHub real (probado con un `gh` falso).
 - Reanudar sesión tras reinicio del contenedor (JSONL de Pi + estado en disco).
 - Timeouts de inactividad, límites de recursos, limpieza de workspace.
 - Trabajar sobre un PR existente (7), tokens y coste por sesión (9), historial de sesiones (10).

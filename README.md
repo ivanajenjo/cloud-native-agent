@@ -6,11 +6,12 @@ Docker en una Raspberry Pi 4, un MacBook o un PC con Windows, clona repos de Git
 trabaja en ellos (Java, Node, Python, Go), ejecuta tests y sube los cambios a una rama.
 Uso personal, mono-usuario.
 
-> **Estado:** fase 3 (CLI y web UI): sobre el MVP conversacional de la fase 1 (sesiones con
-> Pi, preguntas al usuario, rama `agent/<slug>`, red saliente en modo `ask`) y la fase 2 (pull
-> requests, lista de tareas, modo plan, diff y checkpoints, búsqueda web, notificaciones push,
-> API de red) añade una web UI servida en `/ui/` y el CLI `cna`. Quedan pendientes las
-> comprobaciones que necesitan Docker con red normal (tareas 1 y 2 de la fase 1.5).
+> **Estado:** fase 4 (persistencia y robustez): sobre el MVP conversacional (fase 1), los PR y
+> funcionalidades de la fase 2 y la web UI y el CLI de la fase 3, la sesión sobrevive a un
+> reinicio del contenedor, Pi se para tras un rato sin uso, hay historial de sesiones con
+> reanudación, tokens y coste por sesión, trabajo sobre un PR existente del agente y límites de
+> recursos. Quedan pendientes las comprobaciones que necesitan Docker con red normal (tareas 1 y
+> 2 de la fase 1.5). La fase 5 (Kubernetes) es la siguiente.
 > Ver [`docs/PLAN.md`](docs/PLAN.md#fases).
 
 ## Cómo funciona
@@ -100,6 +101,8 @@ docker compose -f deploy/compose/docker-compose.yml down              # parar (c
 | `NTFY_TOKEN`, `TELEGRAM_BOT_TOKEN` | según `notifications.yaml` | Tokens de las notificaciones push, referenciados como `$VARIABLE`. |
 | `BRAVE_API_KEY`, `TAVILY_API_KEY` | según `web.yaml` | API key de la búsqueda web, referenciada como `$VARIABLE`. |
 | `SEARXNG_SECRET` | con el profile `search` | Secreto del SearXNG del compose (`openssl rand -hex 32`). |
+| `CNA_IDLE_TIMEOUT_MIN` | no | Minutos sin uso (sesión en `ready`) antes de parar Pi para liberar memoria; vuelve a arrancar con la siguiente petición. 30 por defecto, 0 lo desactiva. |
+| `CNA_AGENT_MEM_LIMIT`, `CNA_AGENT_CPUS`, `CNA_AGENT_PIDS_LIMIT` | no | Límites del contenedor `agent` (por defecto `6g`, `4` y `2048`). |
 
 Los modelos se configuran en `config/providers.yaml` (copia de
 [`config/providers.example.yaml`](config/providers.example.yaml)), montado en solo lectura
@@ -143,12 +146,16 @@ npm install && npm run build
 export CNA_URL=http://localhost:8080 CNA_TOKEN=<AGENT_API_TOKEN>
 
 npx cna run owner/repo "Arregla el test que falla en CI" [--plan] [--base main] [--model proveedor/modelo]
+npx cna run owner/repo --pr 12 ["más instrucciones"]   # atiende la revisión de un PR del agente
 npx cna chat          # chat interactivo con la sesión actual; responde las preguntas en el terminal
 npx cna status        # estado de la sesión
 npx cna diff [--stat] [--checkpoint N]
 npx cna todos
 npx cna abort
 npx cna close [--force]
+npx cna stats         # tokens, coste y uso del contexto
+npx cna history       # sesiones de la réplica
+npx cna resume <id>   # reanuda una sesión cerrada (vale el prefijo que muestra history)
 ```
 
 `npm link -w @cna/cli` instala el comando `cna` de forma global. El token solo se lee de
@@ -210,7 +217,24 @@ curl -s -H "$AUTH" $API/network/policy                # modo, allowlist y servic
 curl -s -H "$AUTH" "$API/network/log?limit=50"        # últimas conexiones salientes
 curl -s -H "$AUTH" -H 'content-type: application/json' -X PUT $API/network/policy \
   -d '{"mode":"ask","allow":["*.example.com"]}'
+
+curl -s -H "$AUTH" $API/session/stats                 # tokens, coste y contexto
+curl -s -H "$AUTH" $API/session/history               # sesiones de la réplica
+curl -s -H "$AUTH" -H 'content-type: application/json' -X POST \
+  $API/session/history/<id>/resume -d '{"prompt":"sigue"}'   # reanudar una sesión cerrada
+
+# Trabajar sobre un PR abierto del agente (rama agent/*): lee la revisión con gh y sube a la misma rama
+curl -s -H "$AUTH" -H 'content-type: application/json' -X POST $API/session \
+  -d '{"repo":"owner/repo","pr":12}'
 ```
+
+**Reinicios y memoria (ADR-0011).** El gateway guarda la sesión en `/data/state`. Si el
+contenedor se reinicia, la sesión vuelve en `ready` con su conversación; lo que estaba
+ejecutándose y las preguntas pendientes se pierden (sale un aviso). Con la sesión parada más de
+`CNA_IDLE_TIMEOUT_MIN` minutos, Pi se detiene para liberar memoria (`suspended: true`) y vuelve
+a arrancar, con la misma conversación, en cuanto se le pide algo. El historial guarda las últimas
+50 sesiones; una sesión cerrada se puede reanudar mientras siga en él: se clona de nuevo el repo
+en su rama (sin sus checkpoints anteriores).
 
 El agente abre el pull request con `create_pr` (pide confirmación salvo `autoPush: true`) y
 la extensión `guard` bloquea en `bash` comandos como `git push`, `--force`, `sudo`, `docker` o
