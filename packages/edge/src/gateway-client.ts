@@ -7,6 +7,7 @@ import {
   type QuestionOutcome,
   type ResolveQuestionRequest,
 } from "@cna/shared";
+import type { ReplicaTarget } from "./replicas.js";
 
 export interface GatewayClient {
   /** POST /internal/questions {question}. true only on 201. Any other status, network error or timeout → false. Never throws. */
@@ -74,6 +75,55 @@ export function createGatewayClient(options: GatewayClientOptions): GatewayClien
       } catch {
         // Swallowed by contract: the log line is only shown live.
       }
+    },
+  };
+}
+
+/** The gateways of every replica, addressed by replica name (ADR-0012). */
+export interface ReplicaGateways {
+  /** false for an unknown replica (nothing is sent), and in every case GatewayClient.publishQuestion returns false. Never throws. */
+  publishQuestion(replica: string, question: Question): Promise<boolean>;
+  /** Unknown replica → no-op. Never throws. */
+  resolveQuestion(replica: string, id: string, outcome: QuestionOutcome): Promise<void>;
+  /** Unknown replica → no-op. Never throws. */
+  publishNetworkEntry(replica: string, entry: NetworkLogEntry): Promise<void>;
+}
+
+export interface ReplicaGatewaysOptions {
+  replicas: readonly ReplicaTarget[];
+  /** Passed to every GatewayClient. */
+  fetch?: typeof globalThis.fetch;
+  timeoutMs?: number;
+}
+
+/** One GatewayClient per replica (createGatewayClient with its gatewayUrl). */
+export function createReplicaGateways(options: ReplicaGatewaysOptions): ReplicaGateways {
+  // A Map, not an object literal: a name such as "__proto__" must not reach a prototype.
+  const clients = new Map<string, GatewayClient>();
+  for (const replica of options.replicas) {
+    clients.set(
+      replica.name,
+      createGatewayClient({
+        gatewayUrl: replica.gatewayUrl,
+        fetch: options.fetch,
+        timeoutMs: options.timeoutMs,
+      }),
+    );
+  }
+
+  return {
+    async publishQuestion(replica, question) {
+      const client = clients.get(replica);
+      if (client === undefined) return false;
+      return client.publishQuestion(question);
+    },
+
+    async resolveQuestion(replica, id, outcome) {
+      await clients.get(replica)?.resolveQuestion(id, outcome);
+    },
+
+    async publishNetworkEntry(replica, entry) {
+      await clients.get(replica)?.publishNetworkEntry(entry);
     },
   };
 }

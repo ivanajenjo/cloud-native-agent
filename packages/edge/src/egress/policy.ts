@@ -16,6 +16,8 @@ export interface PolicyInput {
   port: number;
   /** All resolved addresses of host (or [host] if it is an IP literal). */
   addresses: string[];
+  /** Replica that opened the connection (ADR-0012). */
+  replica: string;
 }
 
 export interface PolicyResult {
@@ -103,7 +105,7 @@ export function createNetworkPolicy(options: NetworkPolicyOptions): Policy {
   const allow = (reason: NetworkDecisionReason): PolicyResult => ({ decision: "allow", reason });
   const deny = (reason: NetworkDecisionReason): PolicyResult => ({ decision: "deny", reason });
 
-  return async ({ host: rawHost, port, addresses }) => {
+  return async ({ host: rawHost, port, addresses, replica }) => {
     const host = normalizeHost(rawHost);
     const { mode } = options.store.get();
 
@@ -126,7 +128,7 @@ export function createNetworkPolicy(options: NetworkPolicyOptions): Policy {
     if (!allowedPorts.has(port)) return deny("port_not_allowed");
     if (mode === "allowlist") return deny("not_allowed");
 
-    switch (await options.ask.ask(host, port)) {
+    switch (await options.ask.ask(host, port, replica)) {
       case "allow_once":
         return allow("user_once");
       case "allow_always":
