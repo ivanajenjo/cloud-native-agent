@@ -21,6 +21,7 @@ import {
 import { resolvePiCli } from "./pi/launch.js";
 import { createRedactor, secretsFromEnv } from "./redact.js";
 import { RpcBridge, type RpcBridgeHandlers } from "./rpc/bridge.js";
+import { HistoryStore } from "./session/history.js";
 import { type PiProcess, SessionManager, type SessionManagerOptions } from "./session/manager.js";
 import { SessionStateStore } from "./session/persistence.js";
 import { createGitRunner } from "./workspace/git.js";
@@ -92,11 +93,19 @@ export async function createGatewayRuntime(options: GatewayWiringOptions): Promi
     file: paths.stateFile,
     logError: (message) => console.error(message),
   });
+  // Feature 10 (ADR-0011 §6): the history of the sessions of this replica, loaded before any restore.
+  const history = new HistoryStore({
+    file: paths.historyFile,
+    sessionDir: paths.sessionDir,
+    logError: (message) => console.error(message),
+  });
+  await history.load();
   const manager = new SessionManager({
     events,
     redactor,
     git,
     stateStore,
+    history,
     startPi:
       options.startPi ??
       ((spec, handlers: RpcBridgeHandlers): PiProcess => RpcBridge.start(spec, handlers)),

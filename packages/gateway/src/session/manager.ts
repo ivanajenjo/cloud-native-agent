@@ -8,6 +8,7 @@ import {
   type CreateSessionRequest,
   type DiffResponse,
   type DiffSource,
+  type HistoryEntry,
   NETWORK_QUESTION_ID_PREFIX,
   type NetworkLogEntry,
   type PiMessage,
@@ -17,6 +18,7 @@ import {
   type Question,
   type QuestionOutcome,
   type RestoreCheckpointResponse,
+  type ResumeSessionRequest,
   type SessionEvent,
   type SessionInfo,
   type SessionStats,
@@ -44,6 +46,7 @@ import {
 import {
   GitError,
   type GitRunner,
+  prepareResumeWorkspace,
   prepareWorkspace,
   slugify,
   workspaceState,
@@ -56,6 +59,7 @@ import {
   saveCheckpointRef,
   snapshotWorkingTree,
 } from "../workspace/snapshot.js";
+import type { HistoryRecord, HistoryStore } from "./history.js";
 import { normalizeRpcEvent, uiRequestToNotify, uiRequestToQuestion } from "./normalize.js";
 import { PendingQuestions } from "./pending-questions.js";
 import type { PersistedSession, SessionStateStore } from "./persistence.js";
@@ -114,10 +118,17 @@ export interface SessionManagerOptions {
   now?: () => Date;
   /** Default randomUUID. */
   newId?: () => string;
+  /**
+   * Sessions of this replica (feature 10, ADR-0011 §6). Absent: nothing is recorded and nothing can be
+   * resumed.
+   */
+  history?: HistoryStore;
 }
 
 /** Timeout of `abort`: Pi answers only once the session is idle again. */
 const ABORT_TIMEOUT_MS = 60_000;
+/** Timeout of the last stats read before a close: best effort, the close does not wait long for it. */
+const CLOSE_STATS_TIMEOUT_MS = 5_000;
 /** Max length of a stderr line of Pi that reaches the logger. */
 const MAX_LOGGED_LINE_LENGTH = 500;
 const PROMPT_DISPOSITIONS: readonly PromptDisposition[] = ["started", "queued", "handled"];
@@ -127,6 +138,13 @@ const MAX_NOTIFICATION_MESSAGE_LENGTH = 300;
 /** Warning sent after a restart that lost a run or pending questions (ADR-0011 §3). */
 const LOST_RUN_MESSAGE =
   "La ejecución en curso o las preguntas pendientes se perdieron al reiniciar el gateway; vuelve a pedírselo al agente.";
+
+/** Where a resumed session is cloned from (its history record). */
+interface ResumeSource {
+  repo: string;
+  baseBranch: string;
+  branch: string;
+}
 
 /** A checkpoint plus what restoring its conversation needs (ADR-0007, point 3). */
 interface CheckpointRecord {
@@ -192,8 +210,17 @@ export class SessionManager implements SessionService {
   /** Timer of the idle suspension, if armed (ADR-0011 §5). */
   private idleTimer: ReturnType<typeof setTimeout> | undefined;
   private readonly idleTimeoutMs: number;
+  /** Last history entry written by recordHistory(), as JSON: unchanged entries are not written again. */
+  private lastHistoryKey: string | undefined;
   /** Set by shutdown(): no Pi may start any more. */
   private shuttingDown = false;
+  /**
+   * Last token usage and cost read from Pi (ADR-0011 §8), kept in the history. Null until read. Reset by
+   * create() and close(); resume() starts with the stats of the history.
+   */
+  private lastStats: SessionStats | null = null;
+  /** State and history writes not finished yet. shutdown() waits for them, so a stop never races the files. */
+  private readonly pendingWrites = new Set<Promise<void>>();
 
   constructor(options: SessionManagerOptions) {
     this.options = options;
@@ -212,11 +239,15 @@ export class SessionManager implements SessionService {
   async shutdown(): Promise<void> {
     this.shuttingDown = true;
     this.clearIdleTimer();
+    // A run checkpoint may still be writing in the workspace's .git: let it finish first.
+    await this.checkpointQueue;
     const pi = this.pi;
     this.pi = null;
     if (pi !== null) {
       await this.stopPiQuietly(pi);
     }
+    // State and history writes are fire-and-forget during the session: they are waited for here.
+    await Promise.all([...this.pendingWrites]);
   }
 
   /**
@@ -244,6 +275,8 @@ export class SessionManager implements SessionService {
       }
 
       this.adoptState(state);
+      // The stats of the last run survive the restart: the next record must not overwrite them with null.
+      this.lastStats = this.options.history?.get(state.info.id)?.stats ?? null;
       const info = this.info;
       if (info === null) {
         return;
@@ -316,6 +349,14 @@ export class SessionManager implements SessionService {
     this.emit({ type: "status", status: "ready" });
     this.armIdleTimer();
 
+    await this.sendHistory(pi);
+    if (lostRun) {
+      this.emit({ type: "notify", level: "warning", message: LOST_RUN_MESSAGE });
+    }
+  }
+
+  /** Sends the conversation of Pi as a `history` event (replay of a session that is reopened). Never throws. */
+  private async sendHistory(pi: PiProcess): Promise<void> {
     let messages: PiMessage[] = [];
     try {
       const data = await pi.send({ type: "get_messages" });
@@ -323,13 +364,10 @@ export class SessionManager implements SessionService {
       messages = Array.isArray(list) ? (list as PiMessage[]) : [];
     } catch (error) {
       this.logger.error(
-        `session restore: get_messages: ${this.redactor.redactString(errorMessage(error))}`,
+        `history: get_messages: ${this.redactor.redactString(errorMessage(error))}`,
       );
     }
     this.emit({ type: "history", messages });
-    if (lostRun) {
-      this.emit({ type: "notify", level: "warning", message: LOST_RUN_MESSAGE });
-    }
   }
 
   /**
@@ -337,6 +375,7 @@ export class SessionManager implements SessionService {
    * never waits: a failed write is logged. Nothing is written once the session is closed.
    */
   private persist(): void {
+    this.recordHistory();
     const store = this.options.stateStore;
     const info = this.info;
     if (store === undefined || info === null || info.status === "closed") {
@@ -356,9 +395,18 @@ export class SessionManager implements SessionService {
       })),
       baselineTree: this.baselineTree,
     };
-    void store.save(state).catch((error: unknown) => {
-      this.logger.error(`session state: ${this.redactor.redactString(errorMessage(error))}`);
-    });
+    this.trackWrite(
+      store.save(state).catch((error: unknown) => {
+        this.logger.error(`session state: ${this.redactor.redactString(errorMessage(error))}`);
+      }),
+    );
+  }
+
+  /** Keeps a never-rejecting write until it ends, so shutdown() can wait for it. */
+  private trackWrite(write: Promise<void>): Promise<void> {
+    this.pendingWrites.add(write);
+    void write.finally(() => this.pendingWrites.delete(write));
+    return write;
   }
 
   /** Removes the saved state. A failure is logged and does not reject. */
@@ -379,29 +427,8 @@ export class SessionManager implements SessionService {
     if (request.pr !== undefined || request.prompt === undefined) {
       throw new SessionError("invalid_request", "pr is not supported yet");
     }
-    const previous = this.info;
-    if (
-      previous !== null &&
-      (this.closing || (previous.status !== "error" && previous.status !== "closed"))
-    ) {
-      throw new SessionError("session_exists");
-    }
-
-    this.clearIdleTimer();
-    // A previous session in error is discarded. Its Pi, if still alive, stops before the new clone.
-    let stopping: Promise<void> | undefined;
-    if (previous !== null) {
-      const previousPi = this.pi;
-      this.pi = null;
-      stopping = previousPi !== null ? this.stopPiQuietly(previousPi) : undefined;
-      this.questions.discardAll();
-    }
-    // A new session starts with an empty replay buffer, also after a close (ids keep growing).
-    this.events.clear();
-    this.todoList = [];
-    this.checkpointList = [];
-    this.baselineTree = null;
-    this.checkpointQueue = Promise.resolve();
+    this.assertNoActiveSession();
+    const stopping = this.resetSessionState();
 
     const info: SessionInfo = {
       id: this.newId(),
@@ -432,6 +459,75 @@ export class SessionManager implements SessionService {
     // start() catches its own failures; this is only a last safety net.
     void job.catch((error: unknown) => {
       this.logger.error(`session ${sessionId}: ${this.redactor.redactString(errorMessage(error))}`);
+    });
+
+    return this.snapshot(info);
+  }
+
+  /** Sessions of this replica, newest first (ADR-0011 §6). Empty without a history. */
+  async history(): Promise<HistoryEntry[]> {
+    const history = this.options.history;
+    return history === undefined ? [] : history.list();
+  }
+
+  /**
+   * Resumes a closed session of the history (ADR-0011 §7): the repo is cloned again on the session's
+   * branch and Pi reopens the conversation with the same id. Returns at once; the rest runs in the
+   * background, like create().
+   */
+  async resume(id: string, request: ResumeSessionRequest): Promise<SessionInfo> {
+    this.assertNoActiveSession();
+    const history = this.options.history;
+    const record = history?.get(id);
+    if (history === undefined || record === undefined) {
+      throw new SessionError("history_not_found");
+    }
+    if (record.closedAt === null || record.branch === null || record.baseBranch === null) {
+      throw new SessionError("invalid_state", "this session cannot be resumed");
+    }
+    if (!(await history.hasPiSession(id))) {
+      throw new SessionError(
+        "invalid_state",
+        "the conversation of this session is no longer on disk",
+      );
+    }
+    // Checked again: the await above lets another request create a session.
+    this.assertNoActiveSession();
+    const stopping = this.resetSessionState();
+
+    const info: SessionInfo = {
+      id: record.id,
+      status: "cloning",
+      repo: record.repo,
+      baseBranch: record.baseBranch,
+      branch: record.branch,
+      model: record.model,
+      thinking: null,
+      mode: record.mode,
+      autoPush: false,
+      createdAt: record.createdAt,
+      pr: record.pr,
+      suspended: false,
+      pendingQuestions: [],
+    };
+    this.info = info;
+    this.settled = true;
+    this.lastStats = record.stats;
+    this.persist();
+    this.emit({ type: "status", status: "cloning" });
+
+    const source: ResumeSource = {
+      repo: record.repo,
+      baseBranch: record.baseBranch,
+      branch: record.branch,
+    };
+    const job = this.workspaceQueue.then(async () => {
+      await stopping;
+      await this.cloneAndReopen(record.id, source, request);
+    });
+    this.workspaceQueue = job.catch(() => undefined);
+    void job.catch((error: unknown) => {
+      this.logger.error(`session ${record.id}: ${this.redactor.redactString(errorMessage(error))}`);
     });
 
     return this.snapshot(info);
@@ -747,9 +843,16 @@ export class SessionManager implements SessionService {
         await this.checkWorkspaceState(info);
       }
       this.clearIdleTimer();
+      // A run checkpoint may still be snapshotting the workspace that is about to be deleted.
+      await this.checkpointQueue;
       const pi = this.pi;
       this.pi = null;
       if (pi !== null) {
+        // Best effort: the last stats of the conversation go to the history before Pi stops.
+        const stats = await this.readStats(pi, CLOSE_STATS_TIMEOUT_MS);
+        if (stats !== null) {
+          this.lastStats = stats;
+        }
         await this.stopPiQuietly(pi);
       }
       this.questions.resolveAll("cancelled");
@@ -760,6 +863,9 @@ export class SessionManager implements SessionService {
       this.checkpointList = [];
       this.baselineTree = null;
       this.checkpointQueue = Promise.resolve();
+      await this.upsertHistory(
+        this.historyRecordOf(info, { closedAt: this.now().toISOString(), status: "closed" }),
+      );
     } finally {
       this.closing = false;
     }
@@ -872,11 +978,15 @@ export class SessionManager implements SessionService {
     }
   }
 
-  /** Queues the checkpoint of the run that just settled, after the jobs already queued. Never rejects. */
+  /**
+   * Queues the checkpoint of the run that just settled, after the jobs already queued, and then reads the
+   * stats of the conversation. Never rejects.
+   */
   private enqueueRunCheckpoint(sessionId: string): void {
     this.checkpointJobs++;
     const job = this.checkpointQueue
       .then(() => this.createRunCheckpoint(sessionId))
+      .then(() => this.rememberStats(sessionId))
       .finally(() => {
         this.checkpointJobs--;
       });
@@ -1002,6 +1112,173 @@ export class SessionManager implements SessionService {
         this.suspension = undefined;
       }
     }
+  }
+
+  /** Throws session_exists while a session is active: create() and resume() need the replica free. */
+  private assertNoActiveSession(): void {
+    const previous = this.info;
+    if (
+      previous !== null &&
+      (this.closing || (previous.status !== "error" && previous.status !== "closed"))
+    ) {
+      throw new SessionError("session_exists");
+    }
+  }
+
+  /**
+   * Clears the in-memory state before a new session (create or resume) and returns the stop of the
+   * previous Pi, if any. A new session starts with an empty replay buffer, also after a close (ids keep
+   * growing).
+   */
+  private resetSessionState(): Promise<void> | undefined {
+    const hadPrevious = this.info !== null;
+    this.clearIdleTimer();
+    // A previous session in error is discarded. Its Pi, if still alive, stops before the new clone.
+    let stopping: Promise<void> | undefined;
+    if (hadPrevious) {
+      const previousPi = this.pi;
+      this.pi = null;
+      stopping = previousPi !== null ? this.stopPiQuietly(previousPi) : undefined;
+      this.questions.discardAll();
+    }
+    this.events.clear();
+    this.todoList = [];
+    this.checkpointList = [];
+    this.baselineTree = null;
+    this.checkpointQueue = Promise.resolve();
+    this.lastStats = null;
+    return stopping;
+  }
+
+  /**
+   * Re-clones the branch of a resumed session, reopens Pi with the same id (ADR-0011 §7) and sends the
+   * optional prompt. Failures end in status `error`; this never throws.
+   */
+  private async cloneAndReopen(
+    sessionId: string,
+    source: ResumeSource,
+    request: ResumeSessionRequest,
+  ): Promise<void> {
+    if (!this.isCurrent(sessionId)) {
+      return;
+    }
+    try {
+      await rm(this.options.workspaceDir, { recursive: true, force: true });
+      await prepareResumeWorkspace({
+        git: this.options.git,
+        repo: source.repo,
+        dir: this.options.workspaceDir,
+        branch: source.branch,
+        baseBranch: source.baseBranch,
+        userName: this.options.gitIdentity?.name,
+        userEmail: this.options.gitIdentity?.email,
+        remoteBase: this.options.remoteBase,
+      });
+
+      if (this.current(sessionId) === null) {
+        // Closed while cloning: Pi must not start.
+        await this.removeWorkspaceQuietly();
+        return;
+      }
+      await this.createStartCheckpoint(sessionId);
+      if (this.current(sessionId) === null) {
+        // Closed while taking the first checkpoint: Pi must not start.
+        await this.removeWorkspaceQuietly();
+        return;
+      }
+
+      const pi = this.launchPi(sessionId);
+      this.pi = pi;
+      this.settled = true;
+      this.setStatus("ready");
+      await this.sendHistory(pi);
+
+      if (request.prompt !== undefined && this.isCurrent(sessionId)) {
+        const data = await pi.send({ type: "prompt", message: request.prompt });
+        if (this.isCurrent(sessionId) && dispositionOf(data) === "started") {
+          this.settled = false;
+          this.refreshStatus();
+        }
+      }
+    } catch (error) {
+      await this.failStart(sessionId, error);
+    }
+  }
+
+  /**
+   * Keeps the last stats of Pi (ADR-0011 §8) and writes them to the history. Only if Pi is running: a
+   * suspended session is not started for this. Never throws.
+   */
+  private async rememberStats(sessionId: string): Promise<void> {
+    const pi = this.pi;
+    if (!this.isCurrent(sessionId) || pi === null) {
+      return;
+    }
+    const stats = await this.readStats(pi);
+    if (stats === null || !this.isCurrent(sessionId)) {
+      return;
+    }
+    this.lastStats = stats;
+    this.recordHistory();
+  }
+
+  /** Token usage and cost from Pi, or null if it did not answer with stats. Errors are logged; never throws. */
+  private async readStats(pi: PiProcess, timeoutMs?: number): Promise<SessionStats | null> {
+    try {
+      const data = await pi.send({ type: "get_session_stats" }, { timeoutMs });
+      return parseSessionStats(data);
+    } catch (error) {
+      this.logger.error(`stats: ${this.redactor.redactString(errorMessage(error))}`);
+      return null;
+    }
+  }
+
+  /** Writes the session to the history as it is now (not closed). Nothing for a closed or missing session. */
+  private recordHistory(): void {
+    const info = this.info;
+    if (this.options.history === undefined || info === null || info.status === "closed") {
+      return;
+    }
+    const record = this.historyRecordOf(info, { closedAt: null, status: info.status });
+    // persist() runs on every change (todos, checkpoints...); the history file only when its entry changes.
+    const key = JSON.stringify(record);
+    if (key === this.lastHistoryKey) {
+      return;
+    }
+    this.lastHistoryKey = key;
+    void this.upsertHistory(record);
+  }
+
+  /** The history record of `info` with the given close state and the last stats. */
+  private historyRecordOf(
+    info: SessionInfo,
+    state: Pick<HistoryRecord, "closedAt" | "status">,
+  ): HistoryRecord {
+    return {
+      id: info.id,
+      repo: info.repo,
+      baseBranch: info.baseBranch,
+      branch: info.branch,
+      pr: info.pr,
+      mode: info.mode,
+      model: info.model,
+      createdAt: info.createdAt,
+      closedAt: state.closedAt,
+      status: state.status,
+      stats: this.lastStats,
+    };
+  }
+
+  /** Upserts a record of the history. Never rejects: a failure is logged (redacted). */
+  private upsertHistory(record: HistoryRecord): Promise<void> {
+    const history = this.options.history;
+    if (history === undefined) {
+      return Promise.resolve();
+    }
+    const write = history.upsert(record).catch((error: unknown) => {
+      this.logger.error(`history: ${this.redactor.redactString(errorMessage(error))}`);
+    });
+    return this.trackWrite(write);
   }
 
   /** Creates a checkpoint if the working tree changed since the last one. Errors are logged. */

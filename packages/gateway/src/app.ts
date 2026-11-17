@@ -7,6 +7,7 @@ import {
   CreateSessionRequestSchema,
   type DiffResponse,
   type HealthResponse,
+  type HistoryResponse,
   type MessagesResponse,
   type ModelsResponse,
   type PostMessageRequest,
@@ -20,6 +21,8 @@ import {
   ResolveQuestionRequestSchema,
   type RestoreCheckpointRequest,
   RestoreCheckpointRequestSchema,
+  type ResumeSessionRequest,
+  ResumeSessionRequestSchema,
   type SessionStats,
   type SetModelRequest,
   SetModelRequestSchema,
@@ -53,6 +56,7 @@ const SESSION_ERROR_STATUS: Partial<Record<ApiErrorCode, 400 | 404 | 409>> = {
   no_session: 404,
   question_not_found: 404,
   checkpoint_not_found: 404,
+  history_not_found: 404,
   session_exists: 409,
   invalid_state: 409,
   question_resolved: 409,
@@ -144,6 +148,17 @@ export function createApp(options: AppOptions): Hono {
     const request: CreateSessionRequest = await parseBody(c, CreateSessionRequestSchema);
     const info = await session.create(request);
     return c.json(info, 201);
+  });
+
+  app.get("/session/history", async (c) => {
+    const body: HistoryResponse = { sessions: await session.history() };
+    return c.json(body);
+  });
+
+  // The body is optional: an empty one means no prompt (the session waits in `ready`).
+  app.post("/session/history/:id/resume", limitBody, async (c) => {
+    const request: ResumeSessionRequest = await parseOptionalBody(c, ResumeSessionRequestSchema);
+    return c.json(await session.resume(c.req.param("id"), request), 201);
   });
 
   app.get("/session/events", (c) =>

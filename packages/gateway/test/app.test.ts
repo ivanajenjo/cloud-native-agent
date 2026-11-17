@@ -4,6 +4,7 @@ import { join } from "node:path";
 import type {
   Checkpoint,
   DiffResponse,
+  HistoryEntry,
   ModelsResponse,
   PiMessage,
   Question,
@@ -70,6 +71,22 @@ const STATS: SessionStats = {
   context: { tokens: 1200, window: 32000, percent: 3.75 },
 };
 
+/** A closed session of the history (feature 10), not the current one. */
+const HISTORY_ENTRY: HistoryEntry = {
+  id: "s0",
+  repo: "octo/demo",
+  baseBranch: "main",
+  branch: "agent/demo",
+  pr: null,
+  mode: "auto",
+  model: null,
+  createdAt: "2026-11-15T10:00:00.000Z",
+  closedAt: "2026-11-15T11:00:00.000Z",
+  status: "closed",
+  stats: STATS,
+  resumable: true,
+};
+
 const NETWORK_ENTRY = {
   ts: "2026-11-16T10:00:00.000Z",
   method: "CONNECT" as const,
@@ -87,6 +104,8 @@ function fakeSession(overrides: Partial<SessionService> = {}) {
   const service = {
     get: vi.fn(() => null),
     create: vi.fn(async () => SESSION),
+    history: vi.fn(async (): Promise<HistoryEntry[]> => [HISTORY_ENTRY]),
+    resume: vi.fn(async () => SESSION),
     postMessage: vi.fn(async () => ({ disposition: "started" as const })),
     answer: vi.fn(async () => {}),
     setModel: vi.fn(async () => {}),
@@ -806,6 +825,119 @@ describe("GET /session/diff", () => {
       error: "checkpoint_not_found",
       message: "checkpoint_not_found",
     });
+  });
+});
+
+describe("GET /session/history", () => {
+  it("answers 200 with the sessions of the service", async () => {
+    const { app, session } = build();
+
+    const res = await app.request("/session/history");
+
+    expect(res.status).toBe(200);
+    expect(await res.json()).toEqual({ sessions: [HISTORY_ENTRY] });
+    expect(session.history).toHaveBeenCalledTimes(1);
+  });
+
+  it("answers an empty list when there is no history", async () => {
+    const session = fakeSession({ history: vi.fn(async () => []) });
+    const app = createApp({ version: "1", session, events: new EventLog(), models: () => MODELS });
+
+    const res = await app.request("/session/history");
+
+    expect(res.status).toBe(200);
+    expect(await res.json()).toEqual({ sessions: [] });
+  });
+});
+
+describe("POST /session/history/:id/resume", () => {
+  it("answers 201 with the session and passes an empty request for an empty body", async () => {
+    const { app, session } = build();
+
+    const withoutBody = await app.request("/session/history/s0/resume", { method: "POST" });
+    const blankBody = await app.request("/session/history/s0/resume", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: "  ",
+    });
+
+    expect(withoutBody.status).toBe(201);
+    expect(await withoutBody.json()).toEqual(SESSION);
+    expect(blankBody.status).toBe(201);
+    expect(session.resume).toHaveBeenNthCalledWith(1, "s0", {});
+    expect(session.resume).toHaveBeenNthCalledWith(2, "s0", {});
+  });
+
+  it("passes the prompt of the body to resume()", async () => {
+    const { app, session } = build();
+
+    const res = await app.request(
+      "/session/history/s0/resume",
+      jsonRequest("POST", { prompt: "Continue with the tests" }),
+    );
+
+    expect(res.status).toBe(201);
+    expect(session.resume).toHaveBeenCalledWith("s0", { prompt: "Continue with the tests" });
+  });
+
+  it("answers 400 for a body that does not match the schema or is not JSON", async () => {
+    const { app, session } = build();
+
+    const emptyPrompt = await app.request(
+      "/session/history/s0/resume",
+      jsonRequest("POST", { prompt: "" }),
+    );
+    const wrongType = await app.request(
+      "/session/history/s0/resume",
+      jsonRequest("POST", { prompt: 1 }),
+    );
+    const extraField = await app.request(
+      "/session/history/s0/resume",
+      jsonRequest("POST", { prompt: "x", force: true }),
+    );
+    const notJson = await app.request("/session/history/s0/resume", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: "{not json",
+    });
+
+    expect(emptyPrompt.status).toBe(400);
+    expect(wrongType.status).toBe(400);
+    expect(extraField.status).toBe(400);
+    expect(notJson.status).toBe(400);
+    expect(((await notJson.json()) as { error: string }).error).toBe("invalid_request");
+    expect(session.resume).not.toHaveBeenCalled();
+  });
+
+  it("answers 404 history_not_found when the service throws it", async () => {
+    const session = fakeSession({
+      resume: vi.fn(async () => {
+        throw new SessionError("history_not_found");
+      }),
+    });
+    const app = createApp({ version: "1", session, events: new EventLog(), models: () => MODELS });
+
+    const res = await app.request("/session/history/nope/resume", { method: "POST" });
+
+    expect(res.status).toBe(404);
+    expect(await res.json()).toEqual({
+      error: "history_not_found",
+      message: "history_not_found",
+    });
+  });
+
+  it("answers 409 session_exists when another session is active", async () => {
+    const session = fakeSession({
+      resume: vi.fn(async () => {
+        throw new SessionError("session_exists");
+      }),
+    });
+    const app = createApp({ version: "1", session, events: new EventLog(), models: () => MODELS });
+
+    const res = await app.request("/session/history/s0/resume", { method: "POST" });
+
+    expect(res.status).toBe(409);
+    expect(await res.json()).toEqual({ error: "session_exists", message: "session_exists" });
   });
 });
 
