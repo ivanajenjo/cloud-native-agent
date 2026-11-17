@@ -1,5 +1,6 @@
 import { randomUUID } from "node:crypto";
-import { rm } from "node:fs/promises";
+import { access, rm } from "node:fs/promises";
+import { join } from "node:path";
 import {
   ACTIVE_SESSION_STATUSES,
   type AnswerRequest,
@@ -57,6 +58,7 @@ import {
 } from "../workspace/snapshot.js";
 import { normalizeRpcEvent, uiRequestToNotify, uiRequestToQuestion } from "./normalize.js";
 import { PendingQuestions } from "./pending-questions.js";
+import type { PersistedSession, SessionStateStore } from "./persistence.js";
 import { answerToUiResponse, outcomeOfAnswer } from "./questions.js";
 import { SessionError, type SessionService } from "./service.js";
 import { parseSessionStats } from "./stats.js";
@@ -102,6 +104,11 @@ export interface SessionManagerOptions {
    * Absent or 0: Pi is never suspended.
    */
   idleTimeoutMs?: number;
+  /**
+   * Stores the session state Pi does not keep (ADR-0011 §2) and recovers it in restore(). Absent:
+   * nothing is saved nor recovered.
+   */
+  stateStore?: SessionStateStore;
   /** Default console. Receives only redacted text. */
   logger?: { info(message: string): void; error(message: string): void };
   now?: () => Date;
@@ -117,6 +124,9 @@ const PROMPT_DISPOSITIONS: readonly PromptDisposition[] = ["started", "queued", 
 const MESSAGE_STATUSES: readonly SessionStatus[] = ["running", "waiting_input", "ready"];
 /** Max length of the message of a push notification (after redaction). */
 const MAX_NOTIFICATION_MESSAGE_LENGTH = 300;
+/** Warning sent after a restart that lost a run or pending questions (ADR-0011 §3). */
+const LOST_RUN_MESSAGE =
+  "La ejecución en curso o las preguntas pendientes se perdieron al reiniciar el gateway; vuelve a pedírselo al agente.";
 
 /** A checkpoint plus what restoring its conversation needs (ADR-0007, point 3). */
 interface CheckpointRecord {
@@ -209,6 +219,157 @@ export class SessionManager implements SessionService {
     }
   }
 
+  /**
+   * Recovers the session saved before a gateway restart (ADR-0011 §3). Called once, before the gateway
+   * serves requests. Never throws: a failure is logged, and a session that cannot go on ends in `error`.
+   */
+  async restore(): Promise<void> {
+    const store = this.options.stateStore;
+    if (store === undefined) {
+      return;
+    }
+    try {
+      const state = await store.load();
+      if (state === null) {
+        // Without saved state there is no session to resume (ADR-0011 §3).
+        await this.removeWorkspaceQuietly();
+        return;
+      }
+      const discardReason = await this.discardReasonOf(state);
+      if (discardReason !== null) {
+        await this.removeWorkspaceQuietly();
+        await this.clearStateQuietly();
+        this.logger.info(`session state discarded: ${discardReason}`);
+        return;
+      }
+
+      this.adoptState(state);
+      const info = this.info;
+      if (info === null) {
+        return;
+      }
+      if (info.status === "cloning") {
+        this.setStatus("error", "the gateway restarted while the repository was being cloned");
+      } else if (info.status === "error") {
+        // Already failed: the status goes out again so that the replay shows why.
+        this.emit(
+          info.error === undefined
+            ? { type: "status", status: "error" }
+            : { type: "status", status: "error", error: info.error },
+        );
+      } else {
+        const lostRun = state.info.status === "running" || state.info.status === "waiting_input";
+        await this.resumePi(info.id, lostRun);
+      }
+      this.persist();
+    } catch (error) {
+      this.logger.error(`session restore: ${this.redactor.redactString(errorMessage(error))}`);
+    }
+  }
+
+  /** Why a saved state must not be resumed, or null if it can be. Checks the workspace repository too. */
+  private async discardReasonOf(state: PersistedSession): Promise<string | null> {
+    if (state.info.status === "closed") {
+      return "the session was closed";
+    }
+    if (!(await pathExists(join(this.options.workspaceDir, ".git")))) {
+      return "the workspace has no repository";
+    }
+    return null;
+  }
+
+  /** Makes the saved state the in-memory session. Pi is not started here. */
+  private adoptState(state: PersistedSession): void {
+    this.info = { ...state.info, suspended: false, pendingQuestions: [] };
+    this.todoList = state.todos.map((item) => ({ ...item }));
+    this.checkpointList = state.checkpoints.map((record) => ({
+      checkpoint: { ...record.checkpoint },
+      tree: record.tree,
+      forkIndex: record.forkIndex,
+      todos: record.todos.map((item) => ({ ...item })),
+    }));
+    this.baselineTree = state.baselineTree;
+    this.settled = true;
+  }
+
+  /**
+   * Starts Pi on the restored session with the same id, so Pi reopens the conversation, and sends the
+   * conversation as `history`. A run or pending questions of the previous process are lost: `lostRun`
+   * adds a warning. Failures end in `error`; this never throws.
+   */
+  private async resumePi(sessionId: string, lostRun: boolean): Promise<void> {
+    let pi: PiProcess;
+    try {
+      pi = this.launchPi(sessionId);
+    } catch (error) {
+      this.setStatus("error", this.redactor.redactString(errorMessage(error)));
+      return;
+    }
+    this.pi = pi;
+    const info = this.current(sessionId);
+    if (info === null) {
+      return;
+    }
+    // Not setStatus: a `ready` session stays `ready`, and no push notification says "finished" for a
+    // run that was lost.
+    info.status = "ready";
+    this.emit({ type: "status", status: "ready" });
+    this.armIdleTimer();
+
+    let messages: PiMessage[] = [];
+    try {
+      const data = await pi.send({ type: "get_messages" });
+      const list: unknown = isRecord(data) ? data.messages : undefined;
+      messages = Array.isArray(list) ? (list as PiMessage[]) : [];
+    } catch (error) {
+      this.logger.error(
+        `session restore: get_messages: ${this.redactor.redactString(errorMessage(error))}`,
+      );
+    }
+    this.emit({ type: "history", messages });
+    if (lostRun) {
+      this.emit({ type: "notify", level: "warning", message: LOST_RUN_MESSAGE });
+    }
+  }
+
+  /**
+   * Writes the state Pi does not keep (ADR-0011 §2). Called after every change of it. Never throws and
+   * never waits: a failed write is logged. Nothing is written once the session is closed.
+   */
+  private persist(): void {
+    const store = this.options.stateStore;
+    const info = this.info;
+    if (store === undefined || info === null || info.status === "closed") {
+      return;
+    }
+    // Only the fields that survive a restart: questions and suspension live in memory.
+    const { pendingQuestions: _pendingQuestions, suspended: _suspended, ...saved } = info;
+    const state: PersistedSession = {
+      version: 1,
+      info: { ...saved },
+      todos: this.todoList.map((item) => ({ ...item })),
+      checkpoints: this.checkpointList.map((record) => ({
+        checkpoint: { ...record.checkpoint },
+        tree: record.tree,
+        forkIndex: record.forkIndex,
+        todos: record.todos.map((item) => ({ ...item })),
+      })),
+      baselineTree: this.baselineTree,
+    };
+    void store.save(state).catch((error: unknown) => {
+      this.logger.error(`session state: ${this.redactor.redactString(errorMessage(error))}`);
+    });
+  }
+
+  /** Removes the saved state. A failure is logged and does not reject. */
+  private async clearStateQuietly(): Promise<void> {
+    try {
+      await this.options.stateStore?.clear();
+    } catch (error) {
+      this.logger.error(`session state: ${this.redactor.redactString(errorMessage(error))}`);
+    }
+  }
+
   get(): SessionInfo | null {
     return this.info === null ? null : this.snapshot(this.info);
   }
@@ -259,6 +420,7 @@ export class SessionManager implements SessionService {
     };
     this.info = info;
     this.settled = true;
+    this.persist();
     this.emit({ type: "status", status: "cloning" });
 
     const sessionId = info.id;
@@ -383,6 +545,7 @@ export class SessionManager implements SessionService {
     if (request.thinking !== undefined) {
       info.thinking = request.thinking;
     }
+    this.persist();
   }
 
   async abort(): Promise<void> {
@@ -507,6 +670,7 @@ export class SessionManager implements SessionService {
         this.todoList = record.todos.map((item) => ({ ...item }));
         this.emit({ type: "todo", todos: this.todoList });
       }
+      this.persist();
     } catch (error) {
       if (error instanceof GitError || error instanceof RpcCommandError) {
         throw new SessionError("invalid_state", this.redactor.redactString(errorMessage(error)));
@@ -590,6 +754,7 @@ export class SessionManager implements SessionService {
       }
       this.questions.resolveAll("cancelled");
       await rm(this.options.workspaceDir, { recursive: true, force: true });
+      await this.clearStateQuietly();
       this.setStatus("closed");
       this.info = null;
       this.checkpointList = [];
@@ -656,6 +821,7 @@ export class SessionManager implements SessionService {
       }
       info.baseBranch = prepared.baseBranch;
       info.branch = prepared.branch;
+      this.persist();
 
       await this.createStartCheckpoint(sessionId);
       if (this.current(sessionId) === null) {
@@ -699,6 +865,7 @@ export class SessionManager implements SessionService {
       // The conversation is empty: the first user message is fork index 0.
       this.checkpointList.push({ checkpoint, tree, forkIndex: 0, todos: [] });
       this.baselineTree = tree;
+      this.persist();
       this.emit({ type: "checkpoint", action: "created", checkpoint: { ...checkpoint } });
     } catch (error) {
       this.logger.error(`checkpoint 0: ${this.redactor.redactString(errorMessage(error))}`);
@@ -870,9 +1037,10 @@ export class SessionManager implements SessionService {
         todos: this.todoList.map((item) => ({ ...item })),
       });
       this.baselineTree = tree;
+      this.persist();
       this.emit({ type: "checkpoint", action: "created", checkpoint: { ...checkpoint } });
     } catch (error) {
-      this.logger.error(`checkpoint: ${this.redactor.redactString(errorMessage(error))}`);
+      this.logger.error(`checkpoint:${this.redactor.redactString(errorMessage(error))}`);
     }
   }
 
@@ -1001,6 +1169,7 @@ export class SessionManager implements SessionService {
     for (const sessionEvent of normalizeRpcEvent(event)) {
       if (sessionEvent.type === "todo") {
         this.todoList = sessionEvent.todos;
+        this.persist();
       } else if (sessionEvent.type === "mode") {
         const info = this.info;
         // The plan-mode extension may report the mode it already has: no event then.
@@ -1008,6 +1177,7 @@ export class SessionManager implements SessionService {
           continue;
         }
         info.mode = sessionEvent.mode;
+        this.persist();
       }
       this.emit(sessionEvent);
     }
@@ -1098,6 +1268,7 @@ export class SessionManager implements SessionService {
     const previous = info.status;
     info.status = status;
     info.error = safeError;
+    this.persist();
     this.emit(
       safeError === undefined
         ? { type: "status", status }
@@ -1255,4 +1426,13 @@ function forkEntriesOf(data: unknown): unknown[] | null {
 
 function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
+}
+
+async function pathExists(path: string): Promise<boolean> {
+  try {
+    await access(path);
+    return true;
+  } catch {
+    return false;
+  }
 }

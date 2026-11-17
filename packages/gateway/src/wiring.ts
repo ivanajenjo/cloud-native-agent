@@ -22,6 +22,7 @@ import { resolvePiCli } from "./pi/launch.js";
 import { createRedactor, secretsFromEnv } from "./redact.js";
 import { RpcBridge, type RpcBridgeHandlers } from "./rpc/bridge.js";
 import { type PiProcess, SessionManager, type SessionManagerOptions } from "./session/manager.js";
+import { SessionStateStore } from "./session/persistence.js";
 import { createGitRunner } from "./workspace/git.js";
 
 export interface GatewayRuntime {
@@ -86,10 +87,16 @@ export async function createGatewayRuntime(options: GatewayWiringOptions): Promi
   const git = createGitRunner(childEnv);
   const toolLog = createToolLog({ filePath: paths.toolLogFile, redactor });
 
+  // ADR-0011 §2: the session state survives a restart of the gateway.
+  const stateStore = new SessionStateStore({
+    file: paths.stateFile,
+    logError: (message) => console.error(message),
+  });
   const manager = new SessionManager({
     events,
     redactor,
     git,
+    stateStore,
     startPi:
       options.startPi ??
       ((spec, handlers: RpcBridgeHandlers): PiProcess => RpcBridge.start(spec, handlers)),
@@ -118,6 +125,9 @@ export async function createGatewayRuntime(options: GatewayWiringOptions): Promi
           }),
         }),
   });
+
+  // ADR-0011 §3: resumes the session saved before the last restart, before any request arrives.
+  await manager.restore();
 
   const app = createApp({
     version,
