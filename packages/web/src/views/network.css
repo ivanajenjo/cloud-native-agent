@@ -47,6 +47,11 @@
   color: var(--muted);
 }
 
+.net-log {
+  max-width: 100%;
+  overflow-x: auto;
+}
+
 .net-table {
   width: 100%;
   border-collapse: collapse;
@@ -67,7 +72,8 @@
 }
 
 .net-table td {
-  overflow-wrap: anywhere;
+  /* .net-log scrolls horizontally: keep each cell on one line. */
+  white-space: nowrap;
 }
 
 .net-allow {
