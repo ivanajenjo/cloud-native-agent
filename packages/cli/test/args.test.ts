@@ -269,12 +269,148 @@ describe("parseCliArgs: errors", () => {
   });
 });
 
+describe("parseCliArgs: run --pr", () => {
+  it("takes the PR number and keeps the prompt optional with one positional", () => {
+    expect(commandOf(["run", "owner/repo", "--pr", "12"])).toEqual({
+      name: "run",
+      repo: "owner/repo",
+      pr: 12,
+      plan: false,
+      autoPush: false,
+      detach: false,
+    });
+  });
+
+  it("accepts a prompt together with --pr", () => {
+    expect(commandOf(["run", "owner/repo", "revisa el PR", "--pr", "12"])).toMatchObject({
+      name: "run",
+      prompt: "revisa el PR",
+      pr: 12,
+    });
+  });
+
+  it.each([["1"], ["12"], ["1000000000"]])("accepts the PR number %s", (value) => {
+    expect(commandOf(["run", "owner/repo", "--pr", value])).toMatchObject({
+      pr: Number(value),
+    });
+  });
+
+  it.each([["0"], ["1.5"], ["x"], ["1000000001"], ["+3"], [""]])(
+    "rejects the invalid PR number %j",
+    (value) => {
+      expect(usageMessage(["run", "owner/repo", "--pr", value])).toBe(
+        "--pr debe ser un número de PR",
+      );
+    },
+  );
+
+  it("rejects a negative PR number", () => {
+    expect(usageMessage(["run", "owner/repo", "--pr=-1"])).toBe("--pr debe ser un número de PR");
+  });
+
+  it("requires the prompt without --pr", () => {
+    expect(usageMessage(["run", "owner/repo"])).toContain("cna run");
+  });
+
+  it("rejects --base together with --pr", () => {
+    expect(usageMessage(["run", "owner/repo", "--pr", "12", "--base", "dev"])).toBe(
+      "con --pr la rama base es la del PR",
+    );
+  });
+
+  it("rejects too many positionals with --pr", () => {
+    expect(usageMessage(["run", "owner/repo", "uno", "dos", "--pr", "12"])).toContain("cna run");
+  });
+
+  it("rejects a blank prompt with --pr", () => {
+    expect(usageMessage(["run", "owner/repo", "  ", "--pr", "12"])).toContain("prompt");
+  });
+
+  it("rejects --pr for other commands", () => {
+    expect(usageMessage(["status", "--pr", "12"])).toContain("--pr");
+  });
+});
+
+describe("parseCliArgs: stats, history and resume", () => {
+  it("parses stats and history", () => {
+    expect(commandOf(["stats"])).toEqual({ name: "stats" });
+    expect(commandOf(["history"])).toEqual({ name: "history" });
+  });
+
+  it("rejects positionals on stats and history", () => {
+    expect(usageMessage(["stats", "extra"])).toContain("stats");
+    expect(usageMessage(["history", "extra"])).toContain("history");
+  });
+
+  it("parses resume with only the id", () => {
+    expect(commandOf(["resume", "3f2a9c1b"])).toEqual({
+      name: "resume",
+      id: "3f2a9c1b",
+      prompt: undefined,
+      detach: false,
+    });
+  });
+
+  it("parses resume with a prompt", () => {
+    expect(commandOf(["resume", "3f2a9c1b", "sigue por el test"])).toMatchObject({
+      name: "resume",
+      id: "3f2a9c1b",
+      prompt: "sigue por el test",
+      detach: false,
+    });
+  });
+
+  it("parses resume with --detach", () => {
+    expect(commandOf(["resume", "3f2a9c1b", "--detach"])).toMatchObject({
+      name: "resume",
+      detach: true,
+    });
+  });
+
+  it("accepts a full UUID as id", () => {
+    const id = "3f2a9c1b-0d4e-4f5a-8b6c-7d8e9f0a1b2c";
+    expect(commandOf(["resume", id])).toMatchObject({ id });
+  });
+
+  it.each([["ab_cd"], ["../x"], ["a b"], ["é"], ["a".repeat(129)]])(
+    "rejects the invalid session id %j",
+    (id) => {
+      expect(usageMessage(["resume", id])).toContain("id de la sesión");
+    },
+  );
+
+  it("accepts an id of 128 characters", () => {
+    expect(commandOf(["resume", "a".repeat(128)])).toMatchObject({ id: "a".repeat(128) });
+  });
+
+  it("requires the id", () => {
+    expect(usageMessage(["resume"])).toContain("cna resume");
+  });
+
+  it("rejects more than one prompt", () => {
+    expect(usageMessage(["resume", "3f2a9c1b", "uno", "dos"])).toContain("cna resume");
+  });
+
+  it("rejects a blank prompt", () => {
+    expect(usageMessage(["resume", "3f2a9c1b", "   "])).toContain("prompt");
+  });
+
+  it("rejects options that resume does not take", () => {
+    expect(usageMessage(["resume", "3f2a9c1b", "--stat"])).toContain("--stat");
+    expect(usageMessage(["stats", "--detach"])).toContain("--detach");
+  });
+});
+
 describe("USAGE", () => {
   it.each([
     ["run"],
     ["chat"],
     ["attach"],
     ["status"],
+    ["stats"],
+    ["history"],
+    ["resume"],
+    ["--pr"],
     ["diff"],
     ["todos"],
     ["abort"],

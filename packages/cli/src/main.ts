@@ -9,9 +9,12 @@ import {
   createSession,
   describeError,
   type Output,
+  resumeSession,
   runAbort,
   runClose,
   runDiff,
+  runHistory,
+  runStats,
   runStatus,
   runTodos,
 } from "./commands.js";
@@ -107,10 +110,20 @@ async function main(): Promise<number> {
       if (command.detach) return 0;
       return attachChat(ctx);
     }
+    case "resume": {
+      const info = await resumeSession(ctx, command);
+      if (info === null) return 1;
+      if (command.detach) return 0;
+      return attachChat(ctx);
+    }
     case "chat":
       return attachChat(ctx);
     case "status":
       return runStatus(ctx);
+    case "stats":
+      return runStats(ctx);
+    case "history":
+      return runHistory(ctx);
     case "diff":
       return runDiff(ctx, command);
     case "todos":
