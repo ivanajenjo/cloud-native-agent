@@ -47,7 +47,7 @@ ENV EDGE_DATA_DIR=/edge-data \
     EDGE_API_PORT=8080 \
     EDGE_PROXY_PORT=3128 \
     EDGE_PROVIDERS_FILE=/config/providers.yaml \
-    GATEWAY_URL=http://agent:8090
+    EDGE_REPLICAS=agent-1
 
 WORKDIR /app
 COPY --from=build /app/packages/shared/package.json /app/packages/shared/package.json
