@@ -1,7 +1,14 @@
 import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import type { Server as HttpServer, IncomingMessage } from "node:http";
 import { type ClientRequest, request as httpRequest } from "node:http";
-import { type AddressInfo, createServer, isIP, type Server, type Socket } from "node:net";
+import {
+  type AddressInfo,
+  createServer,
+  isIP,
+  connect as netConnect,
+  type Server,
+  type Socket,
+} from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -11,10 +18,14 @@ import {
   type EdgeRuntime,
   loadProviderEndpoints,
   loadServiceEndpoints,
+  type WiringOptions,
 } from "../src/wiring.js";
 
 const TOKEN = "0123456789abcdef".repeat(4);
-const GATEWAY = "http://gw.test:8090";
+/** The replica of the default EDGE_REPLICAS. Its gateway host resolves to LOOPBACK (ADR-0012). */
+const REPLICA = "agent-1";
+/** Where the single-replica tests connect to the proxy from, so the connection is identified. */
+const LOOPBACK = "127.0.0.1";
 const VERSION = "9.9.9-test";
 /** TEST-NET-1 (RFC 5737): reserved for documentation, never routed. Not an internal range for edge. */
 const UNROUTABLE = "192.0.2.10";
@@ -23,6 +34,13 @@ interface RecordedCall {
   url: string;
   method: string;
   body: unknown;
+  headers: Record<string, string>;
+}
+
+/** Answer of the fake gateway to GET /session of one host: a status and, for 200, a body. */
+interface FakeSessionAnswer {
+  status: number;
+  body?: unknown;
 }
 
 type Cleanup = () => Promise<void>;
@@ -67,15 +85,31 @@ async function listen(server: Server | HttpServer): Promise<number> {
   return (server.address() as AddressInfo).port;
 }
 
-/** Fake gateway: 201 for /internal/questions, 204 for everything else. Records every call. */
-function fakeGateway() {
+/**
+ * Fake gateway: 201 for /internal/questions, 204 for everything else, and GET /session of the
+ * hosts listed in `sessions`. Records every call, with its headers.
+ */
+function fakeGateway(sessions: Record<string, FakeSessionAnswer> = {}) {
   const calls: RecordedCall[] = [];
   const fetch = (async (input: string | URL | Request, init?: RequestInit) => {
     const url = String(input);
     const body = typeof init?.body === "string" ? JSON.parse(init.body) : undefined;
-    calls.push({ url, method: init?.method ?? "GET", body });
-    const path = new URL(url).pathname;
-    return new Response(null, { status: path === "/internal/questions" ? 201 : 204 });
+    const headers: Record<string, string> = {};
+    new Headers(init?.headers).forEach((value, name) => {
+      headers[name] = value;
+    });
+    const method = init?.method ?? "GET";
+    calls.push({ url, method, body, headers });
+    const { hostname, pathname } = new URL(url);
+    const session = sessions[hostname];
+    if (method === "GET" && pathname === "/session" && session !== undefined) {
+      if (session.status !== 200) return new Response(null, { status: session.status });
+      return new Response(JSON.stringify(session.body), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      });
+    }
+    return new Response(null, { status: pathname === "/internal/questions" ? 201 : 204 });
   }) as typeof globalThis.fetch;
   return { calls, fetch };
 }
@@ -93,10 +127,12 @@ function configFor(paths: {
   providersFile?: string;
   notificationsFile?: string;
   webFile?: string;
+  /** EDGE_REPLICAS, default REPLICA. */
+  replicas?: string;
 }): EdgeConfig {
   return loadConfig({
     AGENT_API_TOKEN: TOKEN,
-    GATEWAY_URL: GATEWAY,
+    EDGE_REPLICAS: paths.replicas ?? REPLICA,
     EDGE_DATA_DIR: dataDir,
     EDGE_PROVIDERS_FILE: paths.providersFile ?? missingFile("no-providers.yaml"),
     EDGE_NOTIFICATIONS_FILE: paths.notificationsFile ?? missingFile("no-notifications.yaml"),
@@ -117,16 +153,22 @@ async function startRuntime(
     providersFile?: string;
     notificationsFile?: string;
     webFile?: string;
+    replicas?: string;
+    /** Resolver records. The replica's host resolves to LOOPBACK unless the records say otherwise. */
     records?: Record<string, string[]>;
+    /** GET /session answers of the fake gateway, by host. */
+    sessions?: Record<string, FakeSessionAnswer>;
     gateway?: FakeGateway;
+    connect?: WiringOptions["connect"];
   } = {},
 ): Promise<{ runtime: EdgeRuntime; gateway: FakeGateway }> {
-  const gateway = options.gateway ?? fakeGateway();
+  const gateway = options.gateway ?? fakeGateway(options.sessions);
   const runtime = await createEdgeRuntime({
     config: configFor(options),
     version: VERSION,
     fetch: gateway.fetch,
-    resolver: fakeResolver(options.records ?? {}),
+    resolver: fakeResolver({ [REPLICA]: [LOOPBACK], ...options.records }),
+    connect: options.connect,
     logError: () => undefined,
   });
   cleanups.push(async () => {
@@ -165,13 +207,17 @@ interface OpenConnect {
   answered: Promise<{ status: number; socket: Socket }>;
 }
 
-/** Sends a CONNECT to the edge proxy. The client request is returned so the test can drop it. */
-function openConnect(proxyPort: number, authority: string): OpenConnect {
+/**
+ * Sends a CONNECT to the edge proxy, from `localAddress` when given (a replica's address in the
+ * multi-replica tests). The client request is returned so the test can drop it.
+ */
+function openConnect(proxyPort: number, authority: string, localAddress?: string): OpenConnect {
   const req = httpRequest({
     host: "127.0.0.1",
     port: proxyPort,
     method: "CONNECT",
     path: authority,
+    localAddress,
   });
   const answered = new Promise<{ status: number; socket: Socket }>((resolve, reject) => {
     req.on("connect", (response: IncomingMessage, socket: Socket) => {
@@ -377,6 +423,7 @@ describe("egress proxy with the ask flow", () => {
     const connect = openConnect(port, "unknown.example:443");
     const id = await waitFor(() => (questionCall(gateway) ? questionIdOf(gateway) : undefined));
     expect(id.startsWith("net-")).toBe(true);
+    expect(questionCall(gateway)?.url).toBe("http://agent-1:8090/internal/questions");
 
     const answer = await runtime.ingress.request(`/session/answers/${id}`, {
       method: "POST",
@@ -587,5 +634,172 @@ describe("network API wiring", () => {
     });
     expect(response.status).toBe(200);
     expect(runtime.mode()).toBe("allowlist");
+  });
+});
+
+describe("several replicas behind one edge (ADR-0012)", () => {
+  const bearer = { authorization: `Bearer ${TOKEN}` };
+  const TWO_REPLICAS = "agent-1,agent-2";
+  const AGENT_1 = "http://agent-1:8090";
+  const AGENT_2 = "http://agent-2:8090";
+  /** Each replica's gateway host resolves to its own loopback address. */
+  const FROM_AGENT_2 = "127.0.0.2";
+  /** A loopback address that no replica has. */
+  const FROM_UNKNOWN = "127.0.0.3";
+  const RECORDS = {
+    "agent-1": [LOOPBACK],
+    "agent-2": [FROM_AGENT_2],
+    "unknown.example": ["93.184.216.34"],
+  };
+  const SESSION = { id: "s-1", status: "running" };
+
+  /** Calls the fake gateways received from `origin` (e.g. "http://agent-2:8090"), optionally on `path`. */
+  function callsTo(gateway: FakeGateway, origin: string, path?: string): RecordedCall[] {
+    return gateway.calls.filter((call) => {
+      const url = new URL(call.url);
+      return url.origin === origin && (path === undefined || url.pathname === path);
+    });
+  }
+
+  /** Id of the first question published to `origin`, once there is one. */
+  function questionIdAt(gateway: FakeGateway, origin: string): Promise<string> {
+    return waitFor(() => {
+      const call = callsTo(gateway, origin, "/internal/questions")[0];
+      if (call === undefined) return undefined;
+      return (call.body as { question: { id: string } }).question.id;
+    });
+  }
+
+  async function answer(runtime: EdgeRuntime, id: string, value: string): Promise<Response> {
+    return runtime.ingress.request(`/session/answers/${id}`, {
+      method: "POST",
+      headers: { ...bearer, "content-type": "application/json" },
+      body: JSON.stringify({ value }),
+    });
+  }
+
+  /** Echo server standing in for the public destination of an allowed tunnel. */
+  async function startEcho(): Promise<number> {
+    const echo = track(
+      createServer((socket) => {
+        socket.on("error", () => undefined);
+        socket.pipe(socket);
+      }),
+    );
+    return listen(echo);
+  }
+
+  it("asks only the replica that opened the connection, and publishes its log entry there", async () => {
+    const echoPort = await startEcho();
+    const { runtime, gateway } = await startRuntime({
+      replicas: TWO_REPLICAS,
+      records: RECORDS,
+      connect: () => netConnect({ host: "127.0.0.1", port: echoPort }),
+    });
+    const port = await listen(track(runtime.proxy));
+
+    const connect = openConnect(port, "unknown.example:443", FROM_AGENT_2);
+    const id = await questionIdAt(gateway, AGENT_2);
+    expect(id.startsWith("net-")).toBe(true);
+    expect(callsTo(gateway, AGENT_1)).toEqual([]);
+
+    expect((await answer(runtime, id, "allow_once")).status).toBe(204);
+    const connected = await connect.answered;
+    expect(connected.status).toBe(200);
+    connected.socket.destroy();
+
+    const resolved = await waitFor(
+      () => callsTo(gateway, AGENT_2, `/internal/questions/${id}/resolved`)[0],
+    );
+    expect(resolved.body).toEqual({ outcome: "answered" });
+
+    const published = await waitFor(() => callsTo(gateway, AGENT_2, "/internal/network")[0]);
+    expect(published.body).toMatchObject({
+      entry: { host: "unknown.example", decision: "allow", replica: "agent-2" },
+    });
+    expect(callsTo(gateway, AGENT_1)).toEqual([]);
+  });
+
+  it("asks each replica about the same destination with its own question", async () => {
+    const { runtime, gateway } = await startRuntime({ replicas: TWO_REPLICAS, records: RECORDS });
+    const port = await listen(track(runtime.proxy));
+
+    const first = openConnect(port, "unknown.example:443", LOOPBACK);
+    const second = openConnect(port, "unknown.example:443", FROM_AGENT_2);
+    const idOfAgent1 = await questionIdAt(gateway, AGENT_1);
+    const idOfAgent2 = await questionIdAt(gateway, AGENT_2);
+    expect(idOfAgent1).not.toBe(idOfAgent2);
+    expect(callsTo(gateway, AGENT_1, "/internal/questions")).toHaveLength(1);
+    expect(callsTo(gateway, AGENT_2, "/internal/questions")).toHaveLength(1);
+
+    expect((await answer(runtime, idOfAgent1, "deny")).status).toBe(204);
+    expect((await answer(runtime, idOfAgent2, "deny")).status).toBe(204);
+    expect((await first.answered).status).toBe(403);
+    expect((await second.answered).status).toBe(403);
+    expect(callsTo(gateway, AGENT_1, "/internal/questions")).toHaveLength(1);
+    expect(callsTo(gateway, AGENT_2, "/internal/questions")).toHaveLength(1);
+  });
+
+  it("denies a connection from no replica with unknown_client, logs it without replica and tells no gateway", async () => {
+    const { runtime, gateway } = await startRuntime({ replicas: TWO_REPLICAS, records: RECORDS });
+    const port = await listen(track(runtime.proxy));
+
+    const connect = openConnect(port, "unknown.example:443", FROM_UNKNOWN);
+    expect((await connect.answered).status).toBe(403);
+
+    const entry = await waitFor(async () => {
+      const response = await runtime.ingress.request("/network/log", { headers: bearer });
+      expect(response.status).toBe(200);
+      const body = (await response.json()) as { entries: Array<Record<string, unknown>> };
+      return body.entries.find((line) => line.reason === "unknown_client");
+    });
+    expect(entry).toMatchObject({ host: "unknown.example", decision: "deny" });
+    expect(entry).not.toHaveProperty("replica");
+    expect(
+      gateway.calls.filter((call) => new URL(call.url).pathname.startsWith("/internal/")),
+    ).toEqual([]);
+  });
+
+  it("GET /replicas lists every replica with its session, and needs the Bearer", async () => {
+    const { runtime } = await startRuntime({
+      replicas: TWO_REPLICAS,
+      records: RECORDS,
+      sessions: {
+        "agent-1": { status: 200, body: SESSION },
+        "agent-2": { status: 404 },
+      },
+    });
+
+    const response = await runtime.ingress.request("/replicas", { headers: bearer });
+    expect(response.status).toBe(200);
+    await expect(response.json()).resolves.toEqual({
+      replicas: [
+        { name: "agent-1", reachable: true, session: SESSION },
+        { name: "agent-2", reachable: true, session: null },
+      ],
+    });
+
+    const anonymous = await runtime.ingress.request("/replicas");
+    expect(anonymous.status).toBe(401);
+  });
+
+  it("forwards /replicas/agent-2/session to agent-2 as /session, without the Bearer", async () => {
+    const { runtime, gateway } = await startRuntime({
+      replicas: TWO_REPLICAS,
+      records: RECORDS,
+      sessions: { "agent-2": { status: 200, body: SESSION } },
+    });
+
+    const response = await runtime.ingress.request("/replicas/agent-2/session", {
+      headers: bearer,
+    });
+    expect(response.status).toBe(200);
+    await expect(response.json()).resolves.toEqual(SESSION);
+
+    const forwarded = callsTo(gateway, AGENT_2, "/session")[0];
+    expect(forwarded).toBeDefined();
+    expect(forwarded?.method).toBe("GET");
+    expect(forwarded?.headers).not.toHaveProperty("authorization");
+    expect(callsTo(gateway, AGENT_1)).toEqual([]);
   });
 });

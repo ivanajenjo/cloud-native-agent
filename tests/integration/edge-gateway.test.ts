@@ -31,7 +31,11 @@ import { createGitRunner } from "../../packages/gateway/src/workspace/git.js";
 
 /** Only edge holds this token (AGENTS.md invariant). */
 const TOKEN = "0123456789abcdef".repeat(4);
-const GATEWAY_URL = "http://agent:8090";
+/** The one replica of this stack: its name is the gateway host edge resolves (ADR-0012). */
+const REPLICA_NAME = "agent-1";
+const GATEWAY_URL = "http://agent-1:8090";
+/** Loopback: the test connects to the proxy from here, so the replica is identified. */
+const LOOPBACK = "127.0.0.1";
 const VERSION = "0.0.0-test";
 /** TEST-NET-3 (RFC 5737): documentation address, never routed. Every test name resolves to it. */
 const PUBLIC_IP = "203.0.113.10";
@@ -141,7 +145,7 @@ function gatewayConfig(): GatewayConfig {
 function edgeConfig(askTimeoutMs: number): EdgeConfig {
   return {
     token: TOKEN,
-    gatewayUrl: GATEWAY_URL,
+    replicas: [{ name: REPLICA_NAME, gatewayUrl: GATEWAY_URL }],
     dataDir: join(root, "edge-data"),
     apiPort: 8080,
     proxyPort: 8128,
@@ -194,8 +198,12 @@ function headersOf(init: ConstructorParameters<typeof Headers>[0]): Record<strin
   return headers;
 }
 
-/** Names of the test: every one ends with ".example" and resolves to PUBLIC_IP. */
+/**
+ * The replica's gateway host resolves to loopback, where the test connects from. Names of the
+ * test: every one ends with ".example" and resolves to PUBLIC_IP.
+ */
 function resolveTestName(host: string): string[] {
+  if (host === REPLICA_NAME) return [LOOPBACK];
   return host.endsWith(".example") ? [PUBLIC_IP] : [];
 }
 
@@ -526,6 +534,7 @@ describe("edge and gateway together (ADR-0008)", () => {
       host: "allowed-once.example",
       port: 443,
       decision: "allow",
+      replica: REPLICA_NAME,
     });
 
     expect(networkOrder(events)).toEqual(["question", "question_resolved", "network"]);
@@ -620,7 +629,12 @@ describe("edge and gateway together (ADR-0008)", () => {
     await events.waitUntil(hasEvent("question"));
     // Both requests must be waiting on the same question before it is answered;
     // otherwise the second one would ask again.
-    await waitFor(() => (stack.resolved.length === 2 ? true : undefined), "both requests");
+    // Only the destination counts: the replica's own host is resolved too, when identifying.
+    await waitFor(
+      () =>
+        stack.resolved.filter((host) => host === "shared.example").length === 2 ? true : undefined,
+      "both requests",
+    );
     await new Promise((resolve) => setTimeout(resolve, 50));
 
     const question = firstQuestion(events);

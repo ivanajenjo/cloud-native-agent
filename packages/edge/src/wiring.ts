@@ -27,9 +27,10 @@ import {
 import { PolicyStore } from "./egress/policy-store.js";
 import { createEgressProxy } from "./egress/proxy.js";
 import { createRecentNetworkLog } from "./egress/recent-log.js";
-import { createGatewayClient } from "./gateway-client.js";
+import { createReplicaGateways } from "./gateway-client.js";
 import { createIngressApp } from "./ingress.js";
 import { createNetworkApi, formatEndpoint } from "./network-api.js";
+import { createReplicaDirectory, fetchReplicaSummaries } from "./replicas.js";
 
 export interface EdgeRuntime {
   ingress: Hono;
@@ -47,7 +48,7 @@ export interface EdgeRuntime {
 export interface WiringOptions {
   config: EdgeConfig;
   version: string;
-  /** Injectable for tests. Default globalThis.fetch (used by the ingress and the gateway client). */
+  /** Injectable for tests. Default globalThis.fetch (used by the ingress and the gateway clients). */
   fetch?: typeof globalThis.fetch;
   /** Injectable for tests. Default systemResolver. */
   resolver?: Resolver;
@@ -58,9 +59,9 @@ export interface WiringOptions {
 }
 
 /**
- * Builds edge's runtime: policy, ask coordinator, gateway client, network log, egress proxy and
- * ingress. Throws (startup must fail) if the policy file, providers.yaml, notifications.yaml or
- * web.yaml cannot be read or parsed.
+ * Builds edge's runtime: policy, ask coordinator, one gateway client per replica (ADR-0012),
+ * network log, egress proxy and ingress. Throws (startup must fail) if the policy file,
+ * providers.yaml, notifications.yaml or web.yaml cannot be read or parsed.
  */
 export async function createEdgeRuntime(options: WiringOptions): Promise<EdgeRuntime> {
   const { config, version } = options;
@@ -75,8 +76,9 @@ export async function createEdgeRuntime(options: WiringOptions): Promise<EdgeRun
     webFile: config.webFile,
   });
 
-  const gateway = createGatewayClient({ gatewayUrl: config.gatewayUrl, fetch });
-  const ask = new AskCoordinator({ gateway, timeoutMs: config.askTimeoutMs });
+  const gateways = createReplicaGateways({ replicas: config.replicas, fetch });
+  const directory = createReplicaDirectory({ replicas: config.replicas, resolver });
+  const ask = new AskCoordinator({ gateway: gateways, timeoutMs: config.askTimeoutMs });
   const policy = createNetworkPolicy({
     store,
     baseAllowlist: BASE_ALLOWLIST.map(parseAllowlistEntry),
@@ -89,13 +91,16 @@ export async function createEdgeRuntime(options: WiringOptions): Promise<EdgeRun
       ),
   });
 
-  // Each entry goes to the SSE stream (fire and forget), to the recent buffer served by
-  // GET /network/log, and to network.jsonl (edge's volume).
+  // Each entry goes to the SSE stream of the replica that opened the connection (fire and
+  // forget), to the recent buffer served by GET /network/log, and to network.jsonl (edge's
+  // volume). An entry without replica (unknown client, ADR-0012) reaches no gateway.
   const fileLog = createFileNetworkLog(join(config.dataDir, "network.jsonl"));
   const recentLog = createRecentNetworkLog(NETWORK_LOG_CAPACITY);
   const log: NetworkLog = {
     append(entry: NetworkLogEntry) {
-      void gateway.publishNetworkEntry(entry);
+      if (entry.replica !== undefined) {
+        void gateways.publishNetworkEntry(entry.replica, entry);
+      }
       recentLog.append(entry);
       return fileLog.append(entry);
     },
@@ -104,7 +109,13 @@ export async function createEdgeRuntime(options: WiringOptions): Promise<EdgeRun
     },
   };
 
-  const proxy = createEgressProxy({ policy, log, resolver, connect: options.connect });
+  const proxy = createEgressProxy({
+    policy,
+    log,
+    resolver,
+    connect: options.connect,
+    identify: (address) => directory.identify(address),
+  });
   const networkApi = createNetworkApi({
     store,
     base: BASE_ALLOWLIST.map((text) => formatAllowlistEntry(parseAllowlistEntry(text))),
@@ -114,11 +125,12 @@ export async function createEdgeRuntime(options: WiringOptions): Promise<EdgeRun
   });
   const ingress = createIngressApp({
     token: config.token,
-    gatewayUrl: config.gatewayUrl,
+    replicas: config.replicas,
     version,
     fetch,
     networkAnswers: ask,
     networkApi,
+    listReplicas: () => fetchReplicaSummaries(config.replicas, { fetch }),
   });
 
   return {
