@@ -21,6 +21,8 @@ export interface GatewayConfig {
   gitUserName?: string;
   /** CNA_GIT_USER_EMAIL. Empty or absent means undefined. */
   gitUserEmail?: string;
+  /** CNA_IDLE_TIMEOUT_MIN (integer minutes, 0..10080, default 30), in ms. 0 disables the suspension. */
+  idleTimeoutMs: number;
 }
 
 /** Paths derived from the configuration. */
@@ -39,9 +41,16 @@ export interface GatewayPaths {
   systemPromptFile: string;
   /** Copied to <agentDir>/AGENTS.md (global instructions of Pi). */
   globalAgentsFile: string;
+  /** <dataDir>/state/session.json (ADR-0011 §2). */
+  stateFile: string;
+  /** <dataDir>/state/history.json (ADR-0011 §6). */
+  historyFile: string;
 }
 
 const DEFAULT_DATA_DIR = "/data";
+const DEFAULT_IDLE_TIMEOUT_MIN = 30;
+const MAX_IDLE_TIMEOUT_MIN = 10_080;
+const MS_PER_MINUTE = 60_000;
 const DEFAULT_PROVIDERS_FILE = "/config/providers.yaml";
 const DEFAULT_NOTIFICATIONS_FILE = "/config/notifications.yaml";
 const DEFAULT_WEB_FILE = "/config/web.yaml";
@@ -74,6 +83,7 @@ export function loadGatewayConfig(env: Record<string, string | undefined>): Gate
     webUiDir: parseAbsolutePath("CNA_WEB_UI_DIR", env.CNA_WEB_UI_DIR ?? DEFAULT_WEB_UI_DIR),
     gitUserName: optionalValue(env.CNA_GIT_USER_NAME),
     gitUserEmail: optionalValue(env.CNA_GIT_USER_EMAIL),
+    idleTimeoutMs: parseIdleTimeoutMs(env.CNA_IDLE_TIMEOUT_MIN),
   };
 }
 
@@ -97,6 +107,8 @@ export function gatewayPaths(config: GatewayConfig): GatewayPaths {
     ],
     systemPromptFile: join(assetsDir, "system-prompt.md"),
     globalAgentsFile: join(assetsDir, "AGENTS.md"),
+    stateFile: join(dataDir, "state", "session.json"),
+    historyFile: join(dataDir, "state", "history.json"),
   };
 }
 
@@ -119,4 +131,17 @@ function parseAbsolutePath(name: string, value: string): string {
 /** Empty means absent. */
 function optionalValue(value: string | undefined): string | undefined {
   return value === undefined || value === "" ? undefined : value;
+}
+
+/** Absent or empty means the default. Returns milliseconds; the message never echoes the value. */
+function parseIdleTimeoutMs(value: string | undefined): number {
+  const text = optionalValue(value);
+  if (text === undefined) {
+    return DEFAULT_IDLE_TIMEOUT_MIN * MS_PER_MINUTE;
+  }
+  const minutes = /^\d+$/.test(text) ? Number(text) : Number.NaN;
+  if (!Number.isInteger(minutes) || minutes > MAX_IDLE_TIMEOUT_MIN) {
+    throw new Error("CNA_IDLE_TIMEOUT_MIN must be an integer between 0 and 10080");
+  }
+  return minutes * MS_PER_MINUTE;
 }

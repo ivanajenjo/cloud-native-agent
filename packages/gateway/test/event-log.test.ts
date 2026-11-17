@@ -123,6 +123,84 @@ describe("EventLog.subscribe", () => {
   });
 });
 
+describe("EventLog firstId", () => {
+  it("starts the ids at firstId and keeps growing", () => {
+    const log = new EventLog({ firstId: 1000 });
+
+    expect(log.append(notify("a")).id).toBe(1000);
+    expect(log.append(notify("b")).id).toBe(1001);
+    expect(log.lastId).toBe(1001);
+  });
+
+  it("reports lastId 0 when empty, even with firstId", () => {
+    expect(new EventLog({ firstId: 1000 }).lastId).toBe(0);
+  });
+
+  it("keeps growing from firstId after clear", () => {
+    const log = new EventLog({ firstId: 1000 });
+    log.append(notify("a"));
+    log.append(notify("b"));
+
+    log.clear();
+
+    expect(log.append(notify("c")).id).toBe(1002);
+    expect(log.since(0).events.map((e) => e.id)).toEqual([1002]);
+  });
+
+  it("replays correctly with since(lastId) from a previous process", () => {
+    const log = new EventLog({ firstId: Date.now() });
+    const first = log.append(notify("a"));
+    const second = log.append(notify("b"));
+
+    expect(log.since(first.id).events).toEqual([second]);
+    expect(log.since(second.id).events).toEqual([]);
+  });
+
+  it("replays the whole buffer to a client whose id is from a previous process", () => {
+    const previous = new EventLog({ firstId: 5000 });
+    previous.append(notify("old"));
+    const lastEventId = previous.lastId;
+
+    const current = new EventLog({ firstId: 9000 });
+    const stored = current.append(notify("new"));
+
+    // Lower id than the buffer: everything is replayed.
+    expect(lastEventId).toBe(5000);
+    expect(current.since(lastEventId).events).toEqual([stored]);
+    expect(current.since(lastEventId).truncated).toBe(false);
+  });
+
+  it("behaves as before for an afterId greater than the last id", () => {
+    const log = new EventLog({ firstId: 1000 });
+    log.append(notify("a"));
+    log.append(notify("b"));
+
+    expect(log.since(5000)).toEqual({ events: [], truncated: false });
+  });
+
+  it("reports truncation with a high firstId when events were dropped by capacity", () => {
+    const log = new EventLog({ capacity: 2, firstId: 1000 });
+    for (let i = 0; i < 4; i++) {
+      log.append(notify(String(i)));
+    }
+
+    expect(log.since(0).events.map((e) => e.id)).toEqual([1002, 1003]);
+    expect(log.since(0).truncated).toBe(true);
+    expect(log.since(1001).truncated).toBe(false);
+    expect(log.since(1000).truncated).toBe(true);
+  });
+
+  it("rejects a firstId that is not a safe integer >= 1", () => {
+    for (const firstId of [0, 1.5, Number.NaN, -1, Number.MAX_SAFE_INTEGER + 1]) {
+      expect(() => new EventLog({ firstId })).toThrow(RangeError);
+    }
+  });
+
+  it("accepts firstId 1 as the default", () => {
+    expect(new EventLog({ firstId: 1 }).append(notify("a")).id).toBe(1);
+  });
+});
+
 describe("EventLog.clear", () => {
   it("empties the buffer but ids keep growing", () => {
     const log = new EventLog();

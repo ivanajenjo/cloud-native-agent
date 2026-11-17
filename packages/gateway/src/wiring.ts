@@ -81,7 +81,8 @@ export async function createGatewayRuntime(options: GatewayWiringOptions): Promi
   ]);
   // Git and Pi get the environment without the API token.
   const childEnv = withoutApiToken(env);
-  const events = new EventLog();
+  // ADR-0011 §4: ids keep growing across restarts, so a reconnecting client gets the new events.
+  const events = new EventLog({ firstId: Date.now() });
   const git = createGitRunner(childEnv);
   const toolLog = createToolLog({ filePath: paths.toolLogFile, redactor });
 

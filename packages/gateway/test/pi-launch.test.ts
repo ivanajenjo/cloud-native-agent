@@ -7,6 +7,7 @@ const base: PiLaunchOptions = {
   cwd: "/data/workspace/repo",
   agentDir: "/data/pi-agent",
   sessionDir: "/data/sessions",
+  sessionId: "3f2b9c1e-6d4a-4b8e-9c1f-2a7d5e8b9f01",
   extensions: [],
   baseBranch: "main",
   autoPush: false,
@@ -39,6 +40,8 @@ describe("buildPiLaunch args", () => {
       "--no-mcp",
       "--session-dir",
       "/data/sessions",
+      "--session-id",
+      "3f2b9c1e-6d4a-4b8e-9c1f-2a7d5e8b9f01",
       "-e",
       "/opt/cna/ext/ask-user.js",
       "-e",
@@ -67,6 +70,8 @@ describe("buildPiLaunch args", () => {
       "--no-mcp",
       "--session-dir",
       "/data/sessions",
+      "--session-id",
+      "3f2b9c1e-6d4a-4b8e-9c1f-2a7d5e8b9f01",
       "--cna-base-branch",
       "main",
     ]);
@@ -204,6 +209,20 @@ describe("buildPiLaunch validation", () => {
 
   it("rejects a model that looks like a flag", () => {
     expect(() => buildPiLaunch({ ...base, model: "-x", env: {} })).toThrow(Error);
+  });
+
+  it("rejects invalid session ids", () => {
+    for (const sessionId of ["-x", "a b", "x/", "", ".a", "a.", "a".repeat(129)]) {
+      expect(() => buildPiLaunch({ ...base, sessionId, env: {} })).toThrow(
+        "sessionId is not valid",
+      );
+    }
+  });
+
+  it("accepts session ids with dots, dashes and underscores inside, up to 128 characters", () => {
+    for (const sessionId of ["a", "abc.def_ghi-1", "a".repeat(128)]) {
+      expect(() => buildPiLaunch({ ...base, sessionId, env: {} })).not.toThrow();
+    }
   });
 
   it("rejects a relative webConfigFile", () => {

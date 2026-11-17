@@ -220,6 +220,7 @@ describe("e2e: real Pi in RPC mode against a mock OpenAI endpoint", () => {
       webUiDir: join(root, "web-ui"),
       gitUserName: "E2E Agent",
       gitUserEmail: "agent@e2e.invalid",
+      idleTimeoutMs: 1_800_000,
     };
     const runtime = await createGatewayRuntime({
       config,

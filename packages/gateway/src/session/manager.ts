@@ -626,6 +626,7 @@ export class SessionManager implements SessionService {
 
       const spec = buildPiLaunch({
         ...this.options.pi,
+        sessionId: info.id,
         cwd: this.options.workspaceDir,
         model: info.model ?? undefined,
         thinking: info.thinking ?? undefined,

@@ -91,6 +91,7 @@ function configFor(overrides: Partial<GatewayConfig> = {}): GatewayConfig {
     webUiDir: join(root, "web-ui"),
     gitUserName: "Agent",
     gitUserEmail: "agent@example.invalid",
+    idleTimeoutMs: 1_800_000,
     ...overrides,
   };
 }

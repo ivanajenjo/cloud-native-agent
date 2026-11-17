@@ -12,6 +12,8 @@ export interface PiLaunchOptions {
   agentDir: string;
   /** Where Pi stores the session JSONL. */
   sessionDir: string;
+  /** Pi session id (`--session-id`): the SessionInfo id, so a restarted Pi resumes the conversation (ADR-0011). */
+  sessionId: string;
   /** Absolute paths of our extensions, each passed with -e, in order. */
   extensions: string[];
   /** File passed with --append-system-prompt, if any. */
@@ -42,6 +44,9 @@ export interface PiLaunchSpec {
 /** Variable that must never reach Pi's process: only `edge` holds the API token. */
 const FORBIDDEN_ENV = "AGENT_API_TOKEN";
 
+/** Pi session id: alphanumeric at both ends, up to 128 characters, no `/` nor leading `-`. */
+const SESSION_ID_PATTERN = /^[A-Za-z0-9](?:[A-Za-z0-9._-]{0,126}[A-Za-z0-9])?$/;
+
 function assertAbsolute(label: string, value: string): void {
   if (!isAbsolute(value)) {
     throw new Error(`${label} must be an absolute path: ${value}`);
@@ -61,6 +66,9 @@ function validate(options: PiLaunchOptions): void {
   }
   if (options.webConfigFile !== undefined) {
     assertAbsolute("webConfigFile", options.webConfigFile);
+  }
+  if (!SESSION_ID_PATTERN.test(options.sessionId)) {
+    throw new Error("sessionId is not valid");
   }
   if (options.baseBranch.length === 0) {
     throw new Error("baseBranch must not be empty");
@@ -101,6 +109,8 @@ function buildArgs(options: PiLaunchOptions): string[] {
     "--no-mcp",
     "--session-dir",
     options.sessionDir,
+    "--session-id",
+    options.sessionId,
   ];
   for (const extension of options.extensions) {
     args.push("-e", extension);

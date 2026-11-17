@@ -15,6 +15,7 @@ describe("loadGatewayConfig", () => {
     expect(config.extensionsDir.endsWith("/packages/extensions")).toBe(true);
     expect(existsSync(join(config.extensionsDir, "src", "ask-user.ts"))).toBe(true);
     expect(config.webUiDir.endsWith("/packages/web/dist")).toBe(true);
+    expect(config.idleTimeoutMs).toBe(1_800_000);
   });
 
   it("reads the values of the variables", () => {
@@ -28,6 +29,7 @@ describe("loadGatewayConfig", () => {
       CNA_WEB_UI_DIR: "/opt/cna/web",
       CNA_GIT_USER_NAME: "Agent",
       CNA_GIT_USER_EMAIL: "agent@example.invalid",
+      CNA_IDLE_TIMEOUT_MIN: "120",
     });
 
     expect(config).toStrictEqual({
@@ -40,7 +42,31 @@ describe("loadGatewayConfig", () => {
       webUiDir: "/opt/cna/web",
       gitUserName: "Agent",
       gitUserEmail: "agent@example.invalid",
+      idleTimeoutMs: 7_200_000,
     });
+  });
+
+  it("reads CNA_IDLE_TIMEOUT_MIN in minutes, where 0 disables the suspension", () => {
+    expect(loadGatewayConfig({ CNA_IDLE_TIMEOUT_MIN: "0" }).idleTimeoutMs).toBe(0);
+    expect(loadGatewayConfig({ CNA_IDLE_TIMEOUT_MIN: "120" }).idleTimeoutMs).toBe(7_200_000);
+    expect(loadGatewayConfig({ CNA_IDLE_TIMEOUT_MIN: "10080" }).idleTimeoutMs).toBe(604_800_000);
+  });
+
+  it("uses the default idle timeout when CNA_IDLE_TIMEOUT_MIN is empty", () => {
+    expect(loadGatewayConfig({ CNA_IDLE_TIMEOUT_MIN: "" }).idleTimeoutMs).toBe(1_800_000);
+  });
+
+  it("rejects an invalid CNA_IDLE_TIMEOUT_MIN without repeating its value", () => {
+    for (const value of ["-1", "10081", "1.5", "abc", " 5", "1e2"]) {
+      try {
+        loadGatewayConfig({ CNA_IDLE_TIMEOUT_MIN: value });
+        expect.unreachable();
+      } catch (error) {
+        expect((error as Error).message).toBe(
+          "CNA_IDLE_TIMEOUT_MIN must be an integer between 0 and 10080",
+        );
+      }
+    }
   });
 
   it("rejects a relative path without repeating its value", () => {
@@ -111,6 +137,7 @@ describe("gatewayPaths", () => {
       webFile: "/config/web.yaml",
       extensionsDir: "/app/packages/extensions",
       webUiDir: "/app/packages/web/dist",
+      idleTimeoutMs: 1_800_000,
     };
 
     expect(gatewayPaths(config)).toStrictEqual({
@@ -128,6 +155,8 @@ describe("gatewayPaths", () => {
       ],
       systemPromptFile: "/app/packages/extensions/assets/system-prompt.md",
       globalAgentsFile: "/app/packages/extensions/assets/AGENTS.md",
+      stateFile: "/data/state/session.json",
+      historyFile: "/data/state/history.json",
     });
   });
 });
