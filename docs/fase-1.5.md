@@ -298,6 +298,6 @@ necesita. No es un error, pero leído suelto parece una contradicción.
 | Observación | Dónde se resuelve |
 |---|---|
 | Cambiar el modo de red obliga a editar `policy.json` y reiniciar `edge` | Fase 2, endpoints `/network/*` |
-| El replay de eventos vive en memoria (últimos 5000) y un reinicio pierde la sesión | Fase 4 |
+| El replay de eventos vive en memoria (últimos 5000) y un reinicio pierde la sesión | Fase 4: la sesión se reanuda desde disco y el evento `history` trae la conversación (ADR-0011) |
 | La redacción solo cubre el valor exacto del secreto y su forma URL-encoded | Riesgo aceptado (ADR-0006) |
 | Los proveedores integrados de Pi (sin `baseUrl`) generan una pregunta de red la primera vez | Decidido: se mantiene la pregunta |

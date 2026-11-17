@@ -30,6 +30,12 @@ services:
       TAVILY_API_KEY: ${TAVILY_API_KEY:-}
       CNA_GIT_USER_NAME: ${CNA_GIT_USER_NAME:-}
       CNA_GIT_USER_EMAIL: ${CNA_GIT_USER_EMAIL:-}
+      # Minutes of inactivity in `ready` before Pi is stopped to free memory (ADR-0011). 0 = never.
+      CNA_IDLE_TIMEOUT_MIN: ${CNA_IDLE_TIMEOUT_MIN:-30}
+    # Resource limits (ADR-0011): tests and builds run here, so leave room for the host.
+    mem_limit: ${CNA_AGENT_MEM_LIMIT:-6g}
+    cpus: ${CNA_AGENT_CPUS:-4}
+    pids_limit: ${CNA_AGENT_PIDS_LIMIT:-2048}
     security_opt:
       - "no-new-privileges:true"
     cap_drop:

@@ -21,8 +21,11 @@ import {
 import { resolvePiCli } from "./pi/launch.js";
 import { createRedactor, secretsFromEnv } from "./redact.js";
 import { RpcBridge, type RpcBridgeHandlers } from "./rpc/bridge.js";
+import { HistoryStore } from "./session/history.js";
 import { type PiProcess, SessionManager, type SessionManagerOptions } from "./session/manager.js";
+import { SessionStateStore } from "./session/persistence.js";
 import { createGitRunner } from "./workspace/git.js";
+import { createGhRunner } from "./workspace/pr.js";
 
 export interface GatewayRuntime {
   app: Hono;
@@ -81,14 +84,31 @@ export async function createGatewayRuntime(options: GatewayWiringOptions): Promi
   ]);
   // Git and Pi get the environment without the API token.
   const childEnv = withoutApiToken(env);
-  const events = new EventLog();
+  // ADR-0011 §4: ids keep growing across restarts, so a reconnecting client gets the new events.
+  const events = new EventLog({ firstId: Date.now() });
   const git = createGitRunner(childEnv);
+  const gh = createGhRunner(childEnv);
   const toolLog = createToolLog({ filePath: paths.toolLogFile, redactor });
 
+  // ADR-0011 §2: the session state survives a restart of the gateway.
+  const stateStore = new SessionStateStore({
+    file: paths.stateFile,
+    logError: (message) => console.error(message),
+  });
+  // Feature 10 (ADR-0011 §6): the history of the sessions of this replica, loaded before any restore.
+  const history = new HistoryStore({
+    file: paths.historyFile,
+    sessionDir: paths.sessionDir,
+    logError: (message) => console.error(message),
+  });
+  await history.load();
   const manager = new SessionManager({
     events,
     redactor,
     git,
+    gh,
+    stateStore,
+    history,
     startPi:
       options.startPi ??
       ((spec, handlers: RpcBridgeHandlers): PiProcess => RpcBridge.start(spec, handlers)),
@@ -102,6 +122,7 @@ export async function createGatewayRuntime(options: GatewayWiringOptions): Promi
       env: childEnv,
     },
     toolLog,
+    idleTimeoutMs: config.idleTimeoutMs,
     workspaceDir: paths.workspaceDir,
     defaultModel: providers.default,
     gitIdentity: { name: config.gitUserName, email: config.gitUserEmail },
@@ -116,6 +137,9 @@ export async function createGatewayRuntime(options: GatewayWiringOptions): Promi
           }),
         }),
   });
+
+  // ADR-0011 §3: resumes the session saved before the last restart, before any request arrives.
+  await manager.restore();
 
   const app = createApp({
     version,

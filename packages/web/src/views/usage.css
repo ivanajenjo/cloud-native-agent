@@ -1,0 +1,56 @@
+.usage-panel {
+  display: flex;
+  flex-direction: column;
+  gap: 0.75rem;
+  color: var(--fg);
+}
+
+.usage-title {
+  font-size: 1.1rem;
+  margin: 0;
+}
+
+.usage-messages p {
+  margin: 0;
+}
+
+.usage-loading {
+  color: var(--muted);
+}
+
+.usage-error {
+  color: var(--danger);
+}
+
+.usage-grid {
+  display: grid;
+  grid-template-columns: max-content minmax(0, 1fr);
+  gap: 0.4rem 1rem;
+  margin: 0;
+}
+
+.usage-grid dt {
+  color: var(--muted);
+}
+
+.usage-grid dd {
+  margin: 0;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.25rem 0.5rem;
+}
+
+.usage-breakdown {
+  color: var(--muted);
+  font-size: 0.9rem;
+}
+
+.usage-progress {
+  width: 10rem;
+  max-width: 100%;
+}
+
+.usage-refresh {
+  align-self: flex-start;
+}

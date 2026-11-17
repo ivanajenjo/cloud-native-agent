@@ -1,4 +1,4 @@
-import { appendFile, mkdir } from "node:fs/promises";
+import { appendFile, mkdir, rename, stat } from "node:fs/promises";
 import { dirname } from "node:path";
 import type { Redactor } from "../redact.js";
 
@@ -21,6 +21,8 @@ export const MAX_RESULT_CHARS = 2000;
 export const MAX_ARGS_CHARS = 4000;
 /** Max starts waiting for their end. The oldest is dropped when the limit is reached. */
 export const MAX_PENDING = 1000;
+/** Size at which tools.jsonl is rotated to tools.jsonl.1 (replacing the previous one). */
+export const MAX_LOG_BYTES = 10 * 1024 * 1024;
 
 export interface ToolLog {
   start(sessionId: string, event: { toolCallId: string; toolName: string; args: unknown }): void;
@@ -43,18 +45,47 @@ export function createToolLog(options: {
   redactor: Redactor;
   now?: () => Date;
   logError?: (message: string) => void;
+  maxBytes?: number;
 }): ToolLog {
   const { filePath, redactor } = options;
   const now = options.now ?? (() => new Date());
   const logError = options.logError ?? ((message: string) => console.error(message));
+  const maxBytes = options.maxBytes ?? MAX_LOG_BYTES;
 
   /** Args prepared at start, keyed by `${sessionId}:${toolCallId}`, in insertion order. */
   const pending = new Map<string, unknown>();
 
   let directoryReady = false;
+  /** Current size of filePath in bytes; undefined until a successful stat. */
+  let size: number | undefined;
   // Every write is chained here, so lines are written in call order and never interleave.
   // Each link swallows its own error, so the chain never rejects.
   let queue: Promise<void> = Promise.resolve();
+
+  /** Rotates filePath to filePath + ".1" when the line would exceed maxBytes. Never throws. */
+  const rotateIfNeeded = async (lineBytes: number): Promise<void> => {
+    if (size === undefined) {
+      try {
+        size = (await stat(filePath)).size;
+      } catch (error) {
+        if (isNotFound(error)) {
+          size = 0;
+        } else {
+          logError(`tool log: cannot check size: ${errorMessage(error)}`);
+          return;
+        }
+      }
+    }
+    if (size === 0 || size + lineBytes <= maxBytes) {
+      return;
+    }
+    try {
+      await rename(filePath, `${filePath}.1`);
+      size = 0;
+    } catch (error) {
+      logError(`tool log: cannot rotate: ${errorMessage(error)}`);
+    }
+  };
 
   const writeLine = async (line: string): Promise<void> => {
     try {
@@ -62,7 +93,12 @@ export function createToolLog(options: {
         await mkdir(dirname(filePath), { recursive: true, mode: 0o700 });
         directoryReady = true;
       }
+      const lineBytes = Buffer.byteLength(line);
+      await rotateIfNeeded(lineBytes);
       await appendFile(filePath, line, { mode: 0o600 });
+      if (size !== undefined) {
+        size += lineBytes;
+      }
     } catch (error) {
       logError(`tool log: cannot write: ${errorMessage(error)}`);
     }
@@ -169,4 +205,8 @@ function prepareResult(result: unknown, redactor: Redactor): string {
 
 function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
+}
+
+function isNotFound(error: unknown): boolean {
+  return (error as NodeJS.ErrnoException | undefined)?.code === "ENOENT";
 }

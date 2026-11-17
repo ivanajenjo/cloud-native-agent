@@ -5,7 +5,8 @@ export type Command =
   | {
       name: "run";
       repo: string;
-      prompt: string;
+      prompt?: string; // required unless pr is set
+      pr?: number; // --pr <n>: work on an existing agent/* pull request
       plan: boolean; // --plan
       baseBranch?: string; // --base <branch>
       model?: string; // --model <provider/model>
@@ -15,6 +16,9 @@ export type Command =
     }
   | { name: "chat" } // alias: "attach"
   | { name: "status" }
+  | { name: "stats" }
+  | { name: "history" }
+  | { name: "resume"; id: string; prompt?: string; detach: boolean } // cna resume <id> ["prompt"]
   | { name: "diff"; checkpoint?: number; stat: boolean } // --checkpoint <id>, --stat
   | { name: "todos" }
   | { name: "abort" }
@@ -39,11 +43,16 @@ export class UsageError extends Error {}
 
 /** Help text (Spanish), listing every command and option above, plus CNA_URL and CNA_TOKEN. */
 export const USAGE: string = `Uso:
-  cna run <owner/repo> "<prompt>" [--plan] [--base <rama>] [--model <proveedor/modelo>]
-                                  [--thinking <nivel>] [--auto-push] [--detach]
+  cna run <owner/repo> ["<prompt>"] [--pr <n>] [--plan] [--base <rama>]
+                                  [--model <proveedor/modelo>] [--thinking <nivel>]
+                                  [--auto-push] [--detach]
                                   Crea una sesión sobre el repo y abre el chat (o sale con --detach)
   cna chat                        Chat interactivo con la sesión actual (alias: attach)
   cna status                      Estado de la sesión actual
+  cna stats                       Tokens, coste y uso del contexto de la sesión actual
+  cna history                     Sesiones pasadas de esta réplica (la más reciente primero)
+  cna resume <id> ["<prompt>"] [--detach]
+                                  Reanuda una sesión del historial (id completo o su prefijo)
   cna diff [--checkpoint <id>] [--stat]
                                   Diff frente a la rama base (o frente a un checkpoint)
   cna todos                       Lista de tareas del agente
@@ -53,13 +62,18 @@ export const USAGE: string = `Uso:
   cna version                     Muestra la versión (también --version)
 
 Opciones de run:
+  --pr <n>            Trabaja sobre el PR n del repo, que debe ser un PR abierto del agente
+                      (rama agent/*). Con --pr el prompt es opcional
   --plan              Modo plan: el agente investiga y propone antes de editar
-  --base <rama>       Rama base (por defecto, la del repo)
+  --base <rama>       Rama base (por defecto, la del repo; con --pr no se admite)
   --model <proveedor/modelo>
                       Modelo a usar (por defecto, el configurado)
   --thinking <nivel>  Nivel de razonamiento: ${THINKING_LEVELS.join(", ")}
   --auto-push         Hace push y PR sin preguntar
   --detach            Crea la sesión y sale sin conectarse al chat
+
+Opciones de resume:
+  --detach            Reanuda la sesión y sale sin conectarse al chat
 
 Opciones de diff:
   --checkpoint <id>   Diff frente al checkpoint indicado (entero no negativo)
@@ -86,21 +100,25 @@ const REPO_PATTERN = /^[A-Za-z0-9][A-Za-z0-9-]*\/[A-Za-z0-9._-]+$/;
 /** Options accepted by any command. */
 const GLOBAL_OPTIONS = ["url", "no-color", "help", "version"] as const;
 
-/** Options accepted by each command, besides the global ones. */
-const COMMANDS: Record<string, { positionals: number; options: readonly string[] }> = {
+/** Positionals accepted by a command (inclusive range) and its options, besides the global ones. */
+const COMMANDS: Record<string, { min: number; max: number; options: readonly string[] }> = {
   run: {
-    positionals: 2,
-    options: ["plan", "base", "model", "thinking", "auto-push", "detach"],
+    min: 1,
+    max: 2,
+    options: ["pr", "plan", "base", "model", "thinking", "auto-push", "detach"],
   },
-  chat: { positionals: 0, options: [] },
-  attach: { positionals: 0, options: [] },
-  status: { positionals: 0, options: [] },
-  diff: { positionals: 0, options: ["checkpoint", "stat"] },
-  todos: { positionals: 0, options: [] },
-  abort: { positionals: 0, options: [] },
-  close: { positionals: 0, options: ["force"] },
-  help: { positionals: 0, options: [] },
-  version: { positionals: 0, options: [] },
+  chat: { min: 0, max: 0, options: [] },
+  attach: { min: 0, max: 0, options: [] },
+  status: { min: 0, max: 0, options: [] },
+  stats: { min: 0, max: 0, options: [] },
+  history: { min: 0, max: 0, options: [] },
+  resume: { min: 1, max: 2, options: ["detach"] },
+  diff: { min: 0, max: 0, options: ["checkpoint", "stat"] },
+  todos: { min: 0, max: 0, options: [] },
+  abort: { min: 0, max: 0, options: [] },
+  close: { min: 0, max: 0, options: ["force"] },
+  help: { min: 0, max: 0, options: [] },
+  version: { min: 0, max: 0, options: [] },
 };
 
 /** Table given to parseArgs: the union of every option, checked per command afterwards. */
@@ -109,6 +127,7 @@ const OPTIONS = {
   "no-color": { type: "boolean" },
   help: { type: "boolean", short: "h" },
   version: { type: "boolean" },
+  pr: { type: "string" },
   plan: { type: "boolean" },
   base: { type: "string" },
   model: { type: "string" },
@@ -160,11 +179,13 @@ export function parseCliArgs(
     throw new UsageError(`comando desconocido: ${word}`);
   }
   checkOptionsForCommand(word, spec.options, values);
-  checkPositionals(word, spec.positionals, rest.length);
+  checkPositionals(word, spec, rest.length);
 
   switch (word) {
     case "run":
       return { command: parseRun(values, rest), options };
+    case "resume":
+      return { command: parseResume(values, rest), options };
     case "chat":
     case "attach":
       return { command: { name: "chat" }, options };
@@ -173,6 +194,8 @@ export function parseCliArgs(
     case "close":
       return { command: { name: "close", force: values.force === true }, options };
     case "status":
+    case "stats":
+    case "history":
     case "todos":
     case "abort":
     case "help":
@@ -248,29 +271,47 @@ function checkOptionsForCommand(
   }
 }
 
-function checkPositionals(word: string, expected: number, actual: number): void {
-  if (word === "run") {
-    if (actual !== expected) {
-      throw new UsageError('uso: cna run <owner/repo> "<prompt>"');
-    }
+const RUN_USAGE = 'uso: cna run <owner/repo> ["<prompt>"] [--pr <n>]';
+const RESUME_USAGE = 'uso: cna resume <id> ["<prompt>"] [--detach]';
+
+/** Largest PR number accepted by --pr (the same bound as the API). */
+const MAX_PR_NUMBER = 1_000_000_000;
+
+/** Session ids from `cna history` (a UUID, or a prefix of one). */
+const RESUME_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9-]{0,127}$/;
+
+function checkPositionals(word: string, spec: { min: number; max: number }, actual: number): void {
+  if (actual >= spec.min && actual <= spec.max) {
     return;
   }
-  if (actual > 0) {
-    throw new UsageError(`«${word}» no admite argumentos`);
+  if (word === "run") {
+    throw new UsageError(RUN_USAGE);
   }
+  if (word === "resume") {
+    throw new UsageError(RESUME_USAGE);
+  }
+  throw new UsageError(`«${word}» no admite argumentos`);
 }
 
 function parseRun(
   values: Record<string, string | boolean | undefined>,
-  [repo, prompt]: string[],
+  [repo, second]: string[],
 ): Command {
-  if (repo === undefined || prompt === undefined) {
-    throw new UsageError('uso: cna run <owner/repo> "<prompt>"');
+  if (repo === undefined) {
+    throw new UsageError(RUN_USAGE);
+  }
+  const pr = prOption(values.pr);
+  // Without --pr the prompt is required; with --pr it is optional.
+  if (pr === undefined && second === undefined) {
+    throw new UsageError(RUN_USAGE);
   }
   if (!REPO_PATTERN.test(repo)) {
     throw new UsageError("el repositorio debe tener la forma <owner/repo>");
   }
-  if (prompt.trim() === "") {
+  if (pr !== undefined && values.base !== undefined) {
+    throw new UsageError("con --pr la rama base es la del PR");
+  }
+  if (second !== undefined && second.trim() === "") {
     throw new UsageError("el prompt no puede estar vacío");
   }
   const base = stringOption("base", values.base);
@@ -279,7 +320,8 @@ function parseRun(
   return {
     name: "run",
     repo,
-    prompt,
+    prompt: second,
+    pr,
     plan: values.plan === true,
     baseBranch: base,
     model,
@@ -287,6 +329,34 @@ function parseRun(
     autoPush: values["auto-push"] === true,
     detach: values.detach === true,
   };
+}
+
+function parseResume(
+  values: Record<string, string | boolean | undefined>,
+  [id, prompt]: string[],
+): Command {
+  if (id === undefined) {
+    throw new UsageError(RESUME_USAGE);
+  }
+  if (!RESUME_ID_PATTERN.test(id)) {
+    throw new UsageError("el id de la sesión no es válido; usa el que muestra cna history");
+  }
+  if (prompt !== undefined && prompt.trim() === "") {
+    throw new UsageError("el prompt no puede estar vacío");
+  }
+  return { name: "resume", id, prompt, detach: values.detach === true };
+}
+
+/** `--pr <n>`: an integer from 1 to MAX_PR_NUMBER, without sign or decimals. */
+function prOption(value: string | boolean | undefined): number | undefined {
+  if (value === undefined) {
+    return undefined;
+  }
+  const pr = typeof value === "string" && /^[0-9]+$/.test(value) ? Number(value) : Number.NaN;
+  if (!Number.isInteger(pr) || pr < 1 || pr > MAX_PR_NUMBER) {
+    throw new UsageError("--pr debe ser un número de PR");
+  }
+  return pr;
 }
 
 function parseDiff(values: Record<string, string | boolean | undefined>): Command {

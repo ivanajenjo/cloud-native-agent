@@ -134,6 +134,7 @@ function gatewayConfig(): GatewayConfig {
     webUiDir: join(root, "web-ui"),
     gitUserName: "Agent",
     gitUserEmail: "agent@example.invalid",
+    idleTimeoutMs: 1_800_000,
   };
 }
 

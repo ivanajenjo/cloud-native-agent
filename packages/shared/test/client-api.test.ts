@@ -64,6 +64,8 @@ const SESSION = {
   mode: "auto",
   autoPush: false,
   createdAt: "2026-01-01T00:00:00.000Z",
+  pr: null,
+  suspended: false,
   pendingQuestions: [],
 };
 
@@ -436,5 +438,100 @@ describe("followEvents", () => {
     }
     expect(items).toEqual([]);
     expect(fake.calls).toHaveLength(1);
+  });
+});
+
+const STATS = {
+  tokens: { input: 10, output: 5, cacheRead: 0, cacheWrite: 0, total: 15 },
+  cost: 0.001,
+  messages: { user: 1, assistant: 1, toolCalls: 0 },
+  context: { tokens: 15, window: 200000, percent: 0.01 },
+};
+
+const HISTORY_ENTRY = {
+  id: "s1",
+  repo: "octo/hello",
+  baseBranch: "main",
+  branch: "agent/s1",
+  pr: null,
+  mode: "auto",
+  model: null,
+  createdAt: "2026-01-01T00:00:00.000Z",
+  closedAt: "2026-01-02T00:00:00.000Z",
+  status: "closed",
+  stats: null,
+  resumable: true,
+};
+
+describe("ApiClient session stats, history and resume", () => {
+  it("GET /session/stats with Authorization and returns the stats", async () => {
+    const fake = fakeFetch(() => json(STATS));
+    const client = new ApiClient({ baseUrl: "http://h:1", token: "secret", fetch: fake.fetch });
+    await expect(client.stats()).resolves.toEqual(STATS);
+    const call = fake.calls[0] as RecordedCall;
+    expect(call.url).toBe("http://h:1/session/stats");
+    expect(call.init?.method).toBe("GET");
+    expect(header(call, "authorization")).toBe("Bearer secret");
+  });
+
+  it("GET /session/history and unwraps .sessions", async () => {
+    const fake = fakeFetch(() => json({ sessions: [HISTORY_ENTRY] }));
+    const client = new ApiClient({ baseUrl: "http://h:1", token: "secret", fetch: fake.fetch });
+    await expect(client.history()).resolves.toEqual([HISTORY_ENTRY]);
+    const call = fake.calls[0] as RecordedCall;
+    expect(call.url).toBe("http://h:1/session/history");
+    expect(call.init?.method).toBe("GET");
+    expect(header(call, "authorization")).toBe("Bearer secret");
+  });
+
+  it("POST /session/history/:id/resume sends {} by default and returns the session", async () => {
+    const fake = fakeFetch(() => json(SESSION, 201));
+    const client = new ApiClient({ baseUrl: "http://h:1", token: "secret", fetch: fake.fetch });
+    await expect(client.resumeSession("s1")).resolves.toEqual(SESSION);
+    const call = fake.calls[0] as RecordedCall;
+    expect(call.url).toBe("http://h:1/session/history/s1/resume");
+    expect(call.init?.method).toBe("POST");
+    expect(header(call, "authorization")).toBe("Bearer secret");
+    expect(header(call, "content-type")).toBe("application/json");
+    expect(call.init?.body).toBe("{}");
+  });
+
+  it("POST /session/history/:id/resume sends the prompt", async () => {
+    const fake = fakeFetch(() => json(SESSION, 201));
+    const client = new ApiClient({ baseUrl: "", fetch: fake.fetch });
+    await client.resumeSession("s1", { prompt: "sigue" });
+    const call = fake.calls[0] as RecordedCall;
+    expect(call.url).toBe("/session/history/s1/resume");
+    expect(JSON.parse(String(call.init?.body))).toEqual({ prompt: "sigue" });
+  });
+
+  it("encodes the history id in resumeSession", async () => {
+    const fake = fakeFetch(() => json(SESSION, 201));
+    const client = new ApiClient({ baseUrl: "", fetch: fake.fetch });
+    await client.resumeSession("a/b");
+    expect(fake.calls[0]?.url).toBe("/session/history/a%2Fb/resume");
+  });
+
+  it("maps a 404 history_not_found to ApiClientError", async () => {
+    const client = new ApiClient({
+      baseUrl: "",
+      fetch: fakeFetch(() => json({ error: "history_not_found", message: "no" }, 404)).fetch,
+    });
+    await expect(client.resumeSession("nope")).rejects.toBeInstanceOf(ApiClientError);
+    await expect(client.resumeSession("nope")).rejects.toMatchObject({
+      status: 404,
+      code: "history_not_found",
+      message: "no",
+    });
+  });
+
+  it("maps a 409 session_exists to ApiClientError", async () => {
+    const client = new ApiClient({
+      baseUrl: "",
+      fetch: fakeFetch(() => json({ error: "session_exists", message: "busy" }, 409)).fetch,
+    });
+    const error = await client.resumeSession("s1").catch((caught: unknown) => caught);
+    expect(error).toBeInstanceOf(ApiClientError);
+    expect(error).toMatchObject({ status: 409, code: "session_exists", message: "busy" });
   });
 });

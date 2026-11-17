@@ -75,6 +75,9 @@ ejecutar tests y subir los cambios. Se controla por API REST, una web UI sencill
   lectura en los dos contenedores para que `edge` permita los proveedores sin fiarse del agente.
 - **Servicios auxiliares** (ADR-0009). `notifications.yaml` y `web.yaml` siguen el mismo
   camino: solo lectura en los dos contenedores, y `edge` permite sus hosts.
+- **Persistencia y reanudación** (ADR-0011). Pi arranca con `--session-id` igual al id de la
+  sesión; el gateway guarda su estado en `/data/state`, reanuda tras un reinicio, suspende Pi por
+  inactividad y lleva un historial de sesiones. Solo se trabaja sobre PRs propios (`agent/*`).
 - **Web UI y CLI** (ADR-0010). Cliente común en `@cna/shared/client`; web estática sin
   framework (build con Vite) servida por el gateway en `/ui/` con CSP estricta; el contenido
   del agente se pinta siempre como texto. El CLI lee el token solo de `CNA_TOKEN`.
@@ -94,7 +97,8 @@ GET    /health
 GET    /models                          modelos/proveedores configurados
 GET    /session                         sesión actual (o 404)
 POST   /session                         {repo, baseBranch?, prompt, model?, thinking?,
-                                         mode?: "plan"|"auto", autoPush?}
+                                         mode?: "plan"|"auto", autoPush?, pr?}
+                                        con pr, prompt es opcional (ADR-0011)
                                         409 si la réplica ya está ocupada
 GET    /session/events                  SSE con replay (Last-Event-ID)
 GET    /session/messages                conversación completa (para reconstruir la UI)
@@ -106,6 +110,9 @@ POST   /session/abort                   aborta el turno y cancela las preguntas 
 GET    /session/todos                   lista de tareas actual del agente
 GET    /session/diff                    diff frente a la rama base (?checkpoint=id)
 GET    /session/checkpoints             snapshots por ejecución
+GET    /session/stats                   tokens, coste y uso del contexto (Pi get_session_stats)
+GET    /session/history                 sesiones de la réplica, la más reciente primero
+POST   /session/history/:id/resume      {prompt?} reanuda una sesión cerrada (409 si hay otra)
 POST   /session/checkpoints/:id/restore {conversation?: boolean}
 DELETE /session                         cierra y limpia el workspace. 409 si hay cambios
                                         sin subir, salvo ?force=true
@@ -129,14 +136,15 @@ expondría `/sessions/:id` y redirigiría a la réplica correspondiente.
 - `waiting_input` mientras haya **al menos una** pregunta pendiente; puede haber varias a
   la vez porque Pi ejecuta tools en paralelo.
 - Fallo al clonar o muerte del proceso Pi → `error`, con el motivo en el evento `status`.
-- Hasta la fase 4, un reinicio del contenedor pierde la sesión: el gateway arranca en
-  `idle` y conserva el workspace anterior hasta que se crea una sesión nueva.
+- Un reinicio del contenedor reanuda la sesión desde disco (ADR-0011): Pi vuelve a abrir su
+  conversación y la sesión queda en `ready`; la ejecución en curso y las preguntas pendientes se
+  pierden.
 
 **Eventos SSE** (normalizados desde los eventos RPC de Pi y del proxy):
 `status`, `message_delta`, `thinking_delta`, `message`, `tool_start`, `tool_update`,
 `tool_end`, `question`, `question_resolved`, `network`, `todo`, `checkpoint`
 (`action: created|restored`), `mode` (al aprobar el plan), `compaction`, `retry`, `notify`,
-`error`.
+`error`, `history` (conversación al reanudar).
 - Pi solo envía deltas en `message_update`; el mensaje definitivo es el de `message_end`.
 - `question.kind`: `ask_user`, `confirm` (push/PR), `plan` (*aprobar*, *pedir cambios*) o
   `network` (*permitir esta vez*, *permitir siempre*, *denegar*).
@@ -215,7 +223,7 @@ providers:
 | 4 | **Checkpoints y deshacer** | 2 | El gateway crea un snapshot git al terminar cada ejecución con cambios. Restaura ficheros y, opcionalmente, la conversación (`fork` de Pi). |
 | 5 | **Notificaciones push** | 2 | El gateway avisa cuando la sesión pasa a `waiting_input`, termina o falla. Proveedor configurable: **ntfy** (autoalojable) o Telegram. `config/notifications.yaml`; el host entra en la allowlist automáticamente. |
 | 6 | **Instrucciones del proyecto** | 1 | Pi carga el `AGENTS.md`/`CLAUDE.md` del repo. Añadimos un `AGENTS.md` global en el directorio de configuración de Pi. |
-| 7 | **Trabajar sobre un PR existente** | 4 | `POST /session` con `pr: <número>`: checkout de la rama del PR; el agente lee los comentarios de revisión con `gh` y los atiende; push a la misma rama. |
+| 7 | **Trabajar sobre un PR existente** | 4 | `POST /session` con `pr: <número>`: checkout de la rama del PR; el agente lee los comentarios de revisión con `gh` y los atiende; push a la misma rama. Solo PRs abiertos del propio agente (rama `agent/*`, ADR-0011). |
 | 8 | **Procesos en segundo plano** | Backlog | Tool `bash_bg` (`start`, `logs`, `stop`, `list`). Limitado a 1–2 procesos por la RAM de la Pi. |
 | 9 | **Tokens y coste por sesión** | 4 | `get_session_stats` de Pi expuesto en `GET /session/stats`. |
 | 10 | **Historial de sesiones** | 4 | Listar y retomar sesiones pasadas de la réplica. |
@@ -396,6 +404,8 @@ el build de Vite servido por un backend falso, no dentro del contenedor.
   checkpoints, panel de conexiones de red, botón de abortar.
 
 ### Fase 4 — Persistencia y robustez
+Hecha (ADR-0011), salvo la comprobación con las imágenes construidas (límites de recursos del
+compose) y el trabajo sobre PR contra GitHub real (probado con un `gh` falso).
 - Reanudar sesión tras reinicio del contenedor (JSONL de Pi + estado en disco).
 - Timeouts de inactividad, límites de recursos, limpieza de workspace.
 - Trabajar sobre un PR existente (7), tokens y coste por sesión (9), historial de sesiones (10).

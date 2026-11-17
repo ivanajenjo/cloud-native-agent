@@ -44,14 +44,24 @@ export const CreateSessionRequestSchema = z
       .refine((value) => !/\/\.{1,2}$/.test(value), "invalid repository name"),
     /** Validated as a git branch name by the gateway. Default: the remote's default branch. */
     baseBranch: z.string().min(1).max(200).optional(),
-    prompt: z.string().min(1),
+    /** Required unless `pr` is set: then the gateway adds the PR instructions (ADR-0011). */
+    prompt: z.string().min(1).optional(),
+    /**
+     * Work on an existing pull request of `repo` instead of a new agent/<slug> branch (feature 7).
+     * Only open PRs from the same repository whose head branch is `agent/*` (ADR-0011).
+     */
+    pr: z.number().int().min(1).max(1_000_000_000).optional(),
     model: ModelRefSchema.optional(),
     thinking: ThinkingLevelSchema.optional(),
     /** Default "auto". "plan": read-only until the user approves a plan (`question{kind:"plan"}`). */
     mode: SessionModeSchema.optional(),
     autoPush: z.boolean().optional(),
   })
-  .strict();
+  .strict()
+  .refine((body) => body.prompt !== undefined || body.pr !== undefined, {
+    message: "prompt is required unless pr is set",
+    path: ["prompt"],
+  });
 export type CreateSessionRequest = z.infer<typeof CreateSessionRequestSchema>;
 
 export const PostMessageRequestSchema = z
@@ -100,6 +110,13 @@ export interface SessionInfo {
   autoPush: boolean;
   /** ISO 8601. */
   createdAt: string;
+  /** Pull request the session works on (feature 7), or null for a new agent/<slug> branch. */
+  pr: number | null;
+  /**
+   * True while Pi is stopped to save memory (inactivity, or after a gateway restart): the session
+   * keeps its state and Pi starts again, resuming the conversation, on the next request that needs it.
+   */
+  suspended: boolean;
   /** Reason of the `error` status. */
   error?: string;
   pendingQuestions: Question[];
@@ -142,6 +159,7 @@ export type ApiErrorCode =
   | "checkpoint_not_found"
   | "mode_not_supported"
   | "unknown_model"
+  | "history_not_found"
   | "unauthorized"
   | "bad_gateway"
   | "internal_error";
@@ -149,4 +167,17 @@ export type ApiErrorCode =
 export interface ApiError {
   error: ApiErrorCode;
   message?: string;
+}
+
+/**
+ * Body of `GET /session/stats` (feature 9), from Pi's `get_session_stats`. Tokens and cost cover the
+ * whole conversation, also before a gateway restart (Pi keeps them in its session file).
+ */
+export interface SessionStats {
+  tokens: { input: number; output: number; cacheRead: number; cacheWrite: number; total: number };
+  /** In the provider's currency (USD for the built-in providers); 0 when the model has no price. */
+  cost: number;
+  messages: { user: number; assistant: number; toolCalls: number };
+  /** Current context window usage; null when Pi does not know it. `tokens`/`percent` are null right after a compaction. */
+  context: { tokens: number | null; window: number; percent: number | null } | null;
 }

@@ -1,5 +1,6 @@
 import { randomUUID } from "node:crypto";
-import { rm } from "node:fs/promises";
+import { access, mkdir, rm } from "node:fs/promises";
+import { dirname, join } from "node:path";
 import {
   ACTIVE_SESSION_STATUSES,
   type AnswerRequest,
@@ -7,6 +8,7 @@ import {
   type CreateSessionRequest,
   type DiffResponse,
   type DiffSource,
+  type HistoryEntry,
   NETWORK_QUESTION_ID_PREFIX,
   type NetworkLogEntry,
   type PiMessage,
@@ -16,8 +18,10 @@ import {
   type Question,
   type QuestionOutcome,
   type RestoreCheckpointResponse,
+  type ResumeSessionRequest,
   type SessionEvent,
   type SessionInfo,
+  type SessionStats,
   type SessionStatus,
   type SetModelRequest,
   type TodoItem,
@@ -42,10 +46,18 @@ import {
 import {
   GitError,
   type GitRunner,
+  type PreparedWorkspace,
+  prepareResumeWorkspace,
   prepareWorkspace,
   slugify,
   workspaceState,
 } from "../workspace/git.js";
+import {
+  type GhRunner,
+  type PullRequestInfo,
+  preparePrWorkspace,
+  resolvePullRequest,
+} from "../workspace/pr.js";
 import {
   deleteCheckpointRefsAfter,
   diffWorkingTree,
@@ -54,10 +66,13 @@ import {
   saveCheckpointRef,
   snapshotWorkingTree,
 } from "../workspace/snapshot.js";
+import type { HistoryRecord, HistoryStore } from "./history.js";
 import { normalizeRpcEvent, uiRequestToNotify, uiRequestToQuestion } from "./normalize.js";
 import { PendingQuestions } from "./pending-questions.js";
+import type { PersistedSession, SessionStateStore } from "./persistence.js";
 import { answerToUiResponse, outcomeOfAnswer } from "./questions.js";
 import { SessionError, type SessionService } from "./service.js";
+import { parseSessionStats } from "./stats.js";
 
 /** What the manager needs from a running Pi (RpcBridge implements it). */
 export interface PiProcess {
@@ -95,21 +110,50 @@ export interface SessionManagerOptions {
   remoteBase?: string;
   /** Push notifications of status changes (ADR-0009). Absent: no notifications. */
   notifier?: Notifier;
+  /** Runs gh for sessions on a pull request (feature 7, ADR-0011 §9). Absent: `pr` is refused. */
+  gh?: GhRunner;
+  /**
+   * Milliseconds without activity after which an idle `ready` session stops Pi (ADR-0011 §5).
+   * Absent or 0: Pi is never suspended.
+   */
+  idleTimeoutMs?: number;
+  /**
+   * Stores the session state Pi does not keep (ADR-0011 §2) and recovers it in restore(). Absent:
+   * nothing is saved nor recovered.
+   */
+  stateStore?: SessionStateStore;
   /** Default console. Receives only redacted text. */
   logger?: { info(message: string): void; error(message: string): void };
   now?: () => Date;
   /** Default randomUUID. */
   newId?: () => string;
+  /**
+   * Sessions of this replica (feature 10, ADR-0011 §6). Absent: nothing is recorded and nothing can be
+   * resumed.
+   */
+  history?: HistoryStore;
 }
 
 /** Timeout of `abort`: Pi answers only once the session is idle again. */
 const ABORT_TIMEOUT_MS = 60_000;
+/** Timeout of the last stats read before a close: best effort, the close does not wait long for it. */
+const CLOSE_STATS_TIMEOUT_MS = 5_000;
 /** Max length of a stderr line of Pi that reaches the logger. */
 const MAX_LOGGED_LINE_LENGTH = 500;
 const PROMPT_DISPOSITIONS: readonly PromptDisposition[] = ["started", "queued", "handled"];
 const MESSAGE_STATUSES: readonly SessionStatus[] = ["running", "waiting_input", "ready"];
 /** Max length of the message of a push notification (after redaction). */
 const MAX_NOTIFICATION_MESSAGE_LENGTH = 300;
+/** Warning sent after a restart that lost a run or pending questions (ADR-0011 §3). */
+const LOST_RUN_MESSAGE =
+  "La ejecución en curso o las preguntas pendientes se perdieron al reiniciar el gateway; vuelve a pedírselo al agente.";
+
+/** Where a resumed session is cloned from (its history record). */
+interface ResumeSource {
+  repo: string;
+  baseBranch: string;
+  branch: string;
+}
 
 /** A checkpoint plus what restoring its conversation needs (ADR-0007, point 3). */
 interface CheckpointRecord {
@@ -168,6 +212,24 @@ export class SessionManager implements SessionService {
   private checkpointQueue: Promise<void> = Promise.resolve();
   /** True while a checkpoint is being restored: no new prompt or restore may start meanwhile. */
   private restoring = false;
+  /** Number of run checkpoints queued or being taken. The idle suspension waits for them. */
+  private checkpointJobs = 0;
+  /** Stop of a Pi that the idle suspension is stopping. A new Pi starts only after it. */
+  private suspension: Promise<void> | undefined;
+  /** Timer of the idle suspension, if armed (ADR-0011 §5). */
+  private idleTimer: ReturnType<typeof setTimeout> | undefined;
+  private readonly idleTimeoutMs: number;
+  /** Last history entry written by recordHistory(), as JSON: unchanged entries are not written again. */
+  private lastHistoryKey: string | undefined;
+  /** Set by shutdown(): no Pi may start any more. */
+  private shuttingDown = false;
+  /**
+   * Last token usage and cost read from Pi (ADR-0011 §8), kept in the history. Null until read. Reset by
+   * create() and close(); resume() starts with the stats of the history.
+   */
+  private lastStats: SessionStats | null = null;
+  /** State and history writes not finished yet. shutdown() waits for them, so a stop never races the files. */
+  private readonly pendingWrites = new Set<Promise<void>>();
 
   constructor(options: SessionManagerOptions) {
     this.options = options;
@@ -179,14 +241,189 @@ export class SessionManager implements SessionService {
     };
     this.now = options.now ?? (() => new Date());
     this.newId = options.newId ?? randomUUID;
+    this.idleTimeoutMs = options.idleTimeoutMs ?? 0;
   }
 
   /** Stops Pi if running (used on gateway shutdown). Does not delete the workspace. */
   async shutdown(): Promise<void> {
+    this.shuttingDown = true;
+    this.clearIdleTimer();
+    // A run checkpoint may still be writing in the workspace's .git: let it finish first.
+    await this.checkpointQueue;
     const pi = this.pi;
     this.pi = null;
     if (pi !== null) {
       await this.stopPiQuietly(pi);
+    }
+    // State and history writes are fire-and-forget during the session: they are waited for here.
+    await Promise.all([...this.pendingWrites]);
+  }
+
+  /**
+   * Recovers the session saved before a gateway restart (ADR-0011 §3). Called once, before the gateway
+   * serves requests. Never throws: a failure is logged, and a session that cannot go on ends in `error`.
+   */
+  async restore(): Promise<void> {
+    const store = this.options.stateStore;
+    if (store === undefined) {
+      return;
+    }
+    try {
+      const state = await store.load();
+      if (state === null) {
+        // Without saved state there is no session to resume (ADR-0011 §3).
+        await this.removeWorkspaceQuietly();
+        return;
+      }
+      const discardReason = await this.discardReasonOf(state);
+      if (discardReason !== null) {
+        await this.removeWorkspaceQuietly();
+        await this.clearStateQuietly();
+        this.logger.info(`session state discarded: ${discardReason}`);
+        return;
+      }
+
+      this.adoptState(state);
+      // The stats of the last run survive the restart: the next record must not overwrite them with null.
+      this.lastStats = this.options.history?.get(state.info.id)?.stats ?? null;
+      const info = this.info;
+      if (info === null) {
+        return;
+      }
+      if (info.status === "cloning") {
+        this.setStatus("error", "the gateway restarted while the repository was being cloned");
+      } else if (info.status === "error") {
+        // Already failed: the status goes out again so that the replay shows why.
+        this.emit(
+          info.error === undefined
+            ? { type: "status", status: "error" }
+            : { type: "status", status: "error", error: info.error },
+        );
+      } else {
+        const lostRun = state.info.status === "running" || state.info.status === "waiting_input";
+        await this.resumePi(info.id, lostRun);
+      }
+      this.persist();
+    } catch (error) {
+      this.logger.error(`session restore: ${this.redactor.redactString(errorMessage(error))}`);
+    }
+  }
+
+  /** Why a saved state must not be resumed, or null if it can be. Checks the workspace repository too. */
+  private async discardReasonOf(state: PersistedSession): Promise<string | null> {
+    if (state.info.status === "closed") {
+      return "the session was closed";
+    }
+    if (!(await pathExists(join(this.options.workspaceDir, ".git")))) {
+      return "the workspace has no repository";
+    }
+    return null;
+  }
+
+  /** Makes the saved state the in-memory session. Pi is not started here. */
+  private adoptState(state: PersistedSession): void {
+    this.info = { ...state.info, suspended: false, pendingQuestions: [] };
+    this.todoList = state.todos.map((item) => ({ ...item }));
+    this.checkpointList = state.checkpoints.map((record) => ({
+      checkpoint: { ...record.checkpoint },
+      tree: record.tree,
+      forkIndex: record.forkIndex,
+      todos: record.todos.map((item) => ({ ...item })),
+    }));
+    this.baselineTree = state.baselineTree;
+    this.settled = true;
+  }
+
+  /**
+   * Starts Pi on the restored session with the same id, so Pi reopens the conversation, and sends the
+   * conversation as `history`. A run or pending questions of the previous process are lost: `lostRun`
+   * adds a warning. Failures end in `error`; this never throws.
+   */
+  private async resumePi(sessionId: string, lostRun: boolean): Promise<void> {
+    let pi: PiProcess;
+    try {
+      pi = this.launchPi(sessionId);
+    } catch (error) {
+      this.setStatus("error", this.redactor.redactString(errorMessage(error)));
+      return;
+    }
+    this.pi = pi;
+    const info = this.current(sessionId);
+    if (info === null) {
+      return;
+    }
+    // Not setStatus: a `ready` session stays `ready`, and no push notification says "finished" for a
+    // run that was lost.
+    info.status = "ready";
+    this.emit({ type: "status", status: "ready" });
+    this.armIdleTimer();
+
+    await this.sendHistory(pi);
+    if (lostRun) {
+      this.emit({ type: "notify", level: "warning", message: LOST_RUN_MESSAGE });
+    }
+  }
+
+  /** Sends the conversation of Pi as a `history` event (replay of a session that is reopened). Never throws. */
+  private async sendHistory(pi: PiProcess): Promise<void> {
+    let messages: PiMessage[] = [];
+    try {
+      const data = await pi.send({ type: "get_messages" });
+      const list: unknown = isRecord(data) ? data.messages : undefined;
+      messages = Array.isArray(list) ? (list as PiMessage[]) : [];
+    } catch (error) {
+      this.logger.error(
+        `history: get_messages: ${this.redactor.redactString(errorMessage(error))}`,
+      );
+    }
+    this.emit({ type: "history", messages });
+  }
+
+  /**
+   * Writes the state Pi does not keep (ADR-0011 §2). Called after every change of it. Never throws and
+   * never waits: a failed write is logged. Nothing is written once the session is closed.
+   */
+  private persist(): void {
+    this.recordHistory();
+    const store = this.options.stateStore;
+    const info = this.info;
+    if (store === undefined || info === null || info.status === "closed") {
+      return;
+    }
+    // Only the fields that survive a restart: questions and suspension live in memory.
+    const { pendingQuestions: _pendingQuestions, suspended: _suspended, ...saved } = info;
+    const state: PersistedSession = {
+      version: 1,
+      info: { ...saved },
+      todos: this.todoList.map((item) => ({ ...item })),
+      checkpoints: this.checkpointList.map((record) => ({
+        checkpoint: { ...record.checkpoint },
+        tree: record.tree,
+        forkIndex: record.forkIndex,
+        todos: record.todos.map((item) => ({ ...item })),
+      })),
+      baselineTree: this.baselineTree,
+    };
+    this.trackWrite(
+      store.save(state).catch((error: unknown) => {
+        this.logger.error(`session state: ${this.redactor.redactString(errorMessage(error))}`);
+      }),
+    );
+  }
+
+  /** Keeps a never-rejecting write until it ends, so shutdown() can wait for it. */
+  private trackWrite(write: Promise<void>): Promise<void> {
+    this.pendingWrites.add(write);
+    void write.finally(() => this.pendingWrites.delete(write));
+    return write;
+  }
+
+  /** Removes the saved state. A failure is logged and does not reject. */
+  private async clearStateQuietly(): Promise<void> {
+    try {
+      await this.options.stateStore?.clear();
+    } catch (error) {
+      this.logger.error(`session state: ${this.redactor.redactString(errorMessage(error))}`);
     }
   }
 
@@ -195,44 +432,37 @@ export class SessionManager implements SessionService {
   }
 
   async create(request: CreateSessionRequest): Promise<SessionInfo> {
-    const previous = this.info;
-    if (
-      previous !== null &&
-      (this.closing || (previous.status !== "error" && previous.status !== "closed"))
-    ) {
-      throw new SessionError("session_exists");
+    if (request.pr === undefined && request.prompt === undefined) {
+      throw new SessionError("invalid_request", "prompt is required unless pr is set");
     }
-
-    // A previous session in error is discarded. Its Pi, if still alive, stops before the new clone.
-    let stopping: Promise<void> | undefined;
-    if (previous !== null) {
-      const previousPi = this.pi;
-      this.pi = null;
-      stopping = previousPi !== null ? this.stopPiQuietly(previousPi) : undefined;
-      this.questions.discardAll();
+    if (request.pr !== undefined && this.options.gh === undefined) {
+      throw new SessionError(
+        "invalid_request",
+        "pull requests are not supported: gh is not available",
+      );
     }
-    // A new session starts with an empty replay buffer, also after a close (ids keep growing).
-    this.events.clear();
-    this.todoList = [];
-    this.checkpointList = [];
-    this.baselineTree = null;
-    this.checkpointQueue = Promise.resolve();
+    this.assertNoActiveSession();
+    const stopping = this.resetSessionState();
 
     const info: SessionInfo = {
       id: this.newId(),
       status: "cloning",
       repo: request.repo,
-      baseBranch: request.baseBranch ?? null,
+      // A PR session works on the base of the PR, known once start() resolves it.
+      baseBranch: request.pr !== undefined ? null : (request.baseBranch ?? null),
       branch: null,
       model: request.model ?? this.options.defaultModel ?? null,
       thinking: request.thinking ?? null,
       mode: request.mode ?? "auto",
       autoPush: request.autoPush ?? false,
       createdAt: this.now().toISOString(),
+      pr: request.pr ?? null,
+      suspended: false,
       pendingQuestions: [],
     };
     this.info = info;
     this.settled = true;
+    this.persist();
     this.emit({ type: "status", status: "cloning" });
 
     const sessionId = info.id;
@@ -249,10 +479,80 @@ export class SessionManager implements SessionService {
     return this.snapshot(info);
   }
 
+  /** Sessions of this replica, newest first (ADR-0011 §6). Empty without a history. */
+  async history(): Promise<HistoryEntry[]> {
+    const history = this.options.history;
+    return history === undefined ? [] : history.list();
+  }
+
+  /**
+   * Resumes a closed session of the history (ADR-0011 §7): the repo is cloned again on the session's
+   * branch and Pi reopens the conversation with the same id. Returns at once; the rest runs in the
+   * background, like create().
+   */
+  async resume(id: string, request: ResumeSessionRequest): Promise<SessionInfo> {
+    this.assertNoActiveSession();
+    const history = this.options.history;
+    const record = history?.get(id);
+    if (history === undefined || record === undefined) {
+      throw new SessionError("history_not_found");
+    }
+    if (record.closedAt === null || record.branch === null || record.baseBranch === null) {
+      throw new SessionError("invalid_state", "this session cannot be resumed");
+    }
+    if (!(await history.hasPiSession(id))) {
+      throw new SessionError(
+        "invalid_state",
+        "the conversation of this session is no longer on disk",
+      );
+    }
+    // Checked again: the await above lets another request create a session.
+    this.assertNoActiveSession();
+    const stopping = this.resetSessionState();
+
+    const info: SessionInfo = {
+      id: record.id,
+      status: "cloning",
+      repo: record.repo,
+      baseBranch: record.baseBranch,
+      branch: record.branch,
+      model: record.model,
+      thinking: null,
+      mode: record.mode,
+      autoPush: false,
+      createdAt: record.createdAt,
+      pr: record.pr,
+      suspended: false,
+      pendingQuestions: [],
+    };
+    this.info = info;
+    this.settled = true;
+    this.lastStats = record.stats;
+    this.persist();
+    this.emit({ type: "status", status: "cloning" });
+
+    const source: ResumeSource = {
+      repo: record.repo,
+      baseBranch: record.baseBranch,
+      branch: record.branch,
+    };
+    const job = this.workspaceQueue.then(async () => {
+      await stopping;
+      await this.cloneAndReopen(record.id, source, request);
+    });
+    this.workspaceQueue = job.catch(() => undefined);
+    void job.catch((error: unknown) => {
+      this.logger.error(`session ${record.id}: ${this.redactor.redactString(errorMessage(error))}`);
+    });
+
+    return this.snapshot(info);
+  }
+
   todos(): TodoItem[] {
     if (this.info === null) {
       throw new SessionError("no_session");
     }
+    this.markActivity();
     return this.todoList.map((item) => ({ ...item }));
   }
 
@@ -261,8 +561,8 @@ export class SessionManager implements SessionService {
     if (info === null) {
       throw new SessionError("no_session");
     }
-    const pi = this.pi;
-    if (pi === null || !MESSAGE_STATUSES.includes(info.status)) {
+    this.markActivity();
+    if (!MESSAGE_STATUSES.includes(info.status)) {
       throw new SessionError("invalid_state");
     }
     // A checkpoint being taken must not count the message sent next (its forkIndex).
@@ -271,6 +571,7 @@ export class SessionManager implements SessionService {
       throw new SessionError("invalid_state", "a checkpoint is being restored");
     }
 
+    const pi = await this.ensurePi();
     const command: RpcCommandInput = this.settled
       ? { type: "prompt", message: request.text }
       : {
@@ -294,6 +595,7 @@ export class SessionManager implements SessionService {
     if (this.info === null) {
       throw new SessionError("no_session");
     }
+    this.markActivity();
     const entry = this.questions.get(questionId);
     if (entry?.source === "pi") {
       const check = answerToUiResponse(entry.question, answer);
@@ -324,10 +626,7 @@ export class SessionManager implements SessionService {
     if (info === null) {
       throw new SessionError("no_session");
     }
-    const pi = this.pi;
-    if (pi === null) {
-      throw new SessionError("invalid_state");
-    }
+    this.markActivity();
     // Provider and model id are split at the first "/": model ids may contain "/" and ":".
     const slash = request.model.indexOf("/");
     if (slash <= 0) {
@@ -335,6 +634,8 @@ export class SessionManager implements SessionService {
     }
     const provider = request.model.slice(0, slash);
     const modelId = request.model.slice(slash + 1);
+    // Validated first: a malformed model must not start a suspended Pi.
+    const pi = await this.ensurePi();
 
     try {
       await pi.send({ type: "set_model", provider, modelId });
@@ -355,12 +656,14 @@ export class SessionManager implements SessionService {
     if (request.thinking !== undefined) {
       info.thinking = request.thinking;
     }
+    this.persist();
   }
 
   async abort(): Promise<void> {
     if (this.info === null) {
       throw new SessionError("no_session");
     }
+    this.markActivity();
     for (const question of this.questions.list()) {
       if (this.questions.get(question.id)?.source !== "pi") {
         continue;
@@ -386,20 +689,37 @@ export class SessionManager implements SessionService {
     if (this.info === null) {
       throw new SessionError("no_session");
     }
-    const pi = this.pi;
-    if (pi === null) {
-      throw new SessionError("invalid_state");
-    }
+    this.markActivity();
+    const pi = await this.ensurePi();
     const data = await this.sendToPi(pi, { type: "get_messages" });
     const list: unknown = isRecord(data) ? data.messages : undefined;
     const messages = Array.isArray(list) ? (list as PiMessage[]) : [];
     return this.redactor.redact(messages);
   }
 
+  /** Token usage and cost of the session (Pi get_session_stats, ADR-0011 §8). Starts Pi if suspended. */
+  async stats(): Promise<SessionStats> {
+    const info = this.info;
+    if (info === null) {
+      throw new SessionError("no_session");
+    }
+    if (info.status === "cloning") {
+      throw new SessionError("invalid_state", "the workspace is still being cloned");
+    }
+    this.markActivity();
+    const pi = await this.ensurePi();
+    const stats = parseSessionStats(await this.sendToPi(pi, { type: "get_session_stats" }));
+    if (stats === null) {
+      throw new SessionError("invalid_state", "Pi did not return session stats");
+    }
+    return stats;
+  }
+
   checkpoints(): Checkpoint[] {
     if (this.info === null) {
       throw new SessionError("no_session");
     }
+    this.markActivity();
     return this.checkpointList.map((record) => ({ ...record.checkpoint }));
   }
 
@@ -417,6 +737,7 @@ export class SessionManager implements SessionService {
     if (started === null) {
       throw new SessionError("no_session");
     }
+    this.markActivity();
     await this.checkpointQueue;
     if (!this.isCurrent(started.id)) {
       throw new SessionError("no_session");
@@ -435,24 +756,20 @@ export class SessionManager implements SessionService {
       throw new SessionError("invalid_state", "a checkpoint is being restored");
     }
     // Checked before anything is touched: a restore that cannot fork must not move the files.
-    const pi = this.pi;
-    if (options.conversation) {
-      if (pi === null) {
-        throw new SessionError("invalid_state", "Pi is not running");
-      }
-      if (record.forkIndex < 0) {
-        throw new SessionError(
-          "invalid_state",
-          "the conversation position of this checkpoint is unknown",
-        );
-      }
+    if (options.conversation && record.forkIndex < 0) {
+      throw new SessionError(
+        "invalid_state",
+        "the conversation position of this checkpoint is unknown",
+      );
     }
 
     const git = this.options.git;
     const dir = this.options.workspaceDir;
     this.restoring = true;
     try {
-      if (pi !== null && options.conversation) {
+      if (options.conversation) {
+        // Starts Pi if it is suspended: the fork needs it. Files are not touched before that.
+        const pi = await this.ensurePi();
         await this.restoreFilesAndConversation(pi, record);
       } else {
         await restoreWorkingTree(git, dir, record.checkpoint.commit);
@@ -464,6 +781,7 @@ export class SessionManager implements SessionService {
         this.todoList = record.todos.map((item) => ({ ...item }));
         this.emit({ type: "todo", todos: this.todoList });
       }
+      this.persist();
     } catch (error) {
       if (error instanceof GitError || error instanceof RpcCommandError) {
         throw new SessionError("invalid_state", this.redactor.redactString(errorMessage(error)));
@@ -490,6 +808,7 @@ export class SessionManager implements SessionService {
     if (info === null) {
       throw new SessionError("no_session");
     }
+    this.markActivity();
     const baseBranch = info.baseBranch;
     if (info.status === "cloning" || baseBranch === null || info.branch === null) {
       throw new SessionError("invalid_state", "the workspace is not ready for a diff");
@@ -532,23 +851,36 @@ export class SessionManager implements SessionService {
     if (info === null || this.closing) {
       throw new SessionError("no_session");
     }
+    this.markActivity();
     this.closing = true;
     try {
       if (!options.force && info.status !== "cloning") {
         await this.checkWorkspaceState(info);
       }
+      this.clearIdleTimer();
+      // A run checkpoint may still be snapshotting the workspace that is about to be deleted.
+      await this.checkpointQueue;
       const pi = this.pi;
       this.pi = null;
       if (pi !== null) {
+        // Best effort: the last stats of the conversation go to the history before Pi stops.
+        const stats = await this.readStats(pi, CLOSE_STATS_TIMEOUT_MS);
+        if (stats !== null) {
+          this.lastStats = stats;
+        }
         await this.stopPiQuietly(pi);
       }
       this.questions.resolveAll("cancelled");
       await rm(this.options.workspaceDir, { recursive: true, force: true });
+      await this.clearStateQuietly();
       this.setStatus("closed");
       this.info = null;
       this.checkpointList = [];
       this.baselineTree = null;
       this.checkpointQueue = Promise.resolve();
+      await this.upsertHistory(
+        this.historyRecordOf(info, { closedAt: this.now().toISOString(), status: "closed" }),
+      );
     } finally {
       this.closing = false;
     }
@@ -591,16 +923,25 @@ export class SessionManager implements SessionService {
     }
     try {
       await rm(this.options.workspaceDir, { recursive: true, force: true });
-      const prepared = await prepareWorkspace({
-        git: this.options.git,
-        repo: request.repo,
-        baseBranch: request.baseBranch,
-        dir: this.options.workspaceDir,
-        slug: slugify(request.prompt),
-        userName: this.options.gitIdentity?.name,
-        userEmail: this.options.gitIdentity?.email,
-        remoteBase: this.options.remoteBase,
-      });
+      let prepared: PreparedWorkspace;
+      let prompt: string;
+      if (request.pr === undefined) {
+        prepared = await prepareWorkspace({
+          git: this.options.git,
+          repo: request.repo,
+          baseBranch: request.baseBranch,
+          dir: this.options.workspaceDir,
+          slug: slugify(request.prompt ?? ""),
+          userName: this.options.gitIdentity?.name,
+          userEmail: this.options.gitIdentity?.email,
+          remoteBase: this.options.remoteBase,
+        });
+        prompt = request.prompt ?? "";
+      } else {
+        const pullRequest = await this.preparePullRequest(request.repo, request.pr);
+        prepared = pullRequest.workspace;
+        prompt = prPrompt(request.repo, pullRequest.pr, request.prompt);
+      }
 
       const info = this.current(sessionId);
       if (info === null) {
@@ -610,6 +951,7 @@ export class SessionManager implements SessionService {
       }
       info.baseBranch = prepared.baseBranch;
       info.branch = prepared.branch;
+      this.persist();
 
       await this.createStartCheckpoint(sessionId);
       if (this.current(sessionId) === null) {
@@ -618,22 +960,12 @@ export class SessionManager implements SessionService {
         return;
       }
 
-      const spec = buildPiLaunch({
-        ...this.options.pi,
-        cwd: this.options.workspaceDir,
-        model: info.model ?? undefined,
-        thinking: info.thinking ?? undefined,
-        baseBranch: prepared.baseBranch,
-        autoPush: info.autoPush,
-        plan: info.mode === "plan",
-        webConfigFile: this.options.pi.webConfigFile,
-      });
-      const pi = this.options.startPi(spec, this.handlersFor(sessionId));
+      const pi = this.launchPi(sessionId);
       this.pi = pi;
       this.settled = false;
       this.setStatus("running");
 
-      const data = await pi.send({ type: "prompt", message: request.prompt });
+      const data = await pi.send({ type: "prompt", message: prompt });
       if (this.isCurrent(sessionId) && dispositionOf(data) === "handled") {
         // Handled by an extension: there is no run to wait for.
         this.settled = true;
@@ -642,6 +974,36 @@ export class SessionManager implements SessionService {
     } catch (error) {
       await this.failStart(sessionId, error);
     }
+  }
+
+  /**
+   * Resolves the PR with gh (only open PRs of agent/* branches, ADR-0011 §9), then clones its head branch
+   * and checks its base. Throws PullRequestError or a git error; the caller turns them into `error`.
+   */
+  private async preparePullRequest(
+    repo: string,
+    number: number,
+  ): Promise<{ workspace: PreparedWorkspace; pr: PullRequestInfo }> {
+    const gh = this.options.gh;
+    if (gh === undefined) {
+      throw new SessionError(
+        "invalid_request",
+        "pull requests are not supported: gh is not available",
+      );
+    }
+    const dir = this.options.workspaceDir;
+    await mkdir(dirname(dir), { recursive: true });
+    const pr = await resolvePullRequest(gh, repo, number, dirname(dir));
+    const workspace = await preparePrWorkspace({
+      git: this.options.git,
+      repo,
+      dir,
+      pr,
+      userName: this.options.gitIdentity?.name,
+      userEmail: this.options.gitIdentity?.email,
+      remoteBase: this.options.remoteBase,
+    });
+    return { workspace, pr };
   }
 
   /** Checkpoint 0 right after cloning, before Pi starts. A failure is logged and the session goes on. */
@@ -663,16 +1025,314 @@ export class SessionManager implements SessionService {
       // The conversation is empty: the first user message is fork index 0.
       this.checkpointList.push({ checkpoint, tree, forkIndex: 0, todos: [] });
       this.baselineTree = tree;
+      this.persist();
       this.emit({ type: "checkpoint", action: "created", checkpoint: { ...checkpoint } });
     } catch (error) {
       this.logger.error(`checkpoint 0: ${this.redactor.redactString(errorMessage(error))}`);
     }
   }
 
-  /** Queues the checkpoint of the run that just settled, after the jobs already queued. Never rejects. */
+  /**
+   * Queues the checkpoint of the run that just settled, after the jobs already queued, and then reads the
+   * stats of the conversation. Never rejects.
+   */
   private enqueueRunCheckpoint(sessionId: string): void {
-    const job = this.checkpointQueue.then(() => this.createRunCheckpoint(sessionId));
+    this.checkpointJobs++;
+    const job = this.checkpointQueue
+      .then(() => this.createRunCheckpoint(sessionId))
+      .then(() => this.rememberStats(sessionId))
+      .finally(() => {
+        this.checkpointJobs--;
+      });
     this.checkpointQueue = job.catch(() => undefined);
+  }
+
+  /**
+   * Starts Pi on the workspace with the session id (ADR-0011 §1): a Pi started again with the same id
+   * reopens the conversation. Throws invalid_state if the session has no base branch yet.
+   */
+  private launchPi(sessionId: string): PiProcess {
+    const info = this.current(sessionId);
+    if (info === null || info.baseBranch === null) {
+      throw new SessionError("invalid_state", "the workspace is not ready");
+    }
+    const spec = buildPiLaunch({
+      ...this.options.pi,
+      sessionId: info.id,
+      cwd: this.options.workspaceDir,
+      model: info.model ?? undefined,
+      thinking: info.thinking ?? undefined,
+      baseBranch: info.baseBranch,
+      autoPush: info.autoPush,
+      plan: info.mode === "plan",
+      webConfigFile: this.options.pi.webConfigFile,
+    });
+    return this.options.startPi(spec, this.handlersFor(sessionId));
+  }
+
+  /**
+   * The running Pi, starting it again if the idle suspension stopped it (ADR-0011 §5). Throws
+   * invalid_state if the session cannot have a Pi (cloning, closed, in error, or without branch).
+   */
+  private async ensurePi(): Promise<PiProcess> {
+    if (this.pi !== null) {
+      return this.pi;
+    }
+    // The stopped Pi must have exited before a new one starts, or its exit would clear the new one.
+    if (this.suspension !== undefined) {
+      await this.suspension;
+      if (this.pi !== null) {
+        return this.pi;
+      }
+    }
+    const info = this.info;
+    if (
+      info === null ||
+      this.shuttingDown ||
+      this.closing ||
+      info.status === "cloning" ||
+      info.status === "closed" ||
+      info.status === "error" ||
+      info.baseBranch === null ||
+      info.branch === null
+    ) {
+      throw new SessionError("invalid_state", "the session has no Pi to talk to");
+    }
+    // Synchronous from here to the assignment: concurrent callers all see this Pi.
+    const pi = this.launchPi(info.id);
+    this.pi = pi;
+    // A fresh Pi is idle: the run it lost, if any, is not resumed (ADR-0011 §3).
+    this.settled = true;
+    info.suspended = false;
+    this.armIdleTimer();
+    return pi;
+  }
+
+  /** Any public call (except get) and any Pi event counts as activity: the idle timer restarts. */
+  private markActivity(): void {
+    this.armIdleTimer();
+  }
+
+  /** (Re)arms the idle timer if the suspension is on and Pi is running. */
+  private armIdleTimer(): void {
+    this.clearIdleTimer();
+    if (this.idleTimeoutMs <= 0 || this.info === null || this.pi === null) {
+      return;
+    }
+    const timer = setTimeout(() => {
+      this.idleTimer = undefined;
+      void this.suspendIfIdle();
+    }, this.idleTimeoutMs);
+    timer.unref();
+    this.idleTimer = timer;
+  }
+
+  private clearIdleTimer(): void {
+    if (this.idleTimer !== undefined) {
+      clearTimeout(this.idleTimer);
+      this.idleTimer = undefined;
+    }
+  }
+
+  /** Stops Pi if the session is still idle; otherwise re-arms the timer when the wait may end later. */
+  private async suspendIfIdle(): Promise<void> {
+    const info = this.info;
+    const pi = this.pi;
+    if (
+      info === null ||
+      pi === null ||
+      info.status !== "ready" ||
+      !this.settled ||
+      this.questions.size > 0 ||
+      this.restoring ||
+      this.closing
+    ) {
+      return;
+    }
+    if (this.checkpointJobs > 0) {
+      this.armIdleTimer();
+      return;
+    }
+    this.pi = null;
+    info.suspended = true;
+    const minutes = Math.round((this.idleTimeoutMs / 60_000) * 1000) / 1000;
+    this.logger.info(`pi suspended after ${minutes} min of inactivity`);
+    const stopping = this.stopPiQuietly(pi);
+    this.suspension = stopping;
+    try {
+      await stopping;
+    } finally {
+      if (this.suspension === stopping) {
+        this.suspension = undefined;
+      }
+    }
+  }
+
+  /** Throws session_exists while a session is active: create() and resume() need the replica free. */
+  private assertNoActiveSession(): void {
+    const previous = this.info;
+    if (
+      previous !== null &&
+      (this.closing || (previous.status !== "error" && previous.status !== "closed"))
+    ) {
+      throw new SessionError("session_exists");
+    }
+  }
+
+  /**
+   * Clears the in-memory state before a new session (create or resume) and returns the stop of the
+   * previous Pi, if any. A new session starts with an empty replay buffer, also after a close (ids keep
+   * growing).
+   */
+  private resetSessionState(): Promise<void> | undefined {
+    const hadPrevious = this.info !== null;
+    this.clearIdleTimer();
+    // A previous session in error is discarded. Its Pi, if still alive, stops before the new clone.
+    let stopping: Promise<void> | undefined;
+    if (hadPrevious) {
+      const previousPi = this.pi;
+      this.pi = null;
+      stopping = previousPi !== null ? this.stopPiQuietly(previousPi) : undefined;
+      this.questions.discardAll();
+    }
+    this.events.clear();
+    this.todoList = [];
+    this.checkpointList = [];
+    this.baselineTree = null;
+    this.checkpointQueue = Promise.resolve();
+    this.lastStats = null;
+    return stopping;
+  }
+
+  /**
+   * Re-clones the branch of a resumed session, reopens Pi with the same id (ADR-0011 §7) and sends the
+   * optional prompt. Failures end in status `error`; this never throws.
+   */
+  private async cloneAndReopen(
+    sessionId: string,
+    source: ResumeSource,
+    request: ResumeSessionRequest,
+  ): Promise<void> {
+    if (!this.isCurrent(sessionId)) {
+      return;
+    }
+    try {
+      await rm(this.options.workspaceDir, { recursive: true, force: true });
+      await prepareResumeWorkspace({
+        git: this.options.git,
+        repo: source.repo,
+        dir: this.options.workspaceDir,
+        branch: source.branch,
+        baseBranch: source.baseBranch,
+        userName: this.options.gitIdentity?.name,
+        userEmail: this.options.gitIdentity?.email,
+        remoteBase: this.options.remoteBase,
+      });
+
+      if (this.current(sessionId) === null) {
+        // Closed while cloning: Pi must not start.
+        await this.removeWorkspaceQuietly();
+        return;
+      }
+      await this.createStartCheckpoint(sessionId);
+      if (this.current(sessionId) === null) {
+        // Closed while taking the first checkpoint: Pi must not start.
+        await this.removeWorkspaceQuietly();
+        return;
+      }
+
+      const pi = this.launchPi(sessionId);
+      this.pi = pi;
+      this.settled = true;
+      this.setStatus("ready");
+      await this.sendHistory(pi);
+
+      if (request.prompt !== undefined && this.isCurrent(sessionId)) {
+        const data = await pi.send({ type: "prompt", message: request.prompt });
+        if (this.isCurrent(sessionId) && dispositionOf(data) === "started") {
+          this.settled = false;
+          this.refreshStatus();
+        }
+      }
+    } catch (error) {
+      await this.failStart(sessionId, error);
+    }
+  }
+
+  /**
+   * Keeps the last stats of Pi (ADR-0011 §8) and writes them to the history. Only if Pi is running: a
+   * suspended session is not started for this. Never throws.
+   */
+  private async rememberStats(sessionId: string): Promise<void> {
+    const pi = this.pi;
+    if (!this.isCurrent(sessionId) || pi === null) {
+      return;
+    }
+    const stats = await this.readStats(pi);
+    if (stats === null || !this.isCurrent(sessionId)) {
+      return;
+    }
+    this.lastStats = stats;
+    this.recordHistory();
+  }
+
+  /** Token usage and cost from Pi, or null if it did not answer with stats. Errors are logged; never throws. */
+  private async readStats(pi: PiProcess, timeoutMs?: number): Promise<SessionStats | null> {
+    try {
+      const data = await pi.send({ type: "get_session_stats" }, { timeoutMs });
+      return parseSessionStats(data);
+    } catch (error) {
+      this.logger.error(`stats: ${this.redactor.redactString(errorMessage(error))}`);
+      return null;
+    }
+  }
+
+  /** Writes the session to the history as it is now (not closed). Nothing for a closed or missing session. */
+  private recordHistory(): void {
+    const info = this.info;
+    if (this.options.history === undefined || info === null || info.status === "closed") {
+      return;
+    }
+    const record = this.historyRecordOf(info, { closedAt: null, status: info.status });
+    // persist() runs on every change (todos, checkpoints...); the history file only when its entry changes.
+    const key = JSON.stringify(record);
+    if (key === this.lastHistoryKey) {
+      return;
+    }
+    this.lastHistoryKey = key;
+    void this.upsertHistory(record);
+  }
+
+  /** The history record of `info` with the given close state and the last stats. */
+  private historyRecordOf(
+    info: SessionInfo,
+    state: Pick<HistoryRecord, "closedAt" | "status">,
+  ): HistoryRecord {
+    return {
+      id: info.id,
+      repo: info.repo,
+      baseBranch: info.baseBranch,
+      branch: info.branch,
+      pr: info.pr,
+      mode: info.mode,
+      model: info.model,
+      createdAt: info.createdAt,
+      closedAt: state.closedAt,
+      status: state.status,
+      stats: this.lastStats,
+    };
+  }
+
+  /** Upserts a record of the history. Never rejects: a failure is logged (redacted). */
+  private upsertHistory(record: HistoryRecord): Promise<void> {
+    const history = this.options.history;
+    if (history === undefined) {
+      return Promise.resolve();
+    }
+    const write = history.upsert(record).catch((error: unknown) => {
+      this.logger.error(`history: ${this.redactor.redactString(errorMessage(error))}`);
+    });
+    return this.trackWrite(write);
   }
 
   /** Creates a checkpoint if the working tree changed since the last one. Errors are logged. */
@@ -708,9 +1368,10 @@ export class SessionManager implements SessionService {
         todos: this.todoList.map((item) => ({ ...item })),
       });
       this.baselineTree = tree;
+      this.persist();
       this.emit({ type: "checkpoint", action: "created", checkpoint: { ...checkpoint } });
     } catch (error) {
-      this.logger.error(`checkpoint: ${this.redactor.redactString(errorMessage(error))}`);
+      this.logger.error(`checkpoint:${this.redactor.redactString(errorMessage(error))}`);
     }
   }
 
@@ -822,6 +1483,7 @@ export class SessionManager implements SessionService {
   }
 
   private handlePiEvent(event: RpcEvent): void {
+    this.markActivity();
     this.recordTool(event);
     // The end of a run is agent_settled: agent_end can be followed by a retry or queued messages.
     if (event.type === "agent_start") {
@@ -838,6 +1500,7 @@ export class SessionManager implements SessionService {
     for (const sessionEvent of normalizeRpcEvent(event)) {
       if (sessionEvent.type === "todo") {
         this.todoList = sessionEvent.todos;
+        this.persist();
       } else if (sessionEvent.type === "mode") {
         const info = this.info;
         // The plan-mode extension may report the mode it already has: no event then.
@@ -845,6 +1508,7 @@ export class SessionManager implements SessionService {
           continue;
         }
         info.mode = sessionEvent.mode;
+        this.persist();
       }
       this.emit(sessionEvent);
     }
@@ -879,6 +1543,7 @@ export class SessionManager implements SessionService {
   }
 
   private handleUiRequest(request: RpcExtensionUIRequest): void {
+    this.markActivity();
     const question = uiRequestToQuestion(request, this.now());
     if (question === null) {
       const notify = uiRequestToNotify(request);
@@ -934,12 +1599,18 @@ export class SessionManager implements SessionService {
     const previous = info.status;
     info.status = status;
     info.error = safeError;
+    this.persist();
     this.emit(
       safeError === undefined
         ? { type: "status", status }
         : { type: "status", status, error: safeError },
     );
     this.notifyStatusChange(previous, status, safeError);
+    if (status === "ready") {
+      this.armIdleTimer();
+    } else if (status === "error" || status === "closed") {
+      this.clearIdleTimer();
+    }
   }
 
   /** Sends the push notification of a status change, if it has one. Never throws, never waits. */
@@ -1069,6 +1740,23 @@ export class SessionManager implements SessionService {
   }
 }
 
+/**
+ * The first prompt of a session on a pull request (ADR-0011 §9): asks the agent to address the review of
+ * the PR, then appends the user's own instructions, if any.
+ */
+export function prPrompt(repo: string, pr: PullRequestInfo, userPrompt?: string): string {
+  const instructions =
+    `You are working on pull request #${pr.number} of ${repo} (branch ${pr.headBranch}, base ${pr.baseBranch}). ` +
+    `Read its description and review comments with gh: \`gh pr view ${pr.number} --repo ${repo} --comments\` ` +
+    `and \`gh api repos/${repo}/pulls/${pr.number}/comments\`. ` +
+    "Address each comment that asks for a change, commit with git_commit and push to the same branch with git_push. " +
+    "Do not open a new pull request. " +
+    "When you are done, summarise what you changed for each review comment.";
+  return userPrompt === undefined
+    ? instructions
+    : `${instructions}\n\nAdditional instructions from the user:\n${userPrompt}`;
+}
+
 function dispositionOf(data: unknown): PromptDisposition | undefined {
   const value = isRecord(data) ? data.disposition : undefined;
   return PROMPT_DISPOSITIONS.find((disposition) => disposition === value);
@@ -1086,4 +1774,13 @@ function forkEntriesOf(data: unknown): unknown[] | null {
 
 function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
+}
+
+async function pathExists(path: string): Promise<boolean> {
+  try {
+    await access(path);
+    return true;
+  } catch {
+    return false;
+  }
 }

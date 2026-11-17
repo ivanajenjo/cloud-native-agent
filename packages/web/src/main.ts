@@ -9,24 +9,27 @@ import { createComposer, type SendMode } from "./views/composer.js";
 import { createDiffPanel } from "./views/diff.js";
 import { statusLabel } from "./views/format.js";
 import { createHeader } from "./views/header.js";
+import { createHistoryPanel } from "./views/history.js";
 import { createLoginView } from "./views/login.js";
 import { createNetworkPanel } from "./views/network.js";
 import { createNewSessionView } from "./views/new-session.js";
 import { createQuestionsPanel } from "./views/questions.js";
 import { createTodosPanel } from "./views/todos.js";
 import { createTranscript } from "./views/transcript.js";
+import { createUsagePanel } from "./views/usage.js";
 
 /** How long an error notice stays on screen. */
 const TOAST_MS = 8000;
 const CLOSE_QUESTION = "¿Cerrar la sesión? Se borrará el workspace.";
 const FORCE_CLOSE_QUESTION = "Hay cambios sin subir. ¿Cerrar igualmente y descartarlos?";
 
-type TabName = "todos" | "diff" | "network";
+type TabName = "todos" | "diff" | "network" | "usage";
 
 const TABS: ReadonlyArray<{ name: TabName; label: string }> = [
   { name: "todos", label: "Tareas" },
   { name: "diff", label: "Diff" },
   { name: "network", label: "Red" },
+  { name: "usage", label: "Uso" },
 ];
 
 const mountPoint = document.getElementById("app");
@@ -333,11 +336,13 @@ function mountApp(client: ApiClient, initial: SessionInfo | null): void {
     loadPolicy: () => client.networkPolicy(),
     setMode: (mode) => client.updateNetworkPolicy({ mode }),
   });
+  const usage = createUsagePanel(() => client.stats());
 
   const panels: Record<TabName, HTMLElement> = {
     todos: todos.element,
     diff: diff.element,
     network: network.element,
+    usage: usage.element,
   };
   const tabs = TABS.map((tab) => ({
     name: tab.name,
@@ -367,7 +372,11 @@ function mountApp(client: ApiClient, initial: SessionInfo | null): void {
     ),
   }));
 
+  /** The visible tab of the side panel; the usage panel reloads when it is shown. */
+  let activeTab: TabName = "todos";
+
   function selectTab(name: TabName): void {
+    activeTab = name;
     for (const tab of tabs) {
       const selected = tab.name === name;
       tab.button.setAttribute("aria-selected", selected ? "true" : "false");
@@ -378,6 +387,9 @@ function mountApp(client: ApiClient, initial: SessionInfo | null): void {
     }
     if (name === "network") {
       network.refresh();
+    }
+    if (name === "usage") {
+      usage.refresh();
     }
   }
 
@@ -401,11 +413,22 @@ function mountApp(client: ApiClient, initial: SessionInfo | null): void {
   );
   const sessionZone = h("div", { class: "app-main" }, chat, side);
 
-  /** Without a live session: the form, built fresh each time it is entered. */
+  /** Without a live session: the form and the history, built fresh each time it is entered. */
   function showZone(newSession: boolean): void {
     newZone.hidden = !newSession;
     sessionZone.hidden = newSession;
     if (newSession) {
+      const historyPanel = createHistoryPanel({
+        loadHistory: () => client.history(),
+        resume: async (id) => {
+          // As the submit below: drop the old transcript before the resumed session's events arrive.
+          store.dispatch({ type: "reset" });
+          const info = await client.resumeSession(id);
+          if (!stopped) {
+            store.dispatch({ type: "session", session: info });
+          }
+        },
+      });
       newZone.replaceChildren(
         createNewSessionView({
           loadModels: () => client.models(),
@@ -418,7 +441,9 @@ function mountApp(client: ApiClient, initial: SessionInfo | null): void {
             }
           },
         }),
+        historyPanel.element,
       );
+      historyPanel.refresh();
     } else {
       newZone.replaceChildren();
       selectTab("todos");
@@ -443,6 +468,15 @@ function mountApp(client: ApiClient, initial: SessionInfo | null): void {
   connect(
     (s) => s.session?.status ?? null,
     (status) => composer.update(status),
+  );
+  connect(
+    (s) => s.session?.status ?? null,
+    (status) => {
+      // Usage numbers change with each turn: reload them when the session is ready, if shown.
+      if (status === "ready" && activeTab === "usage") {
+        usage.refresh();
+      }
+    },
   );
   connect(
     (s) => s.todos,

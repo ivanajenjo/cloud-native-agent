@@ -4,6 +4,7 @@ import type {
   Checkpoint,
   CreateSessionRequest,
   DiffResponse,
+  HistoryEntry,
   NetworkLogEntry,
   PiMessage,
   PostMessageRequest,
@@ -11,7 +12,9 @@ import type {
   Question,
   QuestionOutcome,
   RestoreCheckpointResponse,
+  ResumeSessionRequest,
   SessionInfo,
+  SessionStats,
   SetModelRequest,
   TodoItem,
 } from "@cna/shared";
@@ -20,7 +23,7 @@ import type {
  * Error raised by the session service. The HTTP layer maps `code` to a status:
  * no_session → 404, question_not_found → 404, checkpoint_not_found → 404, session_exists → 409,
  * invalid_state → 409, question_resolved → 409, invalid_request → 400, mode_not_supported → 400,
- * unknown_model → 400.
+ * unknown_model → 400, history_not_found → 404.
  * `message` must be safe to show to the client (no secrets).
  */
 export class SessionError extends Error {
@@ -50,6 +53,16 @@ export interface SessionService {
    */
   create(request: CreateSessionRequest): Promise<SessionInfo>;
 
+  /** Sessions of this replica, newest first (current included). Never throws for a missing session. */
+  history(): Promise<HistoryEntry[]>;
+
+  /**
+   * Resumes a closed session of the history: same id, re-cloned on its branch, Pi reopened with the same id.
+   * Returns at once with status "cloning" like create(). Throws session_exists like create();
+   * history_not_found if there is no such entry; invalid_state if it is the current one or not `resumable`.
+   */
+  resume(id: string, request: ResumeSessionRequest): Promise<SessionInfo>;
+
   /**
    * Sends a user message. Throws no_session; invalid_state unless the status is running,
    * waiting_input or ready. While running/waiting_input it is sent with streamingBehavior
@@ -76,6 +89,9 @@ export interface SessionService {
 
   /** Full conversation from Pi (`get_messages`), redacted. Throws no_session; invalid_state if Pi is not running. */
   messages(): Promise<PiMessage[]>;
+
+  /** Token usage and cost of the session (Pi get_session_stats). Throws no_session; invalid_state while cloning, closed or in error, or if Pi cannot start or answers without stats. */
+  stats(): Promise<SessionStats>;
 
   /** Checkpoints of the session, oldest first (copies). Throws no_session. */
   checkpoints(): Checkpoint[];

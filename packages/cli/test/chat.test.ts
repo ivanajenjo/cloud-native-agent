@@ -25,6 +25,8 @@ const SESSION: SessionInfo = {
   mode: "auto",
   autoPush: false,
   createdAt: TS,
+  pr: null,
+  suspended: false,
   pendingQuestions: [],
 };
 
@@ -314,6 +316,27 @@ describe("runChat: mensajes", () => {
     await expectOut(chat, "Frente a la rama base main");
   });
 
+  it("prints /stats with the tokens, cost and context of the session", async () => {
+    const chat = start({
+      respond: (request) =>
+        request.method === "GET" && request.path === "/session/stats"
+          ? json({
+              tokens: { input: 1, output: 2, cacheRead: 3, cacheWrite: 4, total: 10 },
+              cost: 0.45,
+              messages: { user: 1, assistant: 1, toolCalls: 0 },
+              context: null,
+            })
+          : undefined,
+    });
+    chat.input.push("/stats");
+    await expectOut(chat, "Coste: $0.45\n");
+    expect(chat.stdout()).toContain(
+      "Tokens: 10 (entrada 1, salida 2, caché leída 3, caché escrita 4)\n",
+    );
+    expect(chat.stdout()).toContain("Contexto: desconocido\n");
+    expect(chat.edge.requestsTo("POST", "/session/messages")).toHaveLength(0);
+  });
+
   it("reports API errors without leaving the chat", async () => {
     const chat = start();
     chat.edge.respond = (request) =>
@@ -554,6 +577,7 @@ describe("CHAT_HELP", () => {
       "/status",
       "/todos",
       "/diff",
+      "/stats",
       "/steer <texto>",
       "/cancel",
       "«.»",

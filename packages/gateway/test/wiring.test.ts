@@ -1,6 +1,6 @@
 import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { pathToFileURL } from "node:url";
 import type { SessionInfo } from "@cna/shared";
 import type { Hono } from "hono";
@@ -10,6 +10,7 @@ import { type GatewayConfig, gatewayPaths, loadGatewayConfig } from "../src/conf
 import type { PiLaunchSpec } from "../src/pi/launch.js";
 import type { RpcBridgeHandlers, RpcCommandInput } from "../src/rpc/bridge.js";
 import type { PiProcess } from "../src/session/manager.js";
+import type { PersistedSession } from "../src/session/persistence.js";
 import { createGatewayRuntime, type GatewayRuntime } from "../src/wiring.js";
 import { createGitRunner } from "../src/workspace/git.js";
 
@@ -66,7 +67,8 @@ afterEach(async () => {
   for (const runtime of runtimes) {
     await runtime.close();
   }
-  await rm(root, { recursive: true, force: true });
+  // Retries: a state write that restore() left in the background may still be in the directory.
+  await rm(root, { recursive: true, force: true, maxRetries: 5, retryDelay: 20 });
 });
 
 /** Fake Pi: answers prompt with disposition "started" and nothing else. */
@@ -91,6 +93,7 @@ function configFor(overrides: Partial<GatewayConfig> = {}): GatewayConfig {
     webUiDir: join(root, "web-ui"),
     gitUserName: "Agent",
     gitUserEmail: "agent@example.invalid",
+    idleTimeoutMs: 1_800_000,
     ...overrides,
   };
 }
@@ -402,5 +405,44 @@ describe("createGatewayRuntime", () => {
         piCli: join(root, "pi", "cli.js"),
       }),
     ).rejects.toThrow("extension file not found");
+  });
+
+  it("resumes the session saved in state/session.json when its workspace is still there", async () => {
+    const config = configFor();
+    const workspaceDir = join(config.dataDir, "workspace", "repo");
+    await mkdir(dirname(workspaceDir), { recursive: true });
+    await realGit(["clone", `${remoteBase}octo/hello.git`, workspaceDir], { cwd: root });
+    await realGit(["checkout", "-b", "agent/fix-the-readme"], { cwd: workspaceDir });
+    const state: PersistedSession = {
+      version: 1,
+      info: {
+        id: "sess-restored",
+        status: "ready",
+        repo: "octo/hello",
+        baseBranch: "main",
+        branch: "agent/fix-the-readme",
+        model: null,
+        thinking: null,
+        mode: "auto",
+        autoPush: false,
+        createdAt: new Date(0).toISOString(),
+        pr: null,
+      },
+      todos: [],
+      checkpoints: [],
+      baselineTree: null,
+    };
+    await mkdir(join(config.dataDir, "state"), { recursive: true });
+    await writeFile(join(config.dataDir, "state", "session.json"), JSON.stringify(state));
+
+    const { app, startPi } = await start(config);
+
+    const info = (await (await app.request("/session")).json()) as SessionInfo;
+    expect(info.id).toBe("sess-restored");
+    expect(info.status).toBe("ready");
+    expect(startPi).toHaveBeenCalledTimes(1);
+    const spec = startPi.mock.calls[0]?.[0] as PiLaunchSpec;
+    expect(spec.args[spec.args.indexOf("--session-id") + 1]).toBe("sess-restored");
+    expect(spec.cwd).toBe(workspaceDir);
   });
 });

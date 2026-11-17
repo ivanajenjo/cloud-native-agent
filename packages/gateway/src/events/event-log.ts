@@ -5,6 +5,8 @@ export interface EventLogOptions {
   capacity?: number;
   /** Injectable clock. Default () => new Date(). */
   now?: () => Date;
+  /** Id of the first event. Default 1. Must be a safe integer >= 1 (ADR-0011 §4: Date.now() across processes). */
+  firstId?: number;
 }
 
 export interface ReplayResult {
@@ -19,13 +21,14 @@ const DEFAULT_CAPACITY = 5000;
 
 /**
  * In-memory, bounded log of the session events, used for SSE replay.
- * Ids are per process: they keep growing across `clear()`.
+ * Ids keep growing across `clear()` and, when `firstId` is set, across processes.
  */
 export class EventLog {
   private readonly capacity: number;
   private readonly now: () => Date;
+  private readonly firstId: number;
   private buffer: StreamEvent[] = [];
-  private nextId = 1;
+  private nextId: number;
   /** True once an event has been evicted because of `capacity` (not by `clear`). */
   private evicted = false;
   private readonly subscriptions = new Set<{ listener: Listener }>();
@@ -35,11 +38,17 @@ export class EventLog {
     if (!Number.isInteger(capacity) || capacity < 1) {
       throw new RangeError(`EventLog capacity must be a positive integer, got ${capacity}`);
     }
+    const firstId = options.firstId ?? 1;
+    if (!Number.isSafeInteger(firstId) || firstId < 1) {
+      throw new RangeError(`EventLog firstId must be a safe integer >= 1, got ${firstId}`);
+    }
     this.capacity = capacity;
     this.now = options.now ?? (() => new Date());
+    this.firstId = firstId;
+    this.nextId = firstId;
   }
 
-  /** Assigns id = lastId + 1 (first is 1) and ts = now().toISOString(), stores it, notifies listeners synchronously in subscription order, returns it. A listener that throws must not prevent the others nor break append (catch and ignore). */
+  /** Assigns id = lastId + 1 (the first is firstId, default 1) and ts = now().toISOString(), stores it, notifies listeners synchronously in subscription order, returns it. A listener that throws must not prevent the others nor break append (catch and ignore). */
   append(event: SessionEvent): StreamEvent {
     const stored: StreamEvent = {
       id: this.nextId,
@@ -86,9 +95,9 @@ export class EventLog {
     };
   }
 
-  /** Last assigned id (0 if none). */
+  /** Last assigned id (0 if none, even when firstId is set). */
   get lastId(): number {
-    return this.nextId - 1;
+    return this.nextId === this.firstId ? 0 : this.nextId - 1;
   }
 
   /**

@@ -414,3 +414,12 @@ describe("EventPrinter: color off", () => {
     expect(out.length).toBeGreaterThan(0);
   });
 });
+
+describe("EventPrinter: history", () => {
+  it("prints how many messages the resumed session had", () => {
+    const printer = new EventPrinter({ color: false });
+    expect(
+      printer.format({ type: "history", messages: [{ role: "user" }, { role: "assistant" }] }),
+    ).toBe("(sesión reanudada: 2 mensajes anteriores)\n");
+  });
+});

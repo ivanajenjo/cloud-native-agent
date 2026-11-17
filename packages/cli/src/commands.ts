@@ -1,13 +1,20 @@
 import type {
   CreateSessionRequest,
   DiffResponse,
+  HistoryEntry,
   SessionInfo,
+  SessionStats,
   TodoItem,
   TodoStatus,
 } from "@cna/shared";
 import { type ApiClient, ApiClientError } from "@cna/shared/client";
 import type { Command } from "./args.js";
 import { sanitize, style } from "./style.js";
+
+/** Ids of at least this length are complete (a UUID): they are not looked up in the history. */
+const FULL_SESSION_ID_LENGTH = 36;
+
+const NOT_IN_HISTORY_MESSAGE = "No existe esa sesión en el historial";
 
 export interface Output {
   /** stdout; the text includes its own "\n". */
@@ -55,6 +62,8 @@ function describeRaw(error: unknown): string {
       case "question_resolved":
       case "checkpoint_not_found":
         return error.message;
+      case "history_not_found":
+        return NOT_IN_HISTORY_MESSAGE;
       default:
         return `${error.message} (${error.code})`;
     }
@@ -84,7 +93,11 @@ export function formatSession(info: SessionInfo, color: boolean): string {
   const lines = [
     `${bold("Repo:")} ${sanitize(info.repo)}`,
     `${bold("Rama:")} ${branch} (base: ${base})`,
+    ...(info.pr === null ? [] : [`${bold("PR:")} #${info.pr}`]),
     `${bold("Estado:")} ${state}`,
+    ...(info.suspended
+      ? [`${bold("Pi:")} en pausa por inactividad (arranca con el siguiente mensaje)`]
+      : []),
     `${bold("Modelo:")} ${model}`,
     `${bold("Modo:")} ${sanitize(info.mode)}`,
     `${bold("Push automático:")} ${info.autoPush ? "sí" : "no"}`,
@@ -163,6 +176,64 @@ export function formatDiff(diff: DiffResponse, options: { stat: boolean; color: 
   return out;
 }
 
+/** Cost in dollars with two decimals; "<$0.01" for amounts between 0 and 0.01. */
+function formatCost(cost: number): string {
+  if (cost > 0 && cost < 0.01) {
+    return "<$0.01";
+  }
+  return `$${cost.toFixed(2)}`;
+}
+
+/** Token usage, cost and context of the session (ends with "\n"). */
+export function formatStats(stats: SessionStats, color: boolean): string {
+  const bold = (text: string) => style(text, color, "bold");
+  const { tokens, messages, context } = stats;
+
+  let contextText: string;
+  if (context === null) {
+    contextText = "desconocido";
+  } else if (context.tokens === null || context.percent === null) {
+    contextText = "recién compactado";
+  } else {
+    contextText = `${context.tokens} de ${context.window} (${Math.round(context.percent)} %)`;
+  }
+
+  const lines = [
+    `${bold("Coste:")} ${formatCost(stats.cost)}`,
+    `${bold("Tokens:")} ${tokens.total} (entrada ${tokens.input}, salida ${tokens.output}, caché leída ${tokens.cacheRead}, caché escrita ${tokens.cacheWrite})`,
+    `${bold("Mensajes:")} ${messages.user} tuyos, ${messages.assistant} del agente, ${messages.toolCalls} llamadas a tools`,
+    `${bold("Contexto:")} ${contextText}`,
+  ];
+  return lines.map((line) => `${line}\n`).join("");
+}
+
+/** The history of the replica, one line per session (ends with "\n"); empty → a fixed message. */
+export function formatHistory(entries: HistoryEntry[], color: boolean): string {
+  if (entries.length === 0) {
+    return "Todavía no hay sesiones.\n";
+  }
+  let out = "";
+  let anyResumable = false;
+  for (const entry of entries) {
+    const id = sanitize(entry.id).slice(0, 8);
+    const when = sanitize(entry.createdAt.slice(0, 16)).replace("T", " ");
+    const pr = entry.pr === null ? "" : ` PR #${entry.pr}`;
+    const branch = entry.branch === null ? "—" : sanitize(entry.branch);
+    const state = entry.closedAt === null ? "actual" : sanitize(entry.status);
+    const cost = entry.stats === null ? "—" : formatCost(entry.stats.cost);
+    let line = `${id}  ${when}  ${sanitize(entry.repo)}${pr}  ${branch}  ${state}  ${cost}`;
+    if (entry.resumable) {
+      line += `  ${style("[reanudable]", color, "green")}`;
+      anyResumable = true;
+    }
+    out += `${line}\n`;
+  }
+  if (anyResumable) {
+    out += "Retoma una con: cna resume <id>\n";
+  }
+  return out;
+}
+
 /** Task list (ends with "\n"); empty → "Sin tareas.\n". */
 export function formatTodos(todos: TodoItem[]): string {
   if (todos.length === 0) {
@@ -180,6 +251,28 @@ export async function runStatus(ctx: CommandContext): Promise<number> {
       return 0;
     }
     ctx.output.out(formatSession(info, ctx.color));
+    return 0;
+  } catch (error) {
+    return fail(ctx, error);
+  }
+}
+
+/** `cna stats`. */
+export async function runStats(ctx: CommandContext): Promise<number> {
+  try {
+    const stats = await ctx.client.stats();
+    ctx.output.out(formatStats(stats, ctx.color));
+    return 0;
+  } catch (error) {
+    return fail(ctx, error);
+  }
+}
+
+/** `cna history`. */
+export async function runHistory(ctx: CommandContext): Promise<number> {
+  try {
+    const entries = await ctx.client.history();
+    ctx.output.out(formatHistory(entries, ctx.color));
     return 0;
   } catch (error) {
     return fail(ctx, error);
@@ -248,11 +341,10 @@ export async function createSession(
   ctx: CommandContext,
   command: Extract<Command, { name: "run" }>,
 ): Promise<SessionInfo | null> {
-  const body: CreateSessionRequest = {
-    repo: command.repo,
-    prompt: command.prompt,
-    mode: command.plan ? "plan" : "auto",
-  };
+  const body: CreateSessionRequest = { repo: command.repo };
+  if (command.prompt !== undefined) body.prompt = command.prompt;
+  if (command.pr !== undefined) body.pr = command.pr;
+  body.mode = command.plan ? "plan" : "auto";
   if (command.baseBranch !== undefined) body.baseBranch = command.baseBranch;
   if (command.model !== undefined) body.model = command.model;
   if (command.thinking !== undefined) body.thinking = command.thinking;
@@ -260,11 +352,54 @@ export async function createSession(
 
   try {
     const info = await ctx.client.createSession(body);
-    let text = `Sesión creada: ${sanitize(info.repo)} (estado: ${sanitize(info.status)})\n`;
+    const target = info.pr === null ? sanitize(info.repo) : `${sanitize(info.repo)} PR #${info.pr}`;
+    let text = `Sesión creada: ${target} (estado: ${sanitize(info.status)})\n`;
     if (info.mode === "plan") {
       text += "Modo plan: el agente propondrá un plan antes de editar.\n";
     }
     ctx.output.out(text);
+    return info;
+  } catch (error) {
+    fail(ctx, error);
+    return null;
+  }
+}
+
+/**
+ * Full id of the history entry the user names. A short id (a prefix shown by `cna history`) is
+ * looked up in GET /session/history; it must match exactly one entry.
+ */
+async function resolveHistoryId(ctx: CommandContext, id: string): Promise<string> {
+  if (id.length >= FULL_SESSION_ID_LENGTH) {
+    return id;
+  }
+  const matches = (await ctx.client.history()).filter((entry) => entry.id.startsWith(id));
+  const [only] = matches;
+  if (only === undefined) {
+    throw new Error(NOT_IN_HISTORY_MESSAGE);
+  }
+  if (matches.length > 1) {
+    throw new Error("El id es ambiguo: escribe más caracteres");
+  }
+  return only.id;
+}
+
+/**
+ * `cna resume <id> ["prompt"]`: reopens a past session. Writes "Sesión reanudada: …" and returns
+ * the info, or writes the error and returns null.
+ */
+export async function resumeSession(
+  ctx: CommandContext,
+  command: Extract<Command, { name: "resume" }>,
+): Promise<SessionInfo | null> {
+  try {
+    const id = await resolveHistoryId(ctx, command.id);
+    const body = command.prompt !== undefined ? { prompt: command.prompt } : {};
+    const info = await ctx.client.resumeSession(id, body);
+    const branch = info.branch === null ? "—" : sanitize(info.branch);
+    ctx.output.out(
+      `Sesión reanudada: ${sanitize(info.repo)} en ${branch} (estado: ${sanitize(info.status)})\n`,
+    );
     return info;
   } catch (error) {
     fail(ctx, error);

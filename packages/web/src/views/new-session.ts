@@ -9,6 +9,9 @@ export interface NewSessionDeps {
   submit(request: CreateSessionRequest): Promise<void>;
 }
 
+/** Largest pull request number accepted by the API (`CreateSessionRequestSchema`). */
+const MAX_PULL_REQUEST = 1_000_000_000;
+
 /** Form to create a session. Calls `deps.loadModels` once, when the view is created. */
 export function createNewSessionView(deps: NewSessionDeps): HTMLElement {
   const repoInput = h("input", {
@@ -29,6 +32,26 @@ export function createNewSessionView(deps: NewSessionDeps): HTMLElement {
       type: "text",
       autocomplete: "off",
       spellcheck: "false",
+    },
+  });
+  const baseBranchHelp = h("p", {
+    class: "new-session-help",
+    attrs: { hidden: true },
+    text: "Con un PR se usa su rama base",
+  });
+  const prInput = h("input", {
+    class: "new-session-input",
+    attrs: {
+      id: "new-session-pr",
+      type: "number",
+      min: 1,
+      step: 1,
+      inputmode: "numeric",
+    },
+    on: {
+      input: () => {
+        syncPullRequestState();
+      },
     },
   });
   const promptInput = h("textarea", {
@@ -96,6 +119,17 @@ export function createNewSessionView(deps: NewSessionDeps): HTMLElement {
     submitButton.replaceChildren(text(submitting ? "Creando…" : "Crear sesión"));
   }
 
+  /** With a PR the prompt is optional and the base branch is the PR's (it is not sent). */
+  function syncPullRequestState(): void {
+    const hasPullRequest = prInput.value.trim() !== "";
+    promptInput.required = !hasPullRequest;
+    promptInput.placeholder = hasPullRequest
+      ? "Opcional: instrucciones además de atender la revisión"
+      : "";
+    baseBranchInput.disabled = hasPullRequest;
+    baseBranchHelp.hidden = !hasPullRequest;
+  }
+
   async function loadModelOptions(): Promise<void> {
     try {
       const { default: defaultRef, models } = await deps.loadModels();
@@ -119,12 +153,20 @@ export function createNewSessionView(deps: NewSessionDeps): HTMLElement {
     event.preventDefault();
     const repo = repoInput.value.trim();
     const prompt = promptInput.value.trim();
+    const prText = prInput.value.trim();
     if (repo === "") {
       showError("Indica el repositorio como owner/repo.");
       repoInput.focus();
       return;
     }
-    if (prompt === "") {
+    const pr = prText === "" ? undefined : parsePullRequest(prText);
+    // A number input reports "" for text it cannot parse: that must not become "no PR".
+    if (prInput.validity.badInput || (prText !== "" && pr === undefined)) {
+      showError("El número de PR no es válido");
+      prInput.focus();
+      return;
+    }
+    if (pr === undefined && prompt === "") {
       showError("Escribe el prompt de la tarea.");
       promptInput.focus();
       return;
@@ -132,12 +174,19 @@ export function createNewSessionView(deps: NewSessionDeps): HTMLElement {
 
     const request: CreateSessionRequest = {
       repo,
-      prompt,
       mode: modeInputs.plan.checked ? "plan" : "auto",
     };
-    const baseBranch = baseBranchInput.value.trim();
-    if (baseBranch !== "") {
-      request.baseBranch = baseBranch;
+    if (pr === undefined) {
+      request.prompt = prompt;
+      const baseBranch = baseBranchInput.value.trim();
+      if (baseBranch !== "") {
+        request.baseBranch = baseBranch;
+      }
+    } else {
+      request.pr = pr;
+      if (prompt !== "") {
+        request.prompt = prompt;
+      }
     }
     if (modelSelect.value !== "") {
       request.model = modelSelect.value;
@@ -165,6 +214,8 @@ export function createNewSessionView(deps: NewSessionDeps): HTMLElement {
     "form",
     {
       class: "new-session-form",
+      // Our own checks show the messages in Spanish; the browser's bubbles would pre-empt them.
+      attrs: { novalidate: true },
       on: {
         submit: (event) => {
           void handleSubmit(event);
@@ -172,7 +223,16 @@ export function createNewSessionView(deps: NewSessionDeps): HTMLElement {
       },
     },
     field("new-session-repo", "Repositorio (owner/repo)", repoInput),
-    field("new-session-base-branch", "Rama base (opcional)", baseBranchInput),
+    field("new-session-base-branch", "Rama base (opcional)", baseBranchInput, baseBranchHelp),
+    field(
+      "new-session-pr",
+      "Pull request (opcional)",
+      prInput,
+      h("p", {
+        class: "new-session-help",
+        text: "Solo PRs abiertos del agente (ramas agent/*) en este repo. El agente leerá los comentarios de revisión.",
+      }),
+    ),
     field("new-session-prompt", "Prompt", promptInput),
     field("new-session-model", "Modelo", modelSelect),
     modelNotice,
@@ -207,13 +267,24 @@ export function createNewSessionView(deps: NewSessionDeps): HTMLElement {
   );
 }
 
-/** A label above a control. */
-function field(id: string, label: string, control: HTMLElement): HTMLElement {
+/** Integer 1..MAX_PULL_REQUEST, or undefined when the text is not a valid PR number. */
+function parsePullRequest(value: string): number | undefined {
+  const number = Number(value);
+  return Number.isInteger(number) && number >= 1 && number <= MAX_PULL_REQUEST ? number : undefined;
+}
+
+/** A label above a control, with an optional help text linked by aria-describedby. */
+function field(id: string, label: string, control: HTMLElement, help?: HTMLElement): HTMLElement {
+  if (help) {
+    help.id = `${id}-help`;
+    control.setAttribute("aria-describedby", help.id);
+  }
   return h(
     "div",
     { class: "new-session-field" },
     h("label", { class: "new-session-label", attrs: { for: id }, text: label }),
     control,
+    help,
   );
 }
 

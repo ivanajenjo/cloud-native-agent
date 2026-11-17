@@ -147,6 +147,7 @@ interface HarnessOptions {
   webConfigFile?: string;
   toolLog?: ToolLog;
   notifier?: Notifier;
+  idleTimeoutMs?: number;
 }
 
 function harness(wrapGit: GitWrapper = (real) => real, options: HarnessOptions = {}): Harness {
@@ -177,6 +178,7 @@ function harness(wrapGit: GitWrapper = (real) => real, options: HarnessOptions =
     defaultModel: "ollama/qwen3-coder:30b",
     remoteBase,
     ...(options.notifier !== undefined ? { notifier: options.notifier } : {}),
+    ...(options.idleTimeoutMs !== undefined ? { idleTimeoutMs: options.idleTimeoutMs } : {}),
     logger: {
       info: (message) => logs.push(message),
       error: (message) => logs.push(message),
@@ -1592,6 +1594,280 @@ describe("SessionManager", () => {
       expect(h.logs).toContain("notifications: sync failure");
       await h.manager.answer("q1", { value: "a" });
       expect(h.manager.get()?.status).toBe("running");
+    });
+  });
+
+  describe("Pi lifecycle: idle suspension, restart and stats (ADR-0011 §1, §5, §8)", () => {
+    afterEach(() => {
+      vi.useRealTimers();
+    });
+
+    /**
+     * Moves a running session to `ready` with fake setTimeout/clearTimeout. The run leaves a file
+     * change so it gets a checkpoint: its real git work ends (awaited without timers) before the
+     * clock moves, otherwise the idle timer would wait for it.
+     */
+    async function settleWithFakeTimers(
+      h: Harness,
+      pi: FakePi,
+      beforeSettled: () => void = () => undefined,
+    ): Promise<void> {
+      const checkpointsBefore = h.manager.checkpoints().length;
+      await writeFile(join(h.workspaceDir, "NOTES.md"), `run ${checkpointsBefore}\n`);
+      vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+      beforeSettled();
+      pi.emit({ type: "agent_settled" });
+      await waitForEvent(
+        h.events,
+        (event) =>
+          event.type === "checkpoint" &&
+          event.action === "created" &&
+          event.checkpoint.id === checkpointsBefore,
+      );
+      // Lets the checkpoint job finish its bookkeeping (a macrotask runs after all microtasks).
+      await new Promise((resolve) => setImmediate(resolve));
+    }
+
+    async function readyWithFakeTimers(h: Harness): Promise<FakePi> {
+      // The clone and the start run with real timers; the clock is faked once the session is idle.
+      vi.useRealTimers();
+      const pi = await createAndRun(h);
+      await settleWithFakeTimers(h, pi);
+      return pi;
+    }
+
+    function commandSent(pi: FakePi, type: string): Record<string, unknown>[] {
+      return pi.send.mock.calls
+        .map((call) => call[0] as unknown as Record<string, unknown>)
+        .filter((command) => command.type === type);
+    }
+
+    it("starts Pi with --session-id set to the session id", async () => {
+      const h = harness();
+      const pi = await createAndRun(h);
+
+      const args = pi.spec.args;
+      expect(args[args.indexOf("--session-id") + 1]).toBe(h.manager.get()?.id);
+    });
+
+    it("stops an idle ready session after idleTimeoutMs, without an error", async () => {
+      const h = harness(undefined, { idleTimeoutMs: 1000 });
+      const pi = await readyWithFakeTimers(h);
+
+      await vi.advanceTimersByTimeAsync(999);
+      expect(pi.stop).not.toHaveBeenCalled();
+      await vi.advanceTimersByTimeAsync(1);
+
+      expect(pi.stop).toHaveBeenCalledOnce();
+      expect(h.manager.get()).toMatchObject({ status: "ready", suspended: true });
+      expect(h.manager.get()?.error).toBeUndefined();
+      expect(h.events.since(0).events.map((stored) => stored.event)).not.toContainEqual(
+        expect.objectContaining({ type: "status", status: "error" }),
+      );
+      expect(h.logs.some((line) => line.startsWith("pi suspended after "))).toBe(true);
+    });
+
+    it("does not suspend a run in progress", async () => {
+      const h = harness(undefined, { idleTimeoutMs: 1000 });
+      const pi = await createAndRun(h);
+      vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+      pi.emit({
+        type: "message_update",
+        assistantMessageEvent: { type: "text_delta", contentIndex: 0, delta: "…" },
+      });
+
+      await vi.advanceTimersByTimeAsync(5000);
+
+      expect(h.manager.get()?.status).toBe("running");
+      expect(pi.stop).not.toHaveBeenCalled();
+      expect(h.manager.get()?.suspended).toBe(false);
+    });
+
+    it("does not suspend while a question is pending", async () => {
+      const h = harness(undefined, { idleTimeoutMs: 1000 });
+      const pi = await readyWithFakeTimers(h);
+      pi.ui(confirmRequest("q1", "cna:confirm:Push?"));
+      expect(h.manager.get()?.status).toBe("waiting_input");
+
+      await vi.advanceTimersByTimeAsync(5000);
+
+      expect(pi.stop).not.toHaveBeenCalled();
+      expect(h.manager.get()?.suspended).toBe(false);
+    });
+
+    it("never suspends when idleTimeoutMs is 0 or absent", async () => {
+      for (const options of [{ idleTimeoutMs: 0 }, {}]) {
+        const h = harness(undefined, options);
+        const pi = await readyWithFakeTimers(h);
+
+        await vi.advanceTimersByTimeAsync(60 * 60_000);
+
+        expect(pi.stop).not.toHaveBeenCalled();
+        expect(h.manager.get()?.suspended).toBe(false);
+      }
+    });
+
+    it("restarts the idle timer with every activity", async () => {
+      const h = harness(undefined, { idleTimeoutMs: 1000 });
+      const pi = await readyWithFakeTimers(h);
+
+      await vi.advanceTimersByTimeAsync(900);
+      h.manager.todos();
+      await vi.advanceTimersByTimeAsync(100);
+      expect(pi.stop).not.toHaveBeenCalled();
+
+      await vi.advanceTimersByTimeAsync(900);
+      expect(pi.stop).toHaveBeenCalledOnce();
+    });
+
+    it("starts a new Pi with the same session id on postMessage, without streamingBehavior", async () => {
+      const h = harness(undefined, { idleTimeoutMs: 1000 });
+      await readyWithFakeTimers(h);
+      const id = h.manager.get()?.id;
+      await vi.advanceTimersByTimeAsync(1000);
+      expect(h.manager.get()?.suspended).toBe(true);
+
+      await h.manager.postMessage({ text: "again" });
+
+      expect(h.startPi).toHaveBeenCalledTimes(2);
+      const args = onlyPi(h).spec.args;
+      expect(args[args.indexOf("--session-id") + 1]).toBe(id);
+      expect(h.manager.get()?.suspended).toBe(false);
+      expect(commandSent(onlyPi(h), "prompt")).toEqual([{ type: "prompt", message: "again" }]);
+      expect(onlyPi(h).send.mock.calls[0]?.[0]).not.toHaveProperty("streamingBehavior");
+    });
+
+    it("starts Pi again for messages(), stats() and setModel()", async () => {
+      const h = harness(undefined, { idleTimeoutMs: 1000 });
+      await readyWithFakeTimers(h);
+      await vi.advanceTimersByTimeAsync(1000);
+
+      await h.manager.messages();
+      expect(h.startPi).toHaveBeenCalledTimes(2);
+      expect(h.manager.get()?.suspended).toBe(false);
+
+      await vi.advanceTimersByTimeAsync(1000);
+      expect(h.manager.get()?.suspended).toBe(true);
+      // The new Pi is created by the call itself: its responder is set before Pi is asked.
+      const statsCall = h.manager.stats();
+      onlyPi(h).responders.set("get_session_stats", () => ({
+        tokens: { input: 1, output: 2, cacheRead: 0, cacheWrite: 0, total: 3 },
+        cost: 0,
+      }));
+      await statsCall;
+      expect(h.startPi).toHaveBeenCalledTimes(3);
+
+      await vi.advanceTimersByTimeAsync(1000);
+      expect(h.manager.get()?.suspended).toBe(true);
+      await h.manager.setModel({ model: "ollama/qwen3-coder:30b" });
+      expect(h.startPi).toHaveBeenCalledTimes(4);
+      expect(onlyPi(h).send).toHaveBeenCalledWith({
+        type: "set_model",
+        provider: "ollama",
+        modelId: "qwen3-coder:30b",
+      });
+    });
+
+    it("starts a single Pi for concurrent calls after a suspension", async () => {
+      const h = harness(undefined, { idleTimeoutMs: 1000 });
+      await readyWithFakeTimers(h);
+      await vi.advanceTimersByTimeAsync(1000);
+
+      await Promise.all([h.manager.messages(), h.manager.messages()]);
+
+      expect(h.startPi).toHaveBeenCalledTimes(2);
+      expect(h.manager.get()?.suspended).toBe(false);
+    });
+
+    it("does not start Pi for abort() after a suspension", async () => {
+      const h = harness(undefined, { idleTimeoutMs: 1000 });
+      await readyWithFakeTimers(h);
+      await vi.advanceTimersByTimeAsync(1000);
+
+      await h.manager.abort();
+
+      expect(h.startPi).toHaveBeenCalledTimes(1);
+      expect(h.manager.get()?.suspended).toBe(true);
+    });
+
+    it("does not pass --cna-plan to a restarted Pi once the plan is approved", async () => {
+      const h = harness(undefined, { idleTimeoutMs: 1000 });
+      const pi = await createAndRun(h, { ...REQUEST, mode: "plan" });
+      expect(pi.spec.args).toContain("--cna-plan");
+      await settleWithFakeTimers(h, pi, () =>
+        pi.emit({
+          type: "entry_appended",
+          entry: { type: "custom", customType: "cna.mode", data: { mode: "auto" } },
+        }),
+      );
+      await vi.advanceTimersByTimeAsync(1000);
+      expect(pi.stop).toHaveBeenCalledOnce();
+
+      await h.manager.postMessage({ text: "implement it" });
+
+      expect(h.startPi).toHaveBeenCalledTimes(2);
+      expect(onlyPi(h).spec.args).not.toContain("--cna-plan");
+      expect(h.manager.get()?.mode).toBe("auto");
+    });
+
+    it("stops the idle timer on close() and on shutdown()", async () => {
+      const closed = harness(undefined, { idleTimeoutMs: 1000 });
+      const closedPi = await readyWithFakeTimers(closed);
+      await closed.manager.close({ force: true });
+      await vi.advanceTimersByTimeAsync(5000);
+      expect(closedPi.stop).toHaveBeenCalledOnce();
+      expect(closed.manager.get()).toBeNull();
+
+      const shut = harness(undefined, { idleTimeoutMs: 1000 });
+      const shutPi = await readyWithFakeTimers(shut);
+      await shut.manager.shutdown();
+      await vi.advanceTimersByTimeAsync(5000);
+      expect(shutPi.stop).toHaveBeenCalledOnce();
+      expect(shut.logs.some((line) => line.startsWith("pi suspended"))).toBe(false);
+    });
+
+    it("translates the stats of Pi (get_session_stats)", async () => {
+      const h = harness();
+      const pi = await createAndRun(h);
+      pi.responders.set("get_session_stats", () => ({
+        tokens: { input: 100, output: 20, cacheRead: 5, cacheWrite: 1, total: 126 },
+        cost: 0.0123,
+        userMessages: 2,
+        assistantMessages: 3,
+        toolCalls: 4,
+        contextUsage: { contextWindow: 32000, tokens: 1200, percent: 3.75 },
+      }));
+
+      expect(await h.manager.stats()).toEqual({
+        tokens: { input: 100, output: 20, cacheRead: 5, cacheWrite: 1, total: 126 },
+        cost: 0.0123,
+        messages: { user: 2, assistant: 3, toolCalls: 4 },
+        context: { tokens: 1200, window: 32000, percent: 3.75 },
+      });
+      expect(pi.send).toHaveBeenCalledWith({ type: "get_session_stats" });
+    });
+
+    it("throws no_session for stats() without a session", async () => {
+      const h = harness();
+      await expect(h.manager.stats()).rejects.toMatchObject({ code: "no_session" });
+    });
+
+    it("throws invalid_state for stats() while cloning", async () => {
+      const h = harness();
+      await h.manager.create(REQUEST);
+
+      await expect(h.manager.stats()).rejects.toMatchObject({ code: "invalid_state" });
+    });
+
+    it("throws invalid_state when Pi answers stats() without stats", async () => {
+      const h = harness();
+      const pi = await createAndRun(h);
+      pi.responders.set("get_session_stats", () => ({}));
+
+      await expect(h.manager.stats()).rejects.toMatchObject({
+        code: "invalid_state",
+        message: "Pi did not return session stats",
+      });
     });
   });
 });

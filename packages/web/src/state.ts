@@ -174,6 +174,9 @@ function applySessionEvent(state: ViewState, event: StreamEvent["event"]): ViewS
       return patch(state, { todos: event.todos });
     case "checkpoint":
       return applyCheckpoint(state, event.action, event.checkpoint);
+    case "history":
+      // A resumed session (ADR-0011): the conversation so far replaces the transcript.
+      return reduceView(state, { type: "messages", messages: event.messages });
     case "mode":
       if (!state.session || state.session.mode === event.mode) {
         return state;

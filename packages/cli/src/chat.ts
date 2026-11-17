@@ -1,6 +1,13 @@
 import type { AnswerRequest, Question, StreamEvent } from "@cna/shared";
 import { type ApiClient, type EventStreamItem, followEvents } from "@cna/shared/client";
-import { describeError, formatDiff, formatSession, formatTodos, type Output } from "./commands.js";
+import {
+  describeError,
+  formatDiff,
+  formatSession,
+  formatStats,
+  formatTodos,
+  type Output,
+} from "./commands.js";
 import { formatQuestion, isMultiline, parseAnswer } from "./questions.js";
 import { EventPrinter } from "./render.js";
 import { sanitize } from "./style.js";
@@ -26,6 +33,7 @@ export const CHAT_HELP: string = `Comandos del chat:
   /status             Estado de la sesión
   /todos              Lista de tareas del agente
   /diff               Diff frente a la rama base (solo el resumen de ficheros)
+  /stats              Tokens, coste y uso del contexto de la sesión
   /steer <texto>      Envía un mensaje que se inyecta en el turno en curso
   /cancel             Cancela la pregunta activa (cuando hay una pregunta)
 
@@ -262,6 +270,9 @@ class ChatRun {
         this.out(formatDiff(diff, { stat: true, color: this.color }));
         return;
       }
+      case "/stats":
+        this.out(formatStats(await this.client.stats(), this.color));
+        return;
       case "/steer": {
         const text = trimmed.slice(word.length).trim();
         if (text === "") {

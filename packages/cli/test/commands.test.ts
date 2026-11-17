@@ -1,4 +1,4 @@
-import type { DiffResponse, Question, SessionInfo } from "@cna/shared";
+import type { DiffResponse, HistoryEntry, Question, SessionInfo, SessionStats } from "@cna/shared";
 import { ApiClient, ApiClientError } from "@cna/shared/client";
 import { describe, expect, it } from "vitest";
 import type { Command } from "../src/args.js";
@@ -7,11 +7,16 @@ import {
   createSession,
   describeError,
   formatDiff,
+  formatHistory,
   formatSession,
+  formatStats,
   formatTodos,
+  resumeSession,
   runAbort,
   runClose,
   runDiff,
+  runHistory,
+  runStats,
   runStatus,
   runTodos,
 } from "../src/commands.js";
@@ -85,6 +90,8 @@ function sessionInfo(overrides: Partial<SessionInfo> = {}): SessionInfo {
     mode: "auto",
     autoPush: false,
     createdAt: "2026-11-17T10:00:00.000Z",
+    pr: null,
+    suspended: false,
     pendingQuestions: [],
     ...overrides,
   };
@@ -516,6 +523,299 @@ describe("createSession", () => {
   it("returns null and writes the error on session_exists", async () => {
     const { ctx, out, err } = harness(() => json({ error: "session_exists" }, 409));
     expect(await createSession(ctx, runCommand())).toBeNull();
+    expect(out).toEqual([]);
+    expect(err).toEqual([
+      "cna: Ya hay una sesión en esta réplica (mira cna status o ciérrala con cna close)\n",
+    ]);
+  });
+});
+
+describe("createSession with a pull request", () => {
+  it("sends pr and no prompt when the run has no prompt", async () => {
+    const { ctx, requests, out, err } = harness(() =>
+      json(sessionInfo({ status: "idle", pr: 12 }), 201),
+    );
+    const info = await createSession(ctx, runCommand({ prompt: undefined, pr: 12 }));
+    expect(info?.pr).toBe(12);
+    expect(requests[0]?.body).toBe('{"repo":"owner/x","pr":12,"mode":"auto"}');
+    expect(out).toEqual(["Sesión creada: owner/x PR #12 (estado: idle)\n"]);
+    expect(err).toEqual([]);
+  });
+
+  it("sends the prompt together with pr when both are given", async () => {
+    const { ctx, requests } = harness(() => json(sessionInfo({ status: "running", pr: 12 }), 201));
+    await createSession(ctx, runCommand({ prompt: "revisa", pr: 12 }));
+    expect(requests[0]?.body).toBe('{"repo":"owner/x","prompt":"revisa","pr":12,"mode":"auto"}');
+  });
+});
+
+describe("formatSession with a pull request and suspension", () => {
+  it("shows the PR number", () => {
+    expect(formatSession(sessionInfo({ pr: 12 }), false)).toContain("PR: #12\n");
+  });
+
+  it("omits the PR line without a PR", () => {
+    expect(formatSession(sessionInfo(), false)).not.toContain("PR:");
+  });
+
+  it("says that Pi is paused when the session is suspended", () => {
+    expect(formatSession(sessionInfo({ suspended: true }), false)).toContain(
+      "Pi: en pausa por inactividad (arranca con el siguiente mensaje)\n",
+    );
+  });
+
+  it("omits the Pi line when the session is not suspended", () => {
+    expect(formatSession(sessionInfo(), false)).not.toContain("Pi:");
+  });
+});
+
+const STATS: SessionStats = {
+  tokens: { input: 50000, output: 10000, cacheRead: 40000, cacheWrite: 5000, total: 105000 },
+  cost: 0.45,
+  messages: { user: 5, assistant: 5, toolCalls: 12 },
+  context: { tokens: 60000, window: 200000, percent: 30 },
+};
+
+describe("formatStats", () => {
+  it("prints cost, tokens, messages and context", () => {
+    expect(formatStats(STATS, false)).toBe(
+      [
+        "Coste: $0.45",
+        "Tokens: 105000 (entrada 50000, salida 10000, caché leída 40000, caché escrita 5000)",
+        "Mensajes: 5 tuyos, 5 del agente, 12 llamadas a tools",
+        "Contexto: 60000 de 200000 (30 %)",
+        "",
+      ].join("\n"),
+    );
+  });
+
+  it("says the context was just compacted when its tokens and percent are null", () => {
+    const text = formatStats(
+      { ...STATS, context: { tokens: null, window: 200000, percent: null } },
+      false,
+    );
+    expect(text).toContain("Contexto: recién compactado\n");
+  });
+
+  it("says the context is unknown when it is null", () => {
+    expect(formatStats({ ...STATS, context: null }, false)).toContain("Contexto: desconocido\n");
+  });
+
+  it("shows amounts under one cent as <$0.01", () => {
+    expect(formatStats({ ...STATS, cost: 0.004 }, false)).toContain("Coste: <$0.01\n");
+    expect(formatStats({ ...STATS, cost: 0.005 }, false)).toContain("Coste: <$0.01\n");
+  });
+
+  it("shows zero cost as $0.00 and a cent as $0.01", () => {
+    expect(formatStats({ ...STATS, cost: 0 }, false)).toContain("Coste: $0.00\n");
+    expect(formatStats({ ...STATS, cost: 0.01 }, false)).toContain("Coste: $0.01\n");
+  });
+
+  it("paints the labels in bold when color is on", () => {
+    expect(formatStats(STATS, true)).toContain(`${ESC}[1mCoste:${ESC}[0m $0.45`);
+    expect(formatStats(STATS, false)).not.toContain(ESC);
+  });
+});
+
+describe("runStats", () => {
+  it("prints GET /session/stats and returns 0", async () => {
+    const { ctx, requests, out, err } = harness(() => json(STATS));
+    expect(await runStats(ctx)).toBe(0);
+    expect(requests[0]).toMatchObject({
+      method: "GET",
+      url: "http://edge.test/session/stats",
+      authorization: `Bearer ${TOKEN}`,
+    });
+    expect(out.join("")).toContain("Coste: $0.45\n");
+    expect(err).toEqual([]);
+  });
+
+  it("writes the error to stderr and returns 1", async () => {
+    const { ctx, out, err } = harness(() => json({ error: "no_session", message: "x" }, 404));
+    expect(await runStats(ctx)).toBe(1);
+    expect(out).toEqual([]);
+    expect(err).toEqual(["cna: No hay ninguna sesión activa\n"]);
+  });
+});
+
+const SESSION_ID = "3f2a9c1b-0d4e-4f5a-8b6c-7d8e9f0a1b2c";
+const OTHER_ID = "9a8b7c6d-1111-4222-8333-444455556666";
+
+function historyEntry(overrides: Partial<HistoryEntry> = {}): HistoryEntry {
+  return {
+    id: SESSION_ID,
+    repo: "owner/x",
+    baseBranch: "main",
+    branch: "agent/fix-1",
+    pr: null,
+    mode: "auto",
+    model: null,
+    createdAt: "2026-11-17T10:00:00.000Z",
+    closedAt: "2026-11-17T11:00:00.000Z",
+    status: "closed",
+    stats: null,
+    resumable: false,
+    ...overrides,
+  };
+}
+
+describe("formatHistory", () => {
+  it("says there are no sessions when the list is empty", () => {
+    expect(formatHistory([], false)).toBe("Todavía no hay sesiones.\n");
+  });
+
+  it("prints one line per session, with the short id, the current one and the cost", () => {
+    const text = formatHistory(
+      [
+        historyEntry({ resumable: true, stats: STATS }),
+        historyEntry({
+          id: OTHER_ID,
+          repo: "octo/hello",
+          pr: 7,
+          branch: null,
+          closedAt: null,
+          status: "running",
+        }),
+      ],
+      false,
+    );
+    expect(text).toBe(
+      [
+        "3f2a9c1b  2026-11-17 10:00  owner/x  agent/fix-1  closed  $0.45  [reanudable]",
+        "9a8b7c6d  2026-11-17 10:00  octo/hello PR #7  —  actual  —",
+        "Retoma una con: cna resume <id>",
+        "",
+      ].join("\n"),
+    );
+  });
+
+  it("paints [reanudable] in green when color is on", () => {
+    const text = formatHistory([historyEntry({ resumable: true })], true);
+    expect(text).toContain(`  ${ESC}[32m[reanudable]${ESC}[0m\n`);
+  });
+
+  it("omits the resume hint when no session can be resumed", () => {
+    const text = formatHistory([historyEntry({ stats: STATS })], false);
+    expect(text).not.toContain("Retoma");
+    expect(text).not.toContain("[reanudable]");
+    expect(text).toContain("  closed  $0.45\n");
+  });
+
+  it("sanitizes the text from the server", () => {
+    const text = formatHistory([historyEntry({ repo: "owner/\x1b[2Jx" })], false);
+    expect(text).not.toContain(ESC);
+    expect(text).toContain("owner/�[2Jx");
+  });
+});
+
+describe("runHistory", () => {
+  it("prints GET /session/history and returns 0", async () => {
+    const { ctx, requests, out, err } = harness(() =>
+      json({ sessions: [historyEntry({ resumable: true })] }),
+    );
+    expect(await runHistory(ctx)).toBe(0);
+    expect(requests[0]).toMatchObject({
+      method: "GET",
+      url: "http://edge.test/session/history",
+    });
+    expect(out.join("")).toContain("3f2a9c1b  2026-11-17 10:00  owner/x");
+    expect(err).toEqual([]);
+  });
+
+  it("writes the error to stderr and returns 1", async () => {
+    const { ctx, out, err } = harness(() =>
+      json({ error: "internal_error", message: "boom" }, 500),
+    );
+    expect(await runHistory(ctx)).toBe(1);
+    expect(out).toEqual([]);
+    expect(err).toEqual(["cna: boom (internal_error)\n"]);
+  });
+});
+
+function resumeCommand(
+  overrides: Partial<Extract<Command, { name: "resume" }>> = {},
+): Extract<Command, { name: "resume" }> {
+  return { name: "resume", id: SESSION_ID, detach: false, ...overrides };
+}
+
+/** Routes the history endpoints of a fake edge; any other request gets a 404. */
+function historyHandler(sessions: HistoryEntry[]) {
+  return (request: RecordedRequest): Response => {
+    if (request.method === "GET" && request.url === "http://edge.test/session/history") {
+      return json({ sessions });
+    }
+    if (request.method === "POST" && request.url.endsWith("/resume")) {
+      const id = decodeURIComponent(request.url.split("/").at(-2) ?? "");
+      if (id === SESSION_ID) {
+        return json(sessionInfo({ id, status: "ready", branch: "agent/fix-1" }), 201);
+      }
+    }
+    return json({ error: "history_not_found", message: "x" }, 404);
+  };
+}
+
+describe("resumeSession", () => {
+  it("resumes a session by its full id with an empty body", async () => {
+    const { ctx, requests, out, err } = harness(historyHandler([historyEntry()]));
+    const info = await resumeSession(ctx, resumeCommand());
+    expect(info?.status).toBe("ready");
+    const post = requests.find((request) => request.method === "POST");
+    expect(post).toMatchObject({
+      url: `http://edge.test/session/history/${SESSION_ID}/resume`,
+      authorization: `Bearer ${TOKEN}`,
+      body: "{}",
+    });
+    expect(out).toEqual(["Sesión reanudada: owner/x en agent/fix-1 (estado: ready)\n"]);
+    expect(err).toEqual([]);
+  });
+
+  it("sends the prompt when one is given", async () => {
+    const { ctx, requests } = harness(historyHandler([historyEntry()]));
+    await resumeSession(ctx, resumeCommand({ prompt: "sigue" }));
+    expect(requests.find((request) => request.method === "POST")?.body).toBe('{"prompt":"sigue"}');
+  });
+
+  it("resolves a unique prefix of the id from the history", async () => {
+    const { ctx, requests, out } = harness(
+      historyHandler([historyEntry(), historyEntry({ id: OTHER_ID })]),
+    );
+    expect(await resumeSession(ctx, resumeCommand({ id: "3f2a" }))).not.toBeNull();
+    expect(requests.map((request) => request.method)).toEqual(["GET", "POST"]);
+    expect(requests[1]?.url).toBe(`http://edge.test/session/history/${SESSION_ID}/resume`);
+    expect(out).toHaveLength(1);
+  });
+
+  it("refuses an ambiguous prefix without resuming anything", async () => {
+    const { ctx, requests, out, err } = harness(
+      historyHandler([
+        historyEntry(),
+        historyEntry({ id: "3f2a0000-1111-4222-8333-444455556666" }),
+      ]),
+    );
+    expect(await resumeSession(ctx, resumeCommand({ id: "3f2a" }))).toBeNull();
+    expect(requests.some((request) => request.method === "POST")).toBe(false);
+    expect(out).toEqual([]);
+    expect(err).toEqual(["cna: El id es ambiguo: escribe más caracteres\n"]);
+  });
+
+  it("refuses a prefix that matches no session", async () => {
+    const { ctx, requests, err } = harness(historyHandler([historyEntry()]));
+    expect(await resumeSession(ctx, resumeCommand({ id: "ffff" }))).toBeNull();
+    expect(requests.some((request) => request.method === "POST")).toBe(false);
+    expect(err).toEqual(["cna: No existe esa sesión en el historial\n"]);
+  });
+
+  it("explains history_not_found", async () => {
+    const { ctx, err } = harness(() =>
+      json({ error: "history_not_found", message: "no encontrada" }, 404),
+    );
+    expect(await resumeSession(ctx, resumeCommand())).toBeNull();
+    expect(err).toEqual(["cna: No existe esa sesión en el historial\n"]);
+  });
+
+  it("explains session_exists when the replica is busy", async () => {
+    const { ctx, out, err } = harness(() => json({ error: "session_exists" }, 409));
+    expect(await resumeSession(ctx, resumeCommand())).toBeNull();
     expect(out).toEqual([]);
     expect(err).toEqual([
       "cna: Ya hay una sesión en esta réplica (mira cna status o ciérrala con cna close)\n",
