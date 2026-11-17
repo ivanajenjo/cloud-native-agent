@@ -143,6 +143,54 @@ export interface PreparedWorkspace {
   branch: string;
 }
 
+export interface CloneOptions {
+  git: GitRunner;
+  /** "owner/name" (already validated). */
+  repo: string;
+  /** Target directory (absolute). Must NOT exist or be empty. */
+  dir: string;
+  /** Branch to clone (`--branch`); default: the remote's default branch. */
+  branch?: string;
+  userName?: string;
+  userEmail?: string;
+  /** Default "https://github.com/". The URL is `${remoteBase}${repo}.git`. */
+  remoteBase?: string;
+}
+
+/**
+ * Clones like prepareWorkspace does (credential helper `!gh auth git-credential`, never a token in the URL,
+ * dir empty or missing, parent created) and sets the commit identity. Returns nothing.
+ */
+export async function cloneRepo(options: CloneOptions): Promise<void> {
+  const { git, repo, dir, branch, userName, userEmail } = options;
+  const remoteBase = options.remoteBase ?? DEFAULT_REMOTE_BASE;
+  const parent = dirname(dir);
+
+  await assertEmptyOrMissing(dir);
+  await mkdir(parent, { recursive: true });
+
+  // Credentials never go in the URL. The first empty helper resets inherited helpers.
+  const cloneArgs = [
+    "clone",
+    "-c",
+    "credential.helper=",
+    "-c",
+    `credential.helper=${GH_CREDENTIAL_HELPER}`,
+  ];
+  if (branch !== undefined) {
+    cloneArgs.push("--branch", branch);
+  }
+  cloneArgs.push("--", `${remoteBase}${repo}.git`, dir);
+  await git(cloneArgs, { cwd: parent });
+
+  if (userName !== undefined) {
+    await git(["config", "user.name", userName], { cwd: dir });
+  }
+  if (userEmail !== undefined) {
+    await git(["config", "user.email", userEmail], { cwd: dir });
+  }
+}
+
 /**
  * Clones the repo into dir, picks the base branch and creates the work branch agent/<slug>
  * (with a numeric suffix if it already exists on the remote), and sets the commit identity.
@@ -166,40 +214,90 @@ export async function prepareWorkspace(
     }
   }
 
-  await assertEmptyOrMissing(dir);
-  await mkdir(parent, { recursive: true });
-
-  // Credentials never go in the URL. The first empty helper resets inherited helpers.
-  const cloneArgs = [
-    "clone",
-    "-c",
-    "credential.helper=",
-    "-c",
-    `credential.helper=${GH_CREDENTIAL_HELPER}`,
-  ];
-  if (options.baseBranch !== undefined) {
-    cloneArgs.push("--branch", options.baseBranch);
-  }
-  cloneArgs.push("--", `${remoteBase}${repo}.git`, dir);
-  await git(cloneArgs, { cwd: parent });
+  await cloneRepo({
+    git,
+    repo,
+    dir,
+    branch: options.baseBranch,
+    userName,
+    userEmail,
+    remoteBase,
+  });
 
   const baseBranch = options.baseBranch ?? (await readRemoteDefaultBranch(git, dir));
   const branch = await pickBranchName(git, dir, slug);
 
   await git(["checkout", "-b", branch], { cwd: dir });
 
-  if (userName !== undefined) {
-    await git(["config", "user.name", userName], { cwd: dir });
+  return { baseBranch, branch };
+}
+
+export interface PrepareResumeOptions {
+  git: GitRunner;
+  /** "owner/name" (already validated). */
+  repo: string;
+  /** Target directory (absolute). Must NOT exist or be empty. */
+  dir: string;
+  /** The session's branch (must start with "agent/"). */
+  branch: string;
+  /** The session's base branch. */
+  baseBranch: string;
+  userName?: string;
+  userEmail?: string;
+  /** Default "https://github.com/". */
+  remoteBase?: string;
+}
+
+/**
+ * Clones the repo on `baseBranch` and checks out `branch`: tracking origin/<branch> if it exists on the remote,
+ * otherwise created from the base (nothing of it was pushed). Throws Error if `branch` does not start with "agent/",
+ * equals `baseBranch`, or fails `git check-ref-format --branch`; GitError on git failures.
+ */
+export async function prepareResumeWorkspace(
+  options: PrepareResumeOptions,
+): Promise<PreparedWorkspace> {
+  const { git, repo, dir, branch, baseBranch, userName, userEmail } = options;
+  const remoteBase = options.remoteBase ?? DEFAULT_REMOTE_BASE;
+
+  // Validated before touching the disk: check-ref-format runs in an existing ancestor.
+  if (!branch.startsWith("agent/")) {
+    throw new Error(`resume branch "${branch}" is not an agent/* branch`);
   }
-  if (userEmail !== undefined) {
-    await git(["config", "user.email", userEmail], { cwd: dir });
+  if (branch === baseBranch) {
+    throw new Error(`resume branch "${branch}" is the base branch`);
+  }
+  if (!(await isValidBranchName(git, branch, await nearestExistingDir(dirname(dir))))) {
+    throw new Error(`invalid branch name "${branch}"`);
+  }
+
+  await cloneRepo({
+    git,
+    repo,
+    dir,
+    branch: baseBranch,
+    userName,
+    userEmail,
+    remoteBase,
+  });
+
+  const { stdout } = await git(["ls-remote", "--heads", "origin", `refs/heads/${branch}`], {
+    cwd: dir,
+  });
+  if (stdout.trim() !== "") {
+    await git(["checkout", "-b", branch, "--track", `origin/${branch}`], { cwd: dir });
+  } else {
+    await git(["checkout", "-b", branch], { cwd: dir });
   }
 
   return { baseBranch, branch };
 }
 
 /** True if `git check-ref-format --branch` accepts the name and it does not start with "-". */
-async function isValidBranchName(git: GitRunner, name: string, cwd: string): Promise<boolean> {
+export async function isValidBranchName(
+  git: GitRunner,
+  name: string,
+  cwd: string,
+): Promise<boolean> {
   if (name.startsWith("-")) {
     return false;
   }
@@ -230,7 +328,7 @@ async function assertEmptyOrMissing(dir: string): Promise<void> {
   }
 }
 
-async function nearestExistingDir(path: string): Promise<string> {
+export async function nearestExistingDir(path: string): Promise<string> {
   let current = path;
   for (;;) {
     try {

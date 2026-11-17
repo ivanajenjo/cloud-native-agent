@@ -9,6 +9,7 @@ import {
   GH_CREDENTIAL_HELPER,
   GitError,
   gitEnv,
+  prepareResumeWorkspace,
   prepareWorkspace,
   slugify,
   workspaceState,
@@ -357,5 +358,80 @@ describe("workspaceState", () => {
     const dir = join(root, "plain-with-git");
     await mkdir(join(dir, ".git"), { recursive: true });
     await expect(workspaceState(git, dir, { checkUnpushed: false })).rejects.toThrow(GitError);
+  });
+});
+
+describe("prepareResumeWorkspace", () => {
+  it("checks out the existing remote branch with tracking and its commits", async () => {
+    // The session's branch already exists on the remote: "develop work" lives there, not on main.
+    const source = join(root, "source");
+    await git(["push", remoteDir, "develop:refs/heads/agent/resume"], { cwd: source });
+
+    const dir = workspaceDir();
+    const result = await prepareResumeWorkspace({
+      git,
+      repo: "octo/hello",
+      dir,
+      branch: "agent/resume",
+      baseBranch: "main",
+      remoteBase,
+    });
+
+    expect(result).toEqual({ baseBranch: "main", branch: "agent/resume" });
+    expect(await currentBranch(dir)).toBe("agent/resume");
+    const upstream = await git(["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}"], {
+      cwd: dir,
+    });
+    expect(upstream.stdout.trim()).toBe("origin/agent/resume");
+    const subject = await git(["log", "-1", "--format=%s"], { cwd: dir });
+    expect(subject.stdout.trim()).toBe("develop work");
+    expect(existsSync(join(dir, "DEVELOP.md"))).toBe(true);
+  });
+
+  it("creates the branch from the base when it does not exist on the remote", async () => {
+    const dir = workspaceDir();
+    const result = await prepareResumeWorkspace({
+      git,
+      repo: "octo/hello",
+      dir,
+      branch: "agent/never-pushed",
+      baseBranch: "main",
+      remoteBase,
+    });
+
+    expect(result).toEqual({ baseBranch: "main", branch: "agent/never-pushed" });
+    expect(await currentBranch(dir)).toBe("agent/never-pushed");
+    const subject = await git(["log", "-1", "--format=%s"], { cwd: dir });
+    expect(subject.stdout.trim()).toBe("initial");
+    expect(existsSync(join(dir, "DEVELOP.md"))).toBe(false);
+  });
+
+  it("rejects branches outside agent/* and the base branch itself", async () => {
+    for (const branch of ["main", "feature/x"]) {
+      const dir = workspaceDir(`resume-${branch.replace("/", "-")}`);
+      const error = await prepareResumeWorkspace({
+        git,
+        repo: "octo/hello",
+        dir,
+        branch,
+        baseBranch: "main",
+        remoteBase,
+      }).catch((e: unknown) => e);
+
+      expect(error).toBeInstanceOf(Error);
+      expect(error).not.toBeInstanceOf(GitError);
+      expect(existsSync(dir)).toBe(false);
+    }
+
+    await expect(
+      prepareResumeWorkspace({
+        git,
+        repo: "octo/hello",
+        dir: workspaceDir("resume-same"),
+        branch: "agent/main",
+        baseBranch: "agent/main",
+        remoteBase,
+      }),
+    ).rejects.toThrow(/base branch/);
   });
 });
