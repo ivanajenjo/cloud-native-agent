@@ -12,6 +12,7 @@ import type {
   QuestionOutcome,
   RestoreCheckpointResponse,
   SessionInfo,
+  SessionStats,
   SetModelRequest,
   TodoItem,
 } from "@cna/shared";
@@ -76,6 +77,9 @@ export interface SessionService {
 
   /** Full conversation from Pi (`get_messages`), redacted. Throws no_session; invalid_state if Pi is not running. */
   messages(): Promise<PiMessage[]>;
+
+  /** Token usage and cost of the session (Pi get_session_stats). Throws no_session; invalid_state while cloning, closed or in error, or if Pi cannot start or answers without stats. */
+  stats(): Promise<SessionStats>;
 
   /** Checkpoints of the session, oldest first (copies). Throws no_session. */
   checkpoints(): Checkpoint[];

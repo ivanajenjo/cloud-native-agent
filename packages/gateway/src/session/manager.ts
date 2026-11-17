@@ -18,6 +18,7 @@ import {
   type RestoreCheckpointResponse,
   type SessionEvent,
   type SessionInfo,
+  type SessionStats,
   type SessionStatus,
   type SetModelRequest,
   type TodoItem,
@@ -58,6 +59,7 @@ import { normalizeRpcEvent, uiRequestToNotify, uiRequestToQuestion } from "./nor
 import { PendingQuestions } from "./pending-questions.js";
 import { answerToUiResponse, outcomeOfAnswer } from "./questions.js";
 import { SessionError, type SessionService } from "./service.js";
+import { parseSessionStats } from "./stats.js";
 
 /** What the manager needs from a running Pi (RpcBridge implements it). */
 export interface PiProcess {
@@ -95,6 +97,11 @@ export interface SessionManagerOptions {
   remoteBase?: string;
   /** Push notifications of status changes (ADR-0009). Absent: no notifications. */
   notifier?: Notifier;
+  /**
+   * Milliseconds without activity after which an idle `ready` session stops Pi (ADR-0011 §5).
+   * Absent or 0: Pi is never suspended.
+   */
+  idleTimeoutMs?: number;
   /** Default console. Receives only redacted text. */
   logger?: { info(message: string): void; error(message: string): void };
   now?: () => Date;
@@ -168,6 +175,15 @@ export class SessionManager implements SessionService {
   private checkpointQueue: Promise<void> = Promise.resolve();
   /** True while a checkpoint is being restored: no new prompt or restore may start meanwhile. */
   private restoring = false;
+  /** Number of run checkpoints queued or being taken. The idle suspension waits for them. */
+  private checkpointJobs = 0;
+  /** Stop of a Pi that the idle suspension is stopping. A new Pi starts only after it. */
+  private suspension: Promise<void> | undefined;
+  /** Timer of the idle suspension, if armed (ADR-0011 §5). */
+  private idleTimer: ReturnType<typeof setTimeout> | undefined;
+  private readonly idleTimeoutMs: number;
+  /** Set by shutdown(): no Pi may start any more. */
+  private shuttingDown = false;
 
   constructor(options: SessionManagerOptions) {
     this.options = options;
@@ -179,10 +195,13 @@ export class SessionManager implements SessionService {
     };
     this.now = options.now ?? (() => new Date());
     this.newId = options.newId ?? randomUUID;
+    this.idleTimeoutMs = options.idleTimeoutMs ?? 0;
   }
 
   /** Stops Pi if running (used on gateway shutdown). Does not delete the workspace. */
   async shutdown(): Promise<void> {
+    this.shuttingDown = true;
+    this.clearIdleTimer();
     const pi = this.pi;
     this.pi = null;
     if (pi !== null) {
@@ -207,6 +226,7 @@ export class SessionManager implements SessionService {
       throw new SessionError("session_exists");
     }
 
+    this.clearIdleTimer();
     // A previous session in error is discarded. Its Pi, if still alive, stops before the new clone.
     let stopping: Promise<void> | undefined;
     if (previous !== null) {
@@ -259,6 +279,7 @@ export class SessionManager implements SessionService {
     if (this.info === null) {
       throw new SessionError("no_session");
     }
+    this.markActivity();
     return this.todoList.map((item) => ({ ...item }));
   }
 
@@ -267,8 +288,8 @@ export class SessionManager implements SessionService {
     if (info === null) {
       throw new SessionError("no_session");
     }
-    const pi = this.pi;
-    if (pi === null || !MESSAGE_STATUSES.includes(info.status)) {
+    this.markActivity();
+    if (!MESSAGE_STATUSES.includes(info.status)) {
       throw new SessionError("invalid_state");
     }
     // A checkpoint being taken must not count the message sent next (its forkIndex).
@@ -277,6 +298,7 @@ export class SessionManager implements SessionService {
       throw new SessionError("invalid_state", "a checkpoint is being restored");
     }
 
+    const pi = await this.ensurePi();
     const command: RpcCommandInput = this.settled
       ? { type: "prompt", message: request.text }
       : {
@@ -300,6 +322,7 @@ export class SessionManager implements SessionService {
     if (this.info === null) {
       throw new SessionError("no_session");
     }
+    this.markActivity();
     const entry = this.questions.get(questionId);
     if (entry?.source === "pi") {
       const check = answerToUiResponse(entry.question, answer);
@@ -330,10 +353,7 @@ export class SessionManager implements SessionService {
     if (info === null) {
       throw new SessionError("no_session");
     }
-    const pi = this.pi;
-    if (pi === null) {
-      throw new SessionError("invalid_state");
-    }
+    this.markActivity();
     // Provider and model id are split at the first "/": model ids may contain "/" and ":".
     const slash = request.model.indexOf("/");
     if (slash <= 0) {
@@ -341,6 +361,8 @@ export class SessionManager implements SessionService {
     }
     const provider = request.model.slice(0, slash);
     const modelId = request.model.slice(slash + 1);
+    // Validated first: a malformed model must not start a suspended Pi.
+    const pi = await this.ensurePi();
 
     try {
       await pi.send({ type: "set_model", provider, modelId });
@@ -367,6 +389,7 @@ export class SessionManager implements SessionService {
     if (this.info === null) {
       throw new SessionError("no_session");
     }
+    this.markActivity();
     for (const question of this.questions.list()) {
       if (this.questions.get(question.id)?.source !== "pi") {
         continue;
@@ -392,20 +415,37 @@ export class SessionManager implements SessionService {
     if (this.info === null) {
       throw new SessionError("no_session");
     }
-    const pi = this.pi;
-    if (pi === null) {
-      throw new SessionError("invalid_state");
-    }
+    this.markActivity();
+    const pi = await this.ensurePi();
     const data = await this.sendToPi(pi, { type: "get_messages" });
     const list: unknown = isRecord(data) ? data.messages : undefined;
     const messages = Array.isArray(list) ? (list as PiMessage[]) : [];
     return this.redactor.redact(messages);
   }
 
+  /** Token usage and cost of the session (Pi get_session_stats, ADR-0011 §8). Starts Pi if suspended. */
+  async stats(): Promise<SessionStats> {
+    const info = this.info;
+    if (info === null) {
+      throw new SessionError("no_session");
+    }
+    if (info.status === "cloning") {
+      throw new SessionError("invalid_state", "the workspace is still being cloned");
+    }
+    this.markActivity();
+    const pi = await this.ensurePi();
+    const stats = parseSessionStats(await this.sendToPi(pi, { type: "get_session_stats" }));
+    if (stats === null) {
+      throw new SessionError("invalid_state", "Pi did not return session stats");
+    }
+    return stats;
+  }
+
   checkpoints(): Checkpoint[] {
     if (this.info === null) {
       throw new SessionError("no_session");
     }
+    this.markActivity();
     return this.checkpointList.map((record) => ({ ...record.checkpoint }));
   }
 
@@ -423,6 +463,7 @@ export class SessionManager implements SessionService {
     if (started === null) {
       throw new SessionError("no_session");
     }
+    this.markActivity();
     await this.checkpointQueue;
     if (!this.isCurrent(started.id)) {
       throw new SessionError("no_session");
@@ -441,24 +482,20 @@ export class SessionManager implements SessionService {
       throw new SessionError("invalid_state", "a checkpoint is being restored");
     }
     // Checked before anything is touched: a restore that cannot fork must not move the files.
-    const pi = this.pi;
-    if (options.conversation) {
-      if (pi === null) {
-        throw new SessionError("invalid_state", "Pi is not running");
-      }
-      if (record.forkIndex < 0) {
-        throw new SessionError(
-          "invalid_state",
-          "the conversation position of this checkpoint is unknown",
-        );
-      }
+    if (options.conversation && record.forkIndex < 0) {
+      throw new SessionError(
+        "invalid_state",
+        "the conversation position of this checkpoint is unknown",
+      );
     }
 
     const git = this.options.git;
     const dir = this.options.workspaceDir;
     this.restoring = true;
     try {
-      if (pi !== null && options.conversation) {
+      if (options.conversation) {
+        // Starts Pi if it is suspended: the fork needs it. Files are not touched before that.
+        const pi = await this.ensurePi();
         await this.restoreFilesAndConversation(pi, record);
       } else {
         await restoreWorkingTree(git, dir, record.checkpoint.commit);
@@ -496,6 +533,7 @@ export class SessionManager implements SessionService {
     if (info === null) {
       throw new SessionError("no_session");
     }
+    this.markActivity();
     const baseBranch = info.baseBranch;
     if (info.status === "cloning" || baseBranch === null || info.branch === null) {
       throw new SessionError("invalid_state", "the workspace is not ready for a diff");
@@ -538,11 +576,13 @@ export class SessionManager implements SessionService {
     if (info === null || this.closing) {
       throw new SessionError("no_session");
     }
+    this.markActivity();
     this.closing = true;
     try {
       if (!options.force && info.status !== "cloning") {
         await this.checkWorkspaceState(info);
       }
+      this.clearIdleTimer();
       const pi = this.pi;
       this.pi = null;
       if (pi !== null) {
@@ -624,18 +664,7 @@ export class SessionManager implements SessionService {
         return;
       }
 
-      const spec = buildPiLaunch({
-        ...this.options.pi,
-        sessionId: info.id,
-        cwd: this.options.workspaceDir,
-        model: info.model ?? undefined,
-        thinking: info.thinking ?? undefined,
-        baseBranch: prepared.baseBranch,
-        autoPush: info.autoPush,
-        plan: info.mode === "plan",
-        webConfigFile: this.options.pi.webConfigFile,
-      });
-      const pi = this.options.startPi(spec, this.handlersFor(sessionId));
+      const pi = this.launchPi(sessionId);
       this.pi = pi;
       this.settled = false;
       this.setStatus("running");
@@ -678,8 +707,134 @@ export class SessionManager implements SessionService {
 
   /** Queues the checkpoint of the run that just settled, after the jobs already queued. Never rejects. */
   private enqueueRunCheckpoint(sessionId: string): void {
-    const job = this.checkpointQueue.then(() => this.createRunCheckpoint(sessionId));
+    this.checkpointJobs++;
+    const job = this.checkpointQueue
+      .then(() => this.createRunCheckpoint(sessionId))
+      .finally(() => {
+        this.checkpointJobs--;
+      });
     this.checkpointQueue = job.catch(() => undefined);
+  }
+
+  /**
+   * Starts Pi on the workspace with the session id (ADR-0011 §1): a Pi started again with the same id
+   * reopens the conversation. Throws invalid_state if the session has no base branch yet.
+   */
+  private launchPi(sessionId: string): PiProcess {
+    const info = this.current(sessionId);
+    if (info === null || info.baseBranch === null) {
+      throw new SessionError("invalid_state", "the workspace is not ready");
+    }
+    const spec = buildPiLaunch({
+      ...this.options.pi,
+      sessionId: info.id,
+      cwd: this.options.workspaceDir,
+      model: info.model ?? undefined,
+      thinking: info.thinking ?? undefined,
+      baseBranch: info.baseBranch,
+      autoPush: info.autoPush,
+      plan: info.mode === "plan",
+      webConfigFile: this.options.pi.webConfigFile,
+    });
+    return this.options.startPi(spec, this.handlersFor(sessionId));
+  }
+
+  /**
+   * The running Pi, starting it again if the idle suspension stopped it (ADR-0011 §5). Throws
+   * invalid_state if the session cannot have a Pi (cloning, closed, in error, or without branch).
+   */
+  private async ensurePi(): Promise<PiProcess> {
+    if (this.pi !== null) {
+      return this.pi;
+    }
+    // The stopped Pi must have exited before a new one starts, or its exit would clear the new one.
+    if (this.suspension !== undefined) {
+      await this.suspension;
+      if (this.pi !== null) {
+        return this.pi;
+      }
+    }
+    const info = this.info;
+    if (
+      info === null ||
+      this.shuttingDown ||
+      this.closing ||
+      info.status === "cloning" ||
+      info.status === "closed" ||
+      info.status === "error" ||
+      info.baseBranch === null ||
+      info.branch === null
+    ) {
+      throw new SessionError("invalid_state", "the session has no Pi to talk to");
+    }
+    // Synchronous from here to the assignment: concurrent callers all see this Pi.
+    const pi = this.launchPi(info.id);
+    this.pi = pi;
+    // A fresh Pi is idle: the run it lost, if any, is not resumed (ADR-0011 §3).
+    this.settled = true;
+    info.suspended = false;
+    this.armIdleTimer();
+    return pi;
+  }
+
+  /** Any public call (except get) and any Pi event counts as activity: the idle timer restarts. */
+  private markActivity(): void {
+    this.armIdleTimer();
+  }
+
+  /** (Re)arms the idle timer if the suspension is on and Pi is running. */
+  private armIdleTimer(): void {
+    this.clearIdleTimer();
+    if (this.idleTimeoutMs <= 0 || this.info === null || this.pi === null) {
+      return;
+    }
+    const timer = setTimeout(() => {
+      this.idleTimer = undefined;
+      void this.suspendIfIdle();
+    }, this.idleTimeoutMs);
+    timer.unref();
+    this.idleTimer = timer;
+  }
+
+  private clearIdleTimer(): void {
+    if (this.idleTimer !== undefined) {
+      clearTimeout(this.idleTimer);
+      this.idleTimer = undefined;
+    }
+  }
+
+  /** Stops Pi if the session is still idle; otherwise re-arms the timer when the wait may end later. */
+  private async suspendIfIdle(): Promise<void> {
+    const info = this.info;
+    const pi = this.pi;
+    if (
+      info === null ||
+      pi === null ||
+      info.status !== "ready" ||
+      !this.settled ||
+      this.questions.size > 0 ||
+      this.restoring ||
+      this.closing
+    ) {
+      return;
+    }
+    if (this.checkpointJobs > 0) {
+      this.armIdleTimer();
+      return;
+    }
+    this.pi = null;
+    info.suspended = true;
+    const minutes = Math.round((this.idleTimeoutMs / 60_000) * 1000) / 1000;
+    this.logger.info(`pi suspended after ${minutes} min of inactivity`);
+    const stopping = this.stopPiQuietly(pi);
+    this.suspension = stopping;
+    try {
+      await stopping;
+    } finally {
+      if (this.suspension === stopping) {
+        this.suspension = undefined;
+      }
+    }
   }
 
   /** Creates a checkpoint if the working tree changed since the last one. Errors are logged. */
@@ -829,6 +984,7 @@ export class SessionManager implements SessionService {
   }
 
   private handlePiEvent(event: RpcEvent): void {
+    this.markActivity();
     this.recordTool(event);
     // The end of a run is agent_settled: agent_end can be followed by a retry or queued messages.
     if (event.type === "agent_start") {
@@ -886,6 +1042,7 @@ export class SessionManager implements SessionService {
   }
 
   private handleUiRequest(request: RpcExtensionUIRequest): void {
+    this.markActivity();
     const question = uiRequestToQuestion(request, this.now());
     if (question === null) {
       const notify = uiRequestToNotify(request);
@@ -947,6 +1104,11 @@ export class SessionManager implements SessionService {
         : { type: "status", status, error: safeError },
     );
     this.notifyStatusChange(previous, status, safeError);
+    if (status === "ready") {
+      this.armIdleTimer();
+    } else if (status === "error" || status === "closed") {
+      this.clearIdleTimer();
+    }
   }
 
   /** Sends the push notification of a status change, if it has one. Never throws, never waits. */

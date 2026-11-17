@@ -20,6 +20,7 @@ import {
   ResolveQuestionRequestSchema,
   type RestoreCheckpointRequest,
   RestoreCheckpointRequestSchema,
+  type SessionStats,
   type SetModelRequest,
   SetModelRequestSchema,
   type TodosResponse,
@@ -158,6 +159,11 @@ export function createApp(options: AppOptions): Hono {
 
   app.get("/session/messages", async (c) => {
     const body: MessagesResponse = { messages: await session.messages() };
+    return c.json(body);
+  });
+
+  app.get("/session/stats", async (c) => {
+    const body: SessionStats = await session.stats();
     return c.json(body);
   });
 

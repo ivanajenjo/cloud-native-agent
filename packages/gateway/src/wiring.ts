@@ -103,6 +103,7 @@ export async function createGatewayRuntime(options: GatewayWiringOptions): Promi
       env: childEnv,
     },
     toolLog,
+    idleTimeoutMs: config.idleTimeoutMs,
     workspaceDir: paths.workspaceDir,
     defaultModel: providers.default,
     gitIdentity: { name: config.gitUserName, email: config.gitUserEmail },

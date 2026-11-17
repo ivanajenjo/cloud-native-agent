@@ -9,6 +9,7 @@ import type {
   Question,
   SessionEvent,
   SessionInfo,
+  SessionStats,
   TodoItem,
 } from "@cna/shared";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -62,6 +63,13 @@ const DIFF: DiffResponse = {
   truncated: false,
 };
 
+const STATS: SessionStats = {
+  tokens: { input: 100, output: 20, cacheRead: 5, cacheWrite: 1, total: 126 },
+  cost: 0.0123,
+  messages: { user: 2, assistant: 3, toolCalls: 4 },
+  context: { tokens: 1200, window: 32000, percent: 3.75 },
+};
+
 const NETWORK_ENTRY = {
   ts: "2026-11-16T10:00:00.000Z",
   method: "CONNECT" as const,
@@ -84,6 +92,7 @@ function fakeSession(overrides: Partial<SessionService> = {}) {
     setModel: vi.fn(async () => {}),
     abort: vi.fn(async () => {}),
     messages: vi.fn(async (): Promise<PiMessage[]> => []),
+    stats: vi.fn(async (): Promise<SessionStats> => STATS),
     checkpoints: vi.fn((): Checkpoint[] => [CHECKPOINT]),
     restoreCheckpoint: vi.fn(async (id: number, options: { conversation: boolean }) => ({
       checkpoint: { ...CHECKPOINT, id },
@@ -597,6 +606,32 @@ describe("internal routes", () => {
 
     expect(res.status).toBe(204);
     expect(session.publishNetworkEntry).toHaveBeenCalledWith(NETWORK_ENTRY);
+  });
+});
+
+describe("GET /session/stats", () => {
+  it("answers 200 with the body of stats()", async () => {
+    const { app, session } = build();
+
+    const res = await app.request("/session/stats");
+
+    expect(res.status).toBe(200);
+    expect(await res.json()).toEqual(STATS);
+    expect(session.stats).toHaveBeenCalledOnce();
+  });
+
+  it("answers 404 no_session when stats() throws it", async () => {
+    const session = fakeSession({
+      stats: vi.fn(async () => {
+        throw new SessionError("no_session");
+      }),
+    });
+    const app = createApp({ version: "1", session, events: new EventLog(), models: () => MODELS });
+
+    const res = await app.request("/session/stats");
+
+    expect(res.status).toBe(404);
+    expect(await res.json()).toEqual({ error: "no_session", message: "no_session" });
   });
 });
 
