@@ -172,6 +172,18 @@ describe("forwarding", () => {
     expect(headers.get("x-forwarded-proto")).toBe("http");
   });
 
+  it("passes gateway redirects to the client without following them", async () => {
+    const { app, calls } = setup(
+      () => new Response(null, { status: 302, headers: { location: "/ui/" } }),
+    );
+    const res = await app.request("/");
+
+    expect(calls).toHaveLength(1);
+    expect(calls[0]?.init?.redirect).toBe("manual");
+    expect(res.status).toBe(302);
+    expect(res.headers.get("location")).toBe("/ui/");
+  });
+
   it("returns the gateway status and body without hop-by-hop headers", async () => {
     const { app } = setup(
       () =>
