@@ -1,5 +1,6 @@
 import { z } from "zod";
 import type { Question } from "./questions.js";
+import { THINKING_LEVELS, type ThinkingLevel } from "./thinking.js";
 
 /** Session lifecycle: idle → cloning → running ⇄ waiting_input → ready → closed (+ error). */
 export const SESSION_STATUSES = [
@@ -21,9 +22,8 @@ export const ACTIVE_SESSION_STATUSES: readonly SessionStatus[] = [
   "ready",
 ];
 
-export const THINKING_LEVELS = ["off", "minimal", "low", "medium", "high", "xhigh", "max"] as const;
+export { THINKING_LEVELS, type ThinkingLevel };
 export const ThinkingLevelSchema = z.enum(THINKING_LEVELS);
-export type ThinkingLevel = z.infer<typeof ThinkingLevelSchema>;
 
 export const SessionModeSchema = z.enum(["plan", "auto"]);
 export type SessionMode = z.infer<typeof SessionModeSchema>;

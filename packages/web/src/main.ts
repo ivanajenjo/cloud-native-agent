@@ -1,4 +1,3 @@
-/// <reference types="vite/client" />
 import "./styles.css";
 import { h } from "./dom.js";
 
