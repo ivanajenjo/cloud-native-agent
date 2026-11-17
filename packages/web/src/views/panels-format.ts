@@ -17,6 +17,7 @@ const REASON_LABELS: Record<NetworkDecisionReason, string> = {
   port_not_allowed: "puerto no permitido",
   invalid_target: "destino no válido",
   dns_error: "error de DNS",
+  unknown_client: "cliente desconocido",
 };
 
 const STATUS_LETTERS: Record<DiffFileStatus, string> = {

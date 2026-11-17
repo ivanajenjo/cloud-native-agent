@@ -160,6 +160,7 @@ export type ApiErrorCode =
   | "mode_not_supported"
   | "unknown_model"
   | "history_not_found"
+  | "replica_not_found"
   | "unauthorized"
   | "bad_gateway"
   | "internal_error";

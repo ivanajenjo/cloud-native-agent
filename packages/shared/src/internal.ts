@@ -65,6 +65,7 @@ export const PublishNetworkEntryRequestSchema = z
         bytesIn: z.number(),
         durationMs: z.number(),
         error: z.string().optional(),
+        replica: z.string().optional(),
       })
       .strict(),
   })
