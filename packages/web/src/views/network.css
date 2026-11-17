@@ -1,0 +1,92 @@
+.net-panel {
+  display: flex;
+  flex-direction: column;
+  gap: 1rem;
+  color: var(--fg);
+}
+
+.net-panel h3 {
+  margin: 0 0 0.35rem;
+}
+
+.net-mode-label {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.35rem;
+}
+
+.net-messages p {
+  margin: 0.35rem 0;
+}
+
+.net-loading {
+  color: var(--muted);
+}
+
+.net-error {
+  color: var(--danger);
+}
+
+.net-policy-details {
+  margin-top: 0.5rem;
+}
+
+.net-list {
+  margin: 0.25rem 0;
+}
+
+.net-list ul {
+  margin: 0.25rem 0;
+  font-family: ui-monospace, monospace;
+  font-size: 13px;
+  overflow-wrap: anywhere;
+}
+
+.net-ports {
+  margin: 0.35rem 0 0;
+  color: var(--muted);
+}
+
+.net-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 13px;
+}
+
+.net-table th,
+.net-table td {
+  padding: 0.25rem 0.5rem;
+  border-bottom: 1px solid var(--border);
+  text-align: left;
+  vertical-align: top;
+}
+
+.net-table th {
+  color: var(--muted);
+  font-weight: 600;
+}
+
+.net-table td {
+  overflow-wrap: anywhere;
+}
+
+.net-allow {
+  color: var(--ok);
+  font-weight: 600;
+}
+
+.net-deny {
+  color: var(--danger);
+  font-weight: 600;
+}
+
+.net-bytes,
+.net-duration {
+  white-space: nowrap;
+  font-family: ui-monospace, monospace;
+}
+
+.net-empty {
+  color: var(--muted);
+  text-align: center;
+}
