@@ -25,6 +25,7 @@ import { HistoryStore } from "./session/history.js";
 import { type PiProcess, SessionManager, type SessionManagerOptions } from "./session/manager.js";
 import { SessionStateStore } from "./session/persistence.js";
 import { createGitRunner } from "./workspace/git.js";
+import { createGhRunner } from "./workspace/pr.js";
 
 export interface GatewayRuntime {
   app: Hono;
@@ -86,6 +87,7 @@ export async function createGatewayRuntime(options: GatewayWiringOptions): Promi
   // ADR-0011 §4: ids keep growing across restarts, so a reconnecting client gets the new events.
   const events = new EventLog({ firstId: Date.now() });
   const git = createGitRunner(childEnv);
+  const gh = createGhRunner(childEnv);
   const toolLog = createToolLog({ filePath: paths.toolLogFile, redactor });
 
   // ADR-0011 §2: the session state survives a restart of the gateway.
@@ -104,6 +106,7 @@ export async function createGatewayRuntime(options: GatewayWiringOptions): Promi
     events,
     redactor,
     git,
+    gh,
     stateStore,
     history,
     startPi:

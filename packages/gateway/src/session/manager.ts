@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
-import { access, rm } from "node:fs/promises";
-import { join } from "node:path";
+import { access, mkdir, rm } from "node:fs/promises";
+import { dirname, join } from "node:path";
 import {
   ACTIVE_SESSION_STATUSES,
   type AnswerRequest,
@@ -46,11 +46,18 @@ import {
 import {
   GitError,
   type GitRunner,
+  type PreparedWorkspace,
   prepareResumeWorkspace,
   prepareWorkspace,
   slugify,
   workspaceState,
 } from "../workspace/git.js";
+import {
+  type GhRunner,
+  type PullRequestInfo,
+  preparePrWorkspace,
+  resolvePullRequest,
+} from "../workspace/pr.js";
 import {
   deleteCheckpointRefsAfter,
   diffWorkingTree,
@@ -103,6 +110,8 @@ export interface SessionManagerOptions {
   remoteBase?: string;
   /** Push notifications of status changes (ADR-0009). Absent: no notifications. */
   notifier?: Notifier;
+  /** Runs gh for sessions on a pull request (feature 7, ADR-0011 §9). Absent: `pr` is refused. */
+  gh?: GhRunner;
   /**
    * Milliseconds without activity after which an idle `ready` session stops Pi (ADR-0011 §5).
    * Absent or 0: Pi is never suspended.
@@ -423,9 +432,14 @@ export class SessionManager implements SessionService {
   }
 
   async create(request: CreateSessionRequest): Promise<SessionInfo> {
-    // Temporary until PR sessions land (ADR-0011): a body without pr always has a prompt.
-    if (request.pr !== undefined || request.prompt === undefined) {
-      throw new SessionError("invalid_request", "pr is not supported yet");
+    if (request.pr === undefined && request.prompt === undefined) {
+      throw new SessionError("invalid_request", "prompt is required unless pr is set");
+    }
+    if (request.pr !== undefined && this.options.gh === undefined) {
+      throw new SessionError(
+        "invalid_request",
+        "pull requests are not supported: gh is not available",
+      );
     }
     this.assertNoActiveSession();
     const stopping = this.resetSessionState();
@@ -434,7 +448,8 @@ export class SessionManager implements SessionService {
       id: this.newId(),
       status: "cloning",
       repo: request.repo,
-      baseBranch: request.baseBranch ?? null,
+      // A PR session works on the base of the PR, known once start() resolves it.
+      baseBranch: request.pr !== undefined ? null : (request.baseBranch ?? null),
       branch: null,
       model: request.model ?? this.options.defaultModel ?? null,
       thinking: request.thinking ?? null,
@@ -908,16 +923,25 @@ export class SessionManager implements SessionService {
     }
     try {
       await rm(this.options.workspaceDir, { recursive: true, force: true });
-      const prepared = await prepareWorkspace({
-        git: this.options.git,
-        repo: request.repo,
-        baseBranch: request.baseBranch,
-        dir: this.options.workspaceDir,
-        slug: slugify(request.prompt ?? ""),
-        userName: this.options.gitIdentity?.name,
-        userEmail: this.options.gitIdentity?.email,
-        remoteBase: this.options.remoteBase,
-      });
+      let prepared: PreparedWorkspace;
+      let prompt: string;
+      if (request.pr === undefined) {
+        prepared = await prepareWorkspace({
+          git: this.options.git,
+          repo: request.repo,
+          baseBranch: request.baseBranch,
+          dir: this.options.workspaceDir,
+          slug: slugify(request.prompt ?? ""),
+          userName: this.options.gitIdentity?.name,
+          userEmail: this.options.gitIdentity?.email,
+          remoteBase: this.options.remoteBase,
+        });
+        prompt = request.prompt ?? "";
+      } else {
+        const pullRequest = await this.preparePullRequest(request.repo, request.pr);
+        prepared = pullRequest.workspace;
+        prompt = prPrompt(request.repo, pullRequest.pr, request.prompt);
+      }
 
       const info = this.current(sessionId);
       if (info === null) {
@@ -941,7 +965,7 @@ export class SessionManager implements SessionService {
       this.settled = false;
       this.setStatus("running");
 
-      const data = await pi.send({ type: "prompt", message: request.prompt ?? "" });
+      const data = await pi.send({ type: "prompt", message: prompt });
       if (this.isCurrent(sessionId) && dispositionOf(data) === "handled") {
         // Handled by an extension: there is no run to wait for.
         this.settled = true;
@@ -950,6 +974,36 @@ export class SessionManager implements SessionService {
     } catch (error) {
       await this.failStart(sessionId, error);
     }
+  }
+
+  /**
+   * Resolves the PR with gh (only open PRs of agent/* branches, ADR-0011 §9), then clones its head branch
+   * and checks its base. Throws PullRequestError or a git error; the caller turns them into `error`.
+   */
+  private async preparePullRequest(
+    repo: string,
+    number: number,
+  ): Promise<{ workspace: PreparedWorkspace; pr: PullRequestInfo }> {
+    const gh = this.options.gh;
+    if (gh === undefined) {
+      throw new SessionError(
+        "invalid_request",
+        "pull requests are not supported: gh is not available",
+      );
+    }
+    const dir = this.options.workspaceDir;
+    await mkdir(dirname(dir), { recursive: true });
+    const pr = await resolvePullRequest(gh, repo, number, dirname(dir));
+    const workspace = await preparePrWorkspace({
+      git: this.options.git,
+      repo,
+      dir,
+      pr,
+      userName: this.options.gitIdentity?.name,
+      userEmail: this.options.gitIdentity?.email,
+      remoteBase: this.options.remoteBase,
+    });
+    return { workspace, pr };
   }
 
   /** Checkpoint 0 right after cloning, before Pi starts. A failure is logged and the session goes on. */
@@ -1684,6 +1738,23 @@ export class SessionManager implements SessionService {
   private snapshot(info: SessionInfo): SessionInfo {
     return { ...info, pendingQuestions: this.questions.list() };
   }
+}
+
+/**
+ * The first prompt of a session on a pull request (ADR-0011 §9): asks the agent to address the review of
+ * the PR, then appends the user's own instructions, if any.
+ */
+export function prPrompt(repo: string, pr: PullRequestInfo, userPrompt?: string): string {
+  const instructions =
+    `You are working on pull request #${pr.number} of ${repo} (branch ${pr.headBranch}, base ${pr.baseBranch}). ` +
+    `Read its description and review comments with gh: \`gh pr view ${pr.number} --repo ${repo} --comments\` ` +
+    `and \`gh api repos/${repo}/pulls/${pr.number}/comments\`. ` +
+    "Address each comment that asks for a change, commit with git_commit and push to the same branch with git_push. " +
+    "Do not open a new pull request. " +
+    "When you are done, summarise what you changed for each review comment.";
+  return userPrompt === undefined
+    ? instructions
+    : `${instructions}\n\nAdditional instructions from the user:\n${userPrompt}`;
 }
 
 function dispositionOf(data: unknown): PromptDisposition | undefined {
