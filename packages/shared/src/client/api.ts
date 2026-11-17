@@ -3,6 +3,7 @@
  * APIs, and only type imports from the rest of `@cna/shared`.
  */
 import type { StreamEvent } from "../events.js";
+import type { HistoryEntry, HistoryResponse, ResumeSessionRequest } from "../history.js";
 import type { NetworkLogEntry } from "../network.js";
 import type {
   NetworkLogResponse,
@@ -19,6 +20,7 @@ import type {
   PostMessageRequest,
   PostMessageResponse,
   SessionInfo,
+  SessionStats,
   SetModelRequest,
 } from "../session.js";
 import type { TodoItem, TodosResponse } from "../todo.js";
@@ -261,6 +263,28 @@ export class ApiClient {
     if (options.force) query.set("force", "true");
     const response = await this.send("DELETE", "/session", { query });
     await assertOk(response);
+  }
+
+  /** GET /session/stats. */
+  async stats(): Promise<SessionStats> {
+    const response = await this.send("GET", "/session/stats");
+    await assertOk(response);
+    return readJson<SessionStats>(response);
+  }
+
+  /** GET /session/history → `.sessions` (newest first). */
+  async history(): Promise<HistoryEntry[]> {
+    const response = await this.send("GET", "/session/history");
+    await assertOk(response);
+    return (await readJson<HistoryResponse>(response)).sessions;
+  }
+
+  /** POST /session/history/:id/resume (201). The body is `{}` when not given. */
+  async resumeSession(id: string, body: ResumeSessionRequest = {}): Promise<SessionInfo> {
+    const path = `/session/history/${encodeURIComponent(id)}/resume`;
+    const response = await this.send("POST", path, { body });
+    await assertOk(response);
+    return readJson<SessionInfo>(response);
   }
 
   /** GET /models. */
