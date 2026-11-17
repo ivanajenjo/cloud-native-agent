@@ -2,6 +2,7 @@ import type {
   CreateSessionRequest,
   DiffResponse,
   HistoryEntry,
+  ReplicaSummary,
   SessionInfo,
   SessionStats,
   TodoItem,
@@ -64,6 +65,8 @@ function describeRaw(error: unknown): string {
         return error.message;
       case "history_not_found":
         return NOT_IN_HISTORY_MESSAGE;
+      case "replica_not_found":
+        return "No existe esa réplica (mira cna replicas)";
       default:
         return `${error.message} (${error.code})`;
     }
@@ -109,6 +112,33 @@ export function formatSession(info: SessionInfo, color: boolean): string {
     );
   }
   return lines.map((line) => `${line}\n`).join("");
+}
+
+/**
+ * `cna replicas`: one line per replica, in edge's order (the first one is the default). Ends with
+ * "\n"; an empty list → a fixed message. Everything from the server is sanitized.
+ */
+export function formatReplicas(replicas: ReplicaSummary[], color: boolean): string {
+  if (replicas.length === 0) {
+    return "No hay réplicas\n";
+  }
+  return replicas
+    .map((replica, index) => {
+      const name = style(sanitize(replica.name), color, "bold");
+      const mark = index === 0 ? " (por defecto)" : "";
+      let state: string;
+      if (!replica.reachable) {
+        state = style("no responde", color, "red");
+      } else if (replica.session === null) {
+        state = "libre";
+      } else {
+        const { session } = replica;
+        state = `${sanitize(session.status)} · ${sanitize(session.repo)}`;
+        if (session.branch !== null) state += ` · ${sanitize(session.branch)}`;
+      }
+      return `${name}${mark} — ${state}\n`;
+    })
+    .join("");
 }
 
 const FILE_MARKS: Record<DiffResponse["files"][number]["status"], string> = {
@@ -251,6 +281,17 @@ export async function runStatus(ctx: CommandContext): Promise<number> {
       return 0;
     }
     ctx.output.out(formatSession(info, ctx.color));
+    return 0;
+  } catch (error) {
+    return fail(ctx, error);
+  }
+}
+
+/** `cna replicas`. */
+export async function runReplicas(ctx: CommandContext): Promise<number> {
+  try {
+    const replicas = await ctx.client.replicas();
+    ctx.output.out(formatReplicas(replicas, ctx.color));
     return 0;
   } catch (error) {
     return fail(ctx, error);

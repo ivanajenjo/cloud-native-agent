@@ -535,3 +535,84 @@ describe("ApiClient session stats, history and resume", () => {
     expect(error).toMatchObject({ status: 409, code: "session_exists", message: "busy" });
   });
 });
+
+describe("ApiClient replicas", () => {
+  const REPLICA = {
+    name: "agent-1",
+    reachable: true,
+    session: SESSION,
+  };
+
+  it("GET /replicas with the bearer token and returns the replicas", async () => {
+    const fake = fakeFetch(() => json({ replicas: [REPLICA] }));
+    const client = new ApiClient({
+      baseUrl: "http://e",
+      token: "secret",
+      fetch: fake.fetch,
+    });
+    await expect(client.replicas()).resolves.toEqual([REPLICA]);
+    const call = fake.calls[0] as RecordedCall;
+    expect(call.url).toBe("http://e/replicas");
+    expect(call.init?.method).toBe("GET");
+    expect(header(call, "authorization")).toBe("Bearer secret");
+  });
+
+  it("throws ApiClientError 401 without a valid token", async () => {
+    const client = new ApiClient({
+      baseUrl: "http://e",
+      fetch: fakeFetch(() => json({ error: "unauthorized" }, 401)).fetch,
+    });
+    await expect(client.replicas()).rejects.toMatchObject({
+      status: 401,
+      code: "unauthorized",
+    });
+  });
+
+  it("getSession returns null on 404 no_session", async () => {
+    const client = new ApiClient({
+      baseUrl: "http://e",
+      fetch: fakeFetch(() => json({ error: "no_session" }, 404)).fetch,
+    });
+    await expect(client.getSession()).resolves.toBeNull();
+  });
+
+  it("getSession returns null on a 404 without body", async () => {
+    const client = new ApiClient({
+      baseUrl: "http://e",
+      fetch: fakeFetch(() => new Response(null, { status: 404 })).fetch,
+    });
+    await expect(client.getSession()).resolves.toBeNull();
+  });
+
+  it("getSession throws replica_not_found on a 404 with that error", async () => {
+    const client = new ApiClient({
+      baseUrl: "http://e/replicas/nope",
+      fetch: fakeFetch(() => json({ error: "replica_not_found", message: "no" }, 404)).fetch,
+    });
+    const error = await client.getSession().catch((caught: unknown) => caught);
+    expect(error).toBeInstanceOf(ApiClientError);
+    expect(error).toMatchObject({ status: 404, code: "replica_not_found", message: "no" });
+  });
+
+  it("getSession uses the HTTP 404 message when replica_not_found has no message", async () => {
+    const client = new ApiClient({
+      baseUrl: "http://e/replicas/nope",
+      fetch: fakeFetch(() => json({ error: "replica_not_found" }, 404)).fetch,
+    });
+    await expect(client.getSession()).rejects.toMatchObject({
+      status: 404,
+      code: "replica_not_found",
+      message: "HTTP 404",
+    });
+  });
+
+  it("getSession addresses the session of the replica through its base URL", async () => {
+    const fake = fakeFetch(() => json(SESSION));
+    const client = new ApiClient({
+      baseUrl: "http://e/replicas/agent-2",
+      fetch: fake.fetch,
+    });
+    await client.getSession();
+    expect(fake.calls[0]?.url).toBe("http://e/replicas/agent-2/session");
+  });
+});

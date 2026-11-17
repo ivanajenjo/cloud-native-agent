@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 import { readFileSync } from "node:fs";
 import { createInterface } from "node:readline";
+import { replicaBasePath } from "@cna/shared";
 import { ApiClient } from "@cna/shared/client";
 import { type ParsedArgs, parseCliArgs, USAGE, UsageError } from "./args.js";
 import { runChat } from "./chat.js";
@@ -14,6 +15,7 @@ import {
   runClose,
   runDiff,
   runHistory,
+  runReplicas,
   runStats,
   runStatus,
   runTodos,
@@ -97,8 +99,13 @@ async function main(): Promise<number> {
     output.err("cna: define CNA_TOKEN con el AGENT_API_TOKEN de edge\n");
     return 2;
   }
+  // With --replica, the session commands go to that replica's prefix on edge (ADR-0012).
+  const baseUrl =
+    options.replica === undefined
+      ? options.url
+      : `${options.url}${replicaBasePath(options.replica)}`;
   const ctx: CommandContext = {
-    client: new ApiClient({ baseUrl: options.url, token }),
+    client: new ApiClient({ baseUrl, token }),
     output,
     color: options.color,
   };
@@ -124,6 +131,9 @@ async function main(): Promise<number> {
       return runStats(ctx);
     case "history":
       return runHistory(ctx);
+    case "replicas":
+      // Always addressed to edge itself: GET /replicas has no replica prefix.
+      return runReplicas({ ...ctx, client: new ApiClient({ baseUrl: options.url, token }) });
     case "diff":
       return runDiff(ctx, command);
     case "todos":

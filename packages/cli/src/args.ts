@@ -1,5 +1,11 @@
 import { parseArgs } from "node:util";
-import { DEFAULT_PORTS, parseCheckpointId, THINKING_LEVELS, type ThinkingLevel } from "@cna/shared";
+import {
+  DEFAULT_PORTS,
+  isReplicaName,
+  parseCheckpointId,
+  THINKING_LEVELS,
+  type ThinkingLevel,
+} from "@cna/shared";
 
 export type Command =
   | {
@@ -24,13 +30,16 @@ export type Command =
   | { name: "abort" }
   | { name: "close"; force: boolean } // --force
   | { name: "help" }
-  | { name: "version" };
+  | { name: "version" }
+  | { name: "replicas" }; // cna replicas: lists the replicas behind edge
 
 export interface GlobalOptions {
   /** --url > env CNA_URL > "http://127.0.0.1:8080". Must parse as an http: or https: URL; trailing "/" removed. */
   url: string;
   /** false with --no-color or a non-empty NO_COLOR env; otherwise `isTty`. */
   color: boolean;
+  /** --replica > env CNA_REPLICA (empty = unset). Validated with isReplicaName. */
+  replica?: string;
 }
 
 export interface ParsedArgs {
@@ -56,6 +65,7 @@ export const USAGE: string = `Uso:
   cna diff [--checkpoint <id>] [--stat]
                                   Diff frente a la rama base (o frente a un checkpoint)
   cna todos                       Lista de tareas del agente
+  cna replicas                    Réplicas detrás de edge y la sesión de cada una
   cna abort                       Aborta el turno en curso y cancela las preguntas pendientes
   cna close [--force]             Cierra la sesión y limpia el workspace
   cna help                        Muestra esta ayuda (también --help o -h)
@@ -84,10 +94,13 @@ Opciones de close:
 
 Opciones globales (válidas en cualquier comando):
   --url <url>         URL de edge (por defecto, CNA_URL o http://127.0.0.1:${DEFAULT_PORTS.edgeApi})
+  --replica <nombre>
+                      Réplica con la que hablar (por defecto, CNA_REPLICA o la primera)
   --no-color          Salida sin colores
 
 Variables de entorno:
   CNA_URL             URL de edge, si no se usa --url
+  CNA_REPLICA         Réplica con la que hablar, si no se usa --replica
   CNA_TOKEN           Token de la API (AGENT_API_TOKEN de edge). Nunca va en la línea de comandos
   NO_COLOR            Si tiene valor, desactiva los colores
 `;
@@ -98,7 +111,7 @@ const DEFAULT_URL = `http://127.0.0.1:${DEFAULT_PORTS.edgeApi}`;
 const REPO_PATTERN = /^[A-Za-z0-9][A-Za-z0-9-]*\/[A-Za-z0-9._-]+$/;
 
 /** Options accepted by any command. */
-const GLOBAL_OPTIONS = ["url", "no-color", "help", "version"] as const;
+const GLOBAL_OPTIONS = ["url", "replica", "no-color", "help", "version"] as const;
 
 /** Positionals accepted by a command (inclusive range) and its options, besides the global ones. */
 const COMMANDS: Record<string, { min: number; max: number; options: readonly string[] }> = {
@@ -119,11 +132,13 @@ const COMMANDS: Record<string, { min: number; max: number; options: readonly str
   close: { min: 0, max: 0, options: ["force"] },
   help: { min: 0, max: 0, options: [] },
   version: { min: 0, max: 0, options: [] },
+  replicas: { min: 0, max: 0, options: [] },
 };
 
 /** Table given to parseArgs: the union of every option, checked per command afterwards. */
 const OPTIONS = {
   url: { type: "string" },
+  replica: { type: "string" },
   "no-color": { type: "boolean" },
   help: { type: "boolean", short: "h" },
   version: { type: "boolean" },
@@ -160,6 +175,7 @@ export function parseCliArgs(
     url: resolveUrl(values.url, env.CNA_URL),
     // Any non-empty NO_COLOR disables colors, as the no-color.org convention says.
     color: values["no-color"] !== true && !env.NO_COLOR && isTty,
+    replica: resolveReplica(values.replica, env.CNA_REPLICA),
   };
 
   if (values.help === true) {
@@ -196,6 +212,7 @@ export function parseCliArgs(
     case "status":
     case "stats":
     case "history":
+    case "replicas":
     case "todos":
     case "abort":
     case "help":
@@ -239,6 +256,24 @@ function parseRaw(argv: string[]) {
     }
     throw new UsageError("argumentos no válidos");
   }
+}
+
+/**
+ * --replica > CNA_REPLICA (an empty variable counts as unset) > undefined (the default replica).
+ * The message never echoes the value.
+ */
+function resolveReplica(
+  flagValue: string | undefined,
+  envValue: string | undefined,
+): string | undefined {
+  const name = flagValue ?? (envValue === "" ? undefined : envValue);
+  if (name === undefined) {
+    return undefined;
+  }
+  if (!isReplicaName(name)) {
+    throw new UsageError("el nombre de la réplica no es válido (p. ej. agent-2)");
+  }
+  return name;
 }
 
 function resolveUrl(flagValue: string | undefined, envValue: string | undefined): string {

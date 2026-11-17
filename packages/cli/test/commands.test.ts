@@ -1,4 +1,11 @@
-import type { DiffResponse, HistoryEntry, Question, SessionInfo, SessionStats } from "@cna/shared";
+import type {
+  DiffResponse,
+  HistoryEntry,
+  Question,
+  ReplicaSummary,
+  SessionInfo,
+  SessionStats,
+} from "@cna/shared";
 import { ApiClient, ApiClientError } from "@cna/shared/client";
 import { describe, expect, it } from "vitest";
 import type { Command } from "../src/args.js";
@@ -8,6 +15,7 @@ import {
   describeError,
   formatDiff,
   formatHistory,
+  formatReplicas,
   formatSession,
   formatStats,
   formatTodos,
@@ -16,6 +24,7 @@ import {
   runClose,
   runDiff,
   runHistory,
+  runReplicas,
   runStats,
   runStatus,
   runTodos,
@@ -155,6 +164,12 @@ describe("describeError", () => {
   it("explains a network failure (status 0)", () => {
     expect(describeError(new ApiClientError(0, "network_error", "ECONNREFUSED"))).toBe(
       "No se puede conectar con edge: ECONNREFUSED",
+    );
+  });
+
+  it("explains replica_not_found and points to cna replicas", () => {
+    expect(describeError(new ApiClientError(404, "replica_not_found", "x"))).toBe(
+      "No existe esa réplica (mira cna replicas)",
     );
   });
 
@@ -820,5 +835,108 @@ describe("resumeSession", () => {
     expect(err).toEqual([
       "cna: Ya hay una sesión en esta réplica (mira cna status o ciérrala con cna close)\n",
     ]);
+  });
+});
+
+const REPLICA_SESSION: SessionInfo = sessionInfo({ status: "ready", repo: "owner/x" });
+
+function replicaSummary(overrides: Partial<ReplicaSummary> = {}): ReplicaSummary {
+  return { name: "agent-1", reachable: true, session: null, ...overrides };
+}
+
+describe("formatReplicas", () => {
+  it("marks the first replica as the default and prints the four states", () => {
+    const text = formatReplicas(
+      [
+        replicaSummary({ name: "agent-1", session: REPLICA_SESSION }),
+        replicaSummary({ name: "agent-2", reachable: false }),
+        replicaSummary({ name: "agent-3", session: null }),
+        replicaSummary({
+          name: "agent-4",
+          session: sessionInfo({ status: "running", repo: "octo/hello", branch: null }),
+        }),
+      ],
+      false,
+    );
+    expect(text).toBe(
+      [
+        "agent-1 (por defecto) — ready · owner/x · agent/fix-1",
+        "agent-2 — no responde",
+        "agent-3 — libre",
+        "agent-4 — running · octo/hello",
+        "",
+      ].join("\n"),
+    );
+  });
+
+  it("does not mark a later replica as the default", () => {
+    expect(
+      formatReplicas(
+        [replicaSummary({ name: "agent-1" }), replicaSummary({ name: "agent-2" })],
+        false,
+      ),
+    ).toBe("agent-1 (por defecto) — libre\nagent-2 — libre\n");
+  });
+
+  it("prints no ANSI codes without color and paints the name and the red state with color", () => {
+    const replicas = [
+      replicaSummary({ name: "agent-1", session: REPLICA_SESSION }),
+      replicaSummary({ name: "agent-2", reachable: false }),
+    ];
+    expect(formatReplicas(replicas, false)).not.toContain(ESC);
+    const colored = formatReplicas(replicas, true);
+    expect(colored).toContain(`${ESC}[1magent-1${ESC}[0m (por defecto) — `);
+    expect(colored).toContain(`${ESC}[31mno responde${ESC}[0m`);
+  });
+
+  it("sanitizes the name, status, repo and branch from the server", () => {
+    const text = formatReplicas(
+      [
+        replicaSummary({
+          name: "\u001b[31mx",
+          session: sessionInfo({
+            status: "\u001b[2Jready" as SessionInfo["status"],
+            repo: "owner/\u001b[31m",
+            branch: "agent/\r\nevil",
+          }),
+        }),
+      ],
+      false,
+    );
+    expect(text).not.toContain(ESC);
+    expect(text).toContain("\uFFFD[31mx (por defecto)");
+    expect(text).toContain("\uFFFD[2Jready · owner/\uFFFD[31m · agent/\nevil\n");
+  });
+
+  it("says there are no replicas when the list is empty", () => {
+    expect(formatReplicas([], false)).toBe("No hay réplicas\n");
+  });
+});
+
+describe("runReplicas", () => {
+  it("prints GET /replicas and returns 0", async () => {
+    const { ctx, requests, out, err } = harness(() =>
+      json({ replicas: [replicaSummary({ name: "agent-1", session: null })] }),
+    );
+    expect(await runReplicas(ctx)).toBe(0);
+    expect(requests[0]).toMatchObject({
+      method: "GET",
+      url: "http://edge.test/replicas",
+      authorization: `Bearer ${TOKEN}`,
+    });
+    expect(out.join("")).toBe("agent-1 (por defecto) — libre\n");
+    expect(err).toEqual([]);
+  });
+
+  it("writes the fixed token message to stderr and returns 1 on 401", async () => {
+    const { ctx, out, err } = harness(() =>
+      json({ error: "unauthorized", message: "sk-secret" }, 401),
+    );
+    expect(await runReplicas(ctx)).toBe(1);
+    expect(out).toEqual([]);
+    expect(err).toEqual([
+      "cna: Token no válido o ausente: define CNA_TOKEN con el AGENT_API_TOKEN de edge\n",
+    ]);
+    expect(err.join("")).not.toContain("sk-secret");
   });
 });
