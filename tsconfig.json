@@ -8,6 +8,8 @@
     "packages/*/src/**/*.ts",
     "packages/*/test/**/*.ts",
     "tests/**/*.ts",
-    "vitest.config.ts"
-  ]
+    "vitest.config.ts",
+    "packages/web/vite.config.ts"
+  ],
+  "exclude": ["packages/web/src/**", "packages/web/test/**"]
 }

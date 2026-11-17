@@ -15,6 +15,8 @@ export interface GatewayConfig {
   webFile: string;
   /** CNA_EXTENSIONS_DIR, default: the folder of the @cna/extensions package. Absolute. */
   extensionsDir: string;
+  /** CNA_WEB_UI_DIR, default: the dist folder of the @cna/web package. Absolute. */
+  webUiDir: string;
   /** CNA_GIT_USER_NAME. Empty or absent means undefined. */
   gitUserName?: string;
   /** CNA_GIT_USER_EMAIL. Empty or absent means undefined. */
@@ -45,6 +47,8 @@ const DEFAULT_NOTIFICATIONS_FILE = "/config/notifications.yaml";
 const DEFAULT_WEB_FILE = "/config/web.yaml";
 /** Resolved from this module, so it is the same from src/ (tests) and from dist/ (production). */
 const DEFAULT_EXTENSIONS_DIR = fileURLToPath(new URL("../../extensions", import.meta.url));
+/** Same trick as DEFAULT_EXTENSIONS_DIR: the same relative depth from src/ and dist/. */
+const DEFAULT_WEB_UI_DIR = fileURLToPath(new URL("../../web/dist", import.meta.url));
 
 /**
  * Reads the gateway's configuration from `env`. Throws an `Error` with a clear message on any
@@ -67,6 +71,7 @@ export function loadGatewayConfig(env: Record<string, string | undefined>): Gate
       "CNA_EXTENSIONS_DIR",
       env.CNA_EXTENSIONS_DIR ?? DEFAULT_EXTENSIONS_DIR,
     ),
+    webUiDir: parseAbsolutePath("CNA_WEB_UI_DIR", env.CNA_WEB_UI_DIR ?? DEFAULT_WEB_UI_DIR),
     gitUserName: optionalValue(env.CNA_GIT_USER_NAME),
     gitUserEmail: optionalValue(env.CNA_GIT_USER_EMAIL),
   };

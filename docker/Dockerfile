@@ -13,6 +13,8 @@ COPY packages/shared/package.json packages/shared/package.json
 COPY packages/gateway/package.json packages/gateway/package.json
 COPY packages/edge/package.json packages/edge/package.json
 COPY packages/extensions/package.json packages/extensions/package.json
+COPY packages/web/package.json packages/web/package.json
+COPY packages/cli/package.json packages/cli/package.json
 RUN npm ci
 COPY packages/ packages/
 RUN npm run build
@@ -27,6 +29,8 @@ COPY packages/shared/package.json packages/shared/package.json
 COPY packages/gateway/package.json packages/gateway/package.json
 COPY packages/edge/package.json packages/edge/package.json
 COPY packages/extensions/package.json packages/extensions/package.json
+COPY packages/web/package.json packages/web/package.json
+COPY packages/cli/package.json packages/cli/package.json
 RUN npm ci --omit=dev
 
 # ---------------------------------------------------------------------------
@@ -75,6 +79,8 @@ COPY --from=build /app/packages/shared/package.json /app/packages/shared/package
 COPY --from=build /app/packages/shared/dist /app/packages/shared/dist
 COPY --from=build /app/packages/gateway/package.json /app/packages/gateway/package.json
 COPY --from=build /app/packages/gateway/dist /app/packages/gateway/dist
+# Web UI: static files only (ADR-0010). The gateway serves them under /ui/ (CNA_WEB_UI_DIR).
+COPY --from=build /app/packages/web/dist /app/packages/web/dist
 COPY --from=prod-deps /app/node_modules /app/node_modules
 # shared's own dependencies may be nested (e.g. yaml 2.9.1 in packages/shared/node_modules).
 COPY --from=prod-deps /app/packages/shared/node_modules /app/packages/shared/node_modules

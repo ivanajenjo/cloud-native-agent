@@ -30,6 +30,7 @@ import type { ZodType, z } from "zod";
 import type { EventLog } from "./events/event-log.js";
 import { createSseResponse, parseLastEventId } from "./events/sse.js";
 import { SessionError, type SessionService } from "./session/service.js";
+import { mountWebUi } from "./web-ui.js";
 
 export interface AppOptions {
   version: string;
@@ -39,6 +40,8 @@ export interface AppOptions {
   models: () => ModelsResponse;
   /** Passed to createSseResponse. */
   sseHeartbeatMs?: number;
+  /** Directory of the built web UI, served under /ui/. Absent means no web UI. */
+  webUiDir?: string;
 }
 
 /** Maximum size of a request body, in bytes (1 MiB). */
@@ -242,6 +245,10 @@ export function createApp(options: AppOptions): Hono {
     session.publishNetworkEntry(body.entry);
     return c.body(null, 204);
   });
+
+  if (options.webUiDir !== undefined) {
+    mountWebUi(app, options.webUiDir);
+  }
 
   app.notFound((c) => c.json({ error: "not_found" }, 404));
 

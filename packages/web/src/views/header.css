@@ -1,0 +1,94 @@
+.header {
+  border-bottom: 1px solid var(--border);
+  padding: 0.75rem 1rem;
+}
+
+.header-top {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.5rem;
+}
+
+.header-title {
+  margin: 0;
+  font-size: 1.25rem;
+}
+
+.header-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+}
+
+.header-button {
+  padding: 0.25rem 0.75rem;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--bg);
+  color: var(--fg);
+  font: inherit;
+  cursor: pointer;
+}
+
+.header-button:disabled {
+  color: var(--muted);
+  cursor: not-allowed;
+}
+
+.header-details {
+  display: grid;
+  grid-template-columns: max-content 1fr;
+  gap: 0.25rem 0.75rem;
+  margin: 0.75rem 0 0;
+  font-size: 0.875rem;
+}
+
+.header-details dt {
+  color: var(--muted);
+}
+
+.header-details dd {
+  margin: 0;
+  overflow-wrap: anywhere;
+}
+
+.header-repo,
+.header-branch,
+.header-model {
+  font-family: ui-monospace, monospace;
+}
+
+.header-status {
+  font-weight: 600;
+}
+
+.status-idle,
+.status-closed {
+  color: var(--muted);
+}
+
+.status-cloning,
+.status-running {
+  color: var(--accent);
+}
+
+.status-waiting_input,
+.status-ready {
+  color: var(--warn);
+}
+
+.status-ready {
+  color: var(--ok);
+}
+
+.status-error {
+  color: var(--danger);
+}
+
+.header-error {
+  margin: 0.5rem 0 0;
+  color: var(--danger);
+  font-size: 0.875rem;
+}

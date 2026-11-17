@@ -217,6 +217,7 @@ describe("e2e: real Pi in RPC mode against a mock OpenAI endpoint", () => {
       notificationsFile: join(root, "notifications.yaml"),
       webFile: join(root, "web.yaml"),
       extensionsDir,
+      webUiDir: join(root, "web-ui"),
       gitUserName: "E2E Agent",
       gitUserEmail: "agent@e2e.invalid",
     };

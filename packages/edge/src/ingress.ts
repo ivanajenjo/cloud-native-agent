@@ -349,6 +349,8 @@ export function createIngressApp(options: IngressOptions): Hono {
       method,
       headers,
       signal: request.signal,
+      // Redirects go back to the client as they are: edge never follows a Location from the gateway.
+      redirect: "manual",
       ...(hasBody ? { body: request.body, duplex: "half" as const } : {}),
     };
 

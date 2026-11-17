@@ -6,11 +6,11 @@ Docker en una Raspberry Pi 4, un MacBook o un PC con Windows, clona repos de Git
 trabaja en ellos (Java, Node, Python, Go), ejecuta tests y sube los cambios a una rama.
 Uso personal, mono-usuario.
 
-> **Estado:** fase 2 (PR y funcionalidades): sobre el MVP conversacional de la fase 1
-> (sesiones con Pi, preguntas al usuario, rama `agent/<slug>`, red saliente en modo `ask`)
-> añade pull requests, lista de tareas, modo plan, diff y checkpoints, bloqueo de comandos
-> peligrosos, búsqueda web, notificaciones push y la API de red. La web UI y el CLI llegan en
-> la fase 3. Quedan pendientes dos tareas de la fase 1.5 que necesitan Docker con red normal.
+> **Estado:** fase 3 (CLI y web UI): sobre el MVP conversacional de la fase 1 (sesiones con
+> Pi, preguntas al usuario, rama `agent/<slug>`, red saliente en modo `ask`) y la fase 2 (pull
+> requests, lista de tareas, modo plan, diff y checkpoints, búsqueda web, notificaciones push,
+> API de red) añade una web UI servida en `/ui/` y el CLI `cna`. Quedan pendientes las
+> comprobaciones que necesitan Docker con red normal (tareas 1 y 2 de la fase 1.5).
 > Ver [`docs/PLAN.md`](docs/PLAN.md#fases).
 
 ## Cómo funciona
@@ -123,6 +123,38 @@ Dos ficheros opcionales más, en `config/` y con el mismo tratamiento (ADR-0009)
 
 No subas nunca el `.env` (está en `.gitignore`). Recomendado: un *ruleset* en GitHub que
 proteja la rama base y un límite de gasto en los proveedores LLM.
+
+## Web UI
+
+Abre `http://localhost:8080/` (redirige a `/ui/`) y pega el `AGENT_API_TOKEN`. Por defecto el
+navegador lo guarda solo mientras la pestaña está abierta; con *Recordar en este navegador*,
+en `localStorage`. Desde la web se crea la sesión (modo auto o plan), se sigue la conversación
+en directo con las tool calls, se responden las preguntas (incluidas las de plan, push/PR y
+red), se ve la lista de tareas, el diff frente a la rama base o a un checkpoint (y se restaura)
+y las conexiones de red con su política. La web no interpreta HTML ni Markdown de lo que llega
+del agente y se sirve con una CSP estricta (ADR-0010).
+
+## CLI
+
+El CLI `cna` se ejecuta en tu máquina, no en el contenedor:
+
+```sh
+npm install && npm run build
+export CNA_URL=http://localhost:8080 CNA_TOKEN=<AGENT_API_TOKEN>
+
+npx cna run owner/repo "Arregla el test que falla en CI" [--plan] [--base main] [--model proveedor/modelo]
+npx cna chat          # chat interactivo con la sesión actual; responde las preguntas en el terminal
+npx cna status        # estado de la sesión
+npx cna diff [--stat] [--checkpoint N]
+npx cna todos
+npx cna abort
+npx cna close [--force]
+```
+
+`npm link -w @cna/cli` instala el comando `cna` de forma global. El token solo se lee de
+`CNA_TOKEN` (nunca de la línea de comandos). En el chat, `/help` muestra los comandos
+(`/abort`, `/status`, `/todos`, `/diff`, `/steer <texto>`, `/quit`); una pregunta se responde
+con el número de la opción, `s`/`n` o el texto, y `/cancel` la cancela.
 
 ## Usar la API
 
@@ -300,7 +332,9 @@ packages/
   shared/     tipos compartidos de la API, eventos y red (@cna/shared)
   gateway/    API de sesión dentro del contenedor del agente (@cna/gateway)
   edge/       entrada con Bearer + proxy de salida con política (@cna/edge)
-  extensions/ extensiones de Pi (ask_user, git) y prompt de sistema (@cna/extensions)
+  extensions/ extensiones de Pi (ask_user, git, todo, plan-mode, guard, web) y prompt de sistema (@cna/extensions)
+  web/        web UI estática (Vite, sin framework), servida por el gateway en /ui/ (@cna/web)
+  cli/        cliente de terminal `cna` (@cna/cli)
 config/       providers.example.yaml (copiar a providers.yaml)
 docker/       Dockerfile (agent), Dockerfile.edge, config de mise/Maven/Gradle
 deploy/

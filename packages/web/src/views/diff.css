@@ -1,0 +1,153 @@
+.diff-panel {
+  display: flex;
+  flex-direction: column;
+  gap: 0.75rem;
+  color: var(--fg);
+}
+
+.diff-toolbar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.5rem;
+}
+
+.diff-messages p {
+  margin: 0;
+}
+
+.diff-loading,
+.diff-empty,
+.diff-note {
+  color: var(--muted);
+}
+
+.diff-error {
+  color: var(--danger);
+}
+
+.diff-from {
+  margin: 0;
+}
+
+.diff-files {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+
+.diff-file {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+  align-items: baseline;
+  padding: 0.15rem 0;
+}
+
+.diff-status {
+  font-family: ui-monospace, monospace;
+  font-weight: 600;
+  width: 1.5em;
+  text-align: center;
+}
+
+.diff-status-added {
+  color: var(--ok);
+}
+
+.diff-status-modified {
+  color: var(--warn);
+}
+
+.diff-status-deleted {
+  color: var(--danger);
+}
+
+.diff-status-renamed {
+  color: var(--accent);
+}
+
+.diff-path {
+  overflow-wrap: anywhere;
+}
+
+.diff-stats {
+  color: var(--muted);
+  font-family: ui-monospace, monospace;
+}
+
+.diff-patch {
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  overflow: hidden;
+}
+
+.diff-patch summary {
+  cursor: pointer;
+  padding: 0.35rem 0.5rem;
+  background: var(--code-bg);
+  font-family: ui-monospace, monospace;
+  overflow-wrap: anywhere;
+}
+
+.diff-code {
+  margin: 0;
+  padding: 0.5rem;
+  overflow-x: auto;
+  font-size: 12px;
+  background: var(--bg);
+}
+
+.diff-line {
+  display: block;
+  white-space: pre;
+}
+
+.diff-add {
+  background: var(--add-bg);
+}
+
+.diff-del {
+  background: var(--del-bg);
+}
+
+.diff-context {
+  color: var(--fg);
+}
+
+.diff-hunk,
+.diff-meta {
+  color: var(--muted);
+}
+
+.diff-checkpoints-section h3 {
+  margin: 0.5rem 0 0.25rem;
+}
+
+.diff-conversation {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.25rem;
+  margin-bottom: 0.35rem;
+}
+
+.diff-checkpoints {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+
+.diff-checkpoint {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.5rem;
+  padding: 0.25rem 0;
+  border-bottom: 1px solid var(--border);
+}
+
+.diff-checkpoint-info {
+  font-family: ui-monospace, monospace;
+  font-size: 13px;
+}

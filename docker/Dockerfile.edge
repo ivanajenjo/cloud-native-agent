@@ -13,9 +13,12 @@ COPY packages/shared/package.json packages/shared/package.json
 COPY packages/gateway/package.json packages/gateway/package.json
 COPY packages/edge/package.json packages/edge/package.json
 COPY packages/extensions/package.json packages/extensions/package.json
+COPY packages/web/package.json packages/web/package.json
+COPY packages/cli/package.json packages/cli/package.json
 RUN npm ci
 COPY packages/ packages/
-RUN npm run build
+# Only what edge runs: the web UI and the CLI are not part of this image.
+RUN npm run build -w @cna/shared -w @cna/edge
 
 # ---------------------------------------------------------------------------
 # prod-deps: production dependencies of shared and edge only (no Pi)
@@ -27,6 +30,8 @@ COPY packages/shared/package.json packages/shared/package.json
 COPY packages/gateway/package.json packages/gateway/package.json
 COPY packages/edge/package.json packages/edge/package.json
 COPY packages/extensions/package.json packages/extensions/package.json
+COPY packages/web/package.json packages/web/package.json
+COPY packages/cli/package.json packages/cli/package.json
 RUN npm ci --omit=dev --workspace=@cna/edge --workspace=@cna/shared --include-workspace-root=false
 
 # ---------------------------------------------------------------------------

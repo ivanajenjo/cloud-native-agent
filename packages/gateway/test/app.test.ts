@@ -1,3 +1,6 @@
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import type {
   Checkpoint,
   DiffResponse,
@@ -822,5 +825,48 @@ describe("body size limit", () => {
     expect(res.status).toBe(413);
     expect(await res.json()).toEqual({ error: "invalid_request", message: "body too large" });
     expect(session.postMessage).not.toHaveBeenCalled();
+  });
+});
+
+describe("web UI mounting", () => {
+  let dir: string;
+
+  beforeEach(async () => {
+    dir = await mkdtemp(join(tmpdir(), "cna-app-web-"));
+    await writeFile(join(dir, "index.html"), "<!doctype html><title>cna</title>");
+  });
+
+  afterEach(async () => {
+    await rm(dir, { recursive: true, force: true });
+  });
+
+  it("serves /ui/ when webUiDir is set", async () => {
+    const app = createApp({
+      version: "1",
+      session: fakeSession(),
+      events: new EventLog(),
+      models: () => MODELS,
+      webUiDir: dir,
+    });
+
+    const res = await app.request("/ui/");
+
+    expect(res.status).toBe(200);
+    expect(res.headers.get("content-type")).toBe("text/html; charset=utf-8");
+    expect(await res.text()).toContain("<title>cna</title>");
+  });
+
+  it("answers /ui/ with not_found JSON when webUiDir is absent", async () => {
+    const app = createApp({
+      version: "1",
+      session: fakeSession(),
+      events: new EventLog(),
+      models: () => MODELS,
+    });
+
+    const res = await app.request("/ui/");
+
+    expect(res.status).toBe(404);
+    expect(await res.json()).toEqual({ error: "not_found" });
   });
 });
