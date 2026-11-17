@@ -1,6 +1,6 @@
-import { mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   createToolLog,
@@ -291,5 +291,84 @@ describe("createToolLog pending starts", () => {
     const [first, second] = await readEntries();
     expect(first?.args).toBeNull();
     expect(second?.args).toEqual({ i: 1 });
+  });
+});
+
+describe("createToolLog rotation", () => {
+  /** Each entry below serializes to 127 bytes, so two fit in 300 bytes and a third does not. */
+  function endEntries(log: ToolLog, ids: string[]): void {
+    for (const id of ids) {
+      log.end("s1", { toolCallId: id, toolName: "bash", result: {}, isError: false });
+    }
+  }
+
+  function idsOf(entries: ToolLogEntry[]): string[] {
+    return entries.map((e) => e.toolCallId);
+  }
+
+  async function readEntriesFrom(path: string): Promise<ToolLogEntry[]> {
+    const text = await readFile(path, "utf8");
+    return text
+      .split("\n")
+      .filter((line) => line.length > 0)
+      .map((line) => JSON.parse(line) as ToolLogEntry);
+  }
+
+  it("moves the full file to tools.jsonl.1 and continues in a new tools.jsonl", async () => {
+    const log = makeLog({ maxBytes: 300 });
+
+    endEntries(log, ["c0", "c1", "c2"]);
+    await log.close();
+
+    expect(idsOf(await readEntriesFrom(`${filePath}.1`))).toEqual(["c0", "c1"]);
+    expect(idsOf(await readEntries())).toEqual(["c2"]);
+  });
+
+  it("replaces the previous tools.jsonl.1 on a second rotation", async () => {
+    const log = makeLog({ maxBytes: 300 });
+
+    endEntries(log, ["c0", "c1", "c2", "c3", "c4"]);
+    await log.close();
+
+    expect(idsOf(await readEntriesFrom(`${filePath}.1`))).toEqual(["c2", "c3"]);
+    expect(idsOf(await readEntries())).toEqual(["c4"]);
+  });
+
+  it("rotates on the first write when the existing file is already near the limit", async () => {
+    await mkdir(dirname(filePath), { recursive: true });
+    const original = `${"x".repeat(249)}\n`;
+    await writeFile(filePath, original);
+    const log = makeLog({ maxBytes: 300 });
+
+    endEntries(log, ["c0"]);
+    await log.close();
+
+    expect(await readFile(`${filePath}.1`, "utf8")).toBe(original);
+    expect(idsOf(await readEntries())).toEqual(["c0"]);
+  });
+
+  it("writes a line bigger than the limit into an empty file without rotating", async () => {
+    const log = makeLog({ maxBytes: 50 });
+
+    endEntries(log, ["c0"]);
+    await log.close();
+
+    await expect(stat(`${filePath}.1`)).rejects.toMatchObject({ code: "ENOENT" });
+    expect(idsOf(await readEntries())).toEqual(["c0"]);
+  });
+
+  it("logs a failed rotation and still writes the line to tools.jsonl", async () => {
+    // A non-empty directory where the rotated file should go makes rename fail.
+    await mkdir(`${filePath}.1`, { recursive: true });
+    await writeFile(join(`${filePath}.1`, "keep"), "keep");
+    const logError = vi.fn();
+    const log = makeLog({ maxBytes: 200, logError });
+
+    endEntries(log, ["c0", "c1"]);
+    await log.close();
+
+    expect(logError).toHaveBeenCalledTimes(1);
+    expect(logError.mock.calls[0]?.[0]).toMatch(/^tool log: cannot rotate: /);
+    expect(idsOf(await readEntries())).toEqual(["c0", "c1"]);
   });
 });
