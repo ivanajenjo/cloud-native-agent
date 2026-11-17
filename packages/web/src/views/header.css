@@ -56,12 +56,28 @@
 
 .header-repo,
 .header-branch,
-.header-model {
+.header-model,
+.header-pr {
   font-family: ui-monospace, monospace;
+}
+
+.header-state {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.5rem;
 }
 
 .header-status {
   font-weight: 600;
+}
+
+.header-suspended {
+  padding: 0 0.5rem;
+  border: 1px solid var(--warn);
+  border-radius: 999px;
+  color: var(--warn);
+  font-size: 0.75rem;
 }
 
 .status-idle,

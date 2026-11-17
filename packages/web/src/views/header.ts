@@ -51,11 +51,27 @@ export function createHeader(actions: HeaderActions): Component<SessionInfo | nu
       h("dd", { class: "header-repo", text: session.repo }),
       h("dt", { text: "Rama" }),
       h("dd", { class: "header-branch", text: session.branch ?? "—" }),
+      ...(session.pr === null
+        ? []
+        : [h("dt", { text: "PR" }), h("dd", { class: "header-pr", text: `#${session.pr}` })]),
       h("dt", { text: "Estado" }),
-      h("dd", {
-        class: `header-status status-${session.status}`,
-        text: statusLabel(session.status),
-      }),
+      h(
+        "dd",
+        { class: "header-state" },
+        h("span", {
+          class: `header-status status-${session.status}`,
+          text: statusLabel(session.status),
+        }),
+        session.suspended
+          ? h("span", {
+              class: "header-suspended",
+              attrs: {
+                title: "Pi está parado por inactividad; arrancará con el siguiente mensaje",
+              },
+              text: "en pausa",
+            })
+          : null,
+      ),
       h("dt", { text: "Modelo" }),
       h("dd", { class: "header-model", text: session.model ?? "modelo por defecto" }),
       h("dt", { text: "Modo" }),
