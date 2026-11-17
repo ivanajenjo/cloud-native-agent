@@ -10,21 +10,22 @@ Uso personal, mono-usuario.
 > funcionalidades de la fase 2 y la web UI y el CLI de la fase 3, la sesión sobrevive a un
 > reinicio del contenedor, Pi se para tras un rato sin uso, hay historial de sesiones con
 > reanudación, tokens y coste por sesión, trabajo sobre un PR existente del agente y límites de
-> recursos. Quedan pendientes las comprobaciones que necesitan Docker con red normal (tareas 1 y
-> 2 de la fase 1.5). La fase 5 (Kubernetes) es la siguiente.
+> recursos. Con la fase 5 hay varias réplicas en Docker detrás de un único `edge` (ADR-0012);
+> Kubernetes queda en el backlog. Quedan pendientes las comprobaciones que necesitan Docker con
+> red normal (tareas 1 y 2 de la fase 1.5).
 > Ver [`docs/PLAN.md`](docs/PLAN.md#fases).
 
 ## Cómo funciona
 
 ```
- curl / web UI / CLI ──► edge :8080 ──► agent (gateway :8090 + Pi + toolchains)
-   Bearer token          │                       │
-                         │ :3128 proxy ◄─────────┘  todo el tráfico saliente
+ curl / web UI / CLI ──► edge :8080 ──► agent-1 (gateway :8090 + Pi + toolchains)   red internal-1
+   Bearer token          │        └───► agent-2 …                                   red internal-2
+                         │ :3128 proxy ◄── todo el tráfico saliente de cada agente
                          ▼
                       internet (política + registro)
 ```
 
-Cada réplica son dos contenedores:
+Cada réplica (`agent-N`) atiende una sesión; todas comparten un único `edge` (ADR-0012):
 
 - **`edge`**: la única pieza con acceso a internet.
   - Valida el token (`Authorization: Bearer`) y reenvía la API al gateway, quitando el
@@ -33,8 +34,10 @@ Cada réplica son dos contenedores:
     `/edge-data/network.jsonl`, deniega los destinos internos (loopback, LAN, metadatos…)
     salvo los proveedores de `config/providers.yaml`, y en modo `ask` (por defecto) pregunta
     al usuario por los dominios que no están en la allowlist.
-- **`agent`**: gateway (API REST) + Pi + toolchains (mise). Vive en una red interna sin
-  salida: lo que no pasa por el proxy de `edge` no llega a ningún sitio.
+- **`agent-N`**: gateway (API REST) + Pi + toolchains (mise). Vive en su propia red interna
+  sin salida, en la que solo está `edge`: lo que no pasa por el proxy de `edge` no llega a ningún
+  sitio, y no alcanza a las demás réplicas. `edge` sabe qué réplica abre cada conexión por su IP
+  de origen y le pregunta a ella.
 
 Las decisiones de diseño están en [`docs/adr/`](docs/adr/) y la seguridad (qué protege y
 qué no) en [`docs/adr/0006-frontera-de-confianza.md`](docs/adr/0006-frontera-de-confianza.md).
@@ -156,6 +159,8 @@ npx cna close [--force]
 npx cna stats         # tokens, coste y uso del contexto
 npx cna history       # sesiones de la réplica
 npx cna resume <id>   # reanuda una sesión cerrada (vale el prefijo que muestra history)
+npx cna replicas      # réplicas detrás de edge y la sesión de cada una
+npx cna --replica agent-2 status   # cualquier comando contra otra réplica (o CNA_REPLICA)
 ```
 
 `npm link -w @cna/cli` instala el comando `cna` de forma global. El token solo se lee de
@@ -166,7 +171,9 @@ con el número de la opción, `s`/`n` o el texto, y `/cancel` la cancela.
 ## Usar la API
 
 Todo pasa por `edge:8080` con `Authorization: Bearer $AGENT_API_TOKEN`. Hay una sesión por
-réplica, así que la API usa `/session` en singular.
+réplica, así que la API usa `/session` en singular. Sin prefijo se habla con la réplica por
+defecto (la primera de `CNA_REPLICAS`); `GET /replicas` lista todas y `/replicas/<nombre>/…` es la
+API de otra (p. ej. `$API/replicas/agent-2/session`).
 
 ```sh
 export API=http://localhost:8080 AUTH="Authorization: Bearer $AGENT_API_TOKEN"
@@ -340,7 +347,7 @@ GATEWAY_PORT=8090 node packages/gateway/dist/main.js
 
 # Terminal 2: edge
 AGENT_API_TOKEN=$(openssl rand -hex 32) \
-GATEWAY_URL=http://127.0.0.1:8090 \
+EDGE_REPLICAS=localhost \
 EDGE_DATA_DIR="$PWD/.edge-data" EDGE_PROVIDERS_FILE="$PWD/config/providers.yaml" \
 node packages/edge/dist/main.js
 
