@@ -1,0 +1,58 @@
+.todos {
+  padding: 0.75rem 1rem;
+}
+
+.todos-title {
+  margin: 0 0 0.5rem;
+  font-size: 1rem;
+}
+
+.todos-empty {
+  margin: 0;
+  color: var(--muted);
+  font-size: 0.875rem;
+}
+
+.todos-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 0.25rem;
+}
+
+.todos-item {
+  display: flex;
+  gap: 0.5rem;
+  align-items: baseline;
+  overflow-wrap: anywhere;
+}
+
+.todos-marker {
+  flex: none;
+  width: 1.25em;
+  text-align: center;
+}
+
+.todos-sr {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+  clip: rect(0 0 0 0);
+  white-space: nowrap;
+}
+
+.todo-in_progress .todos-marker {
+  color: var(--accent);
+}
+
+.todo-completed .todos-marker {
+  color: var(--ok);
+}
+
+.todo-completed .todos-text {
+  color: var(--muted);
+  text-decoration: line-through;
+}
