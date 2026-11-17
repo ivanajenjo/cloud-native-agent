@@ -426,7 +426,8 @@ compose) y el trabajo sobre PR contra GitHub real (probado con un `gh` falso).
 - Trabajar sobre un PR existente (7), tokens y coste por sesión (9), historial de sesiones (10).
 
 ### Fase 5 — Varias réplicas en Docker
-Replanteada en ADR-0012: solo Docker; Kubernetes pasa al backlog.
+Hecha (ADR-0012: solo Docker; Kubernetes pasa al backlog), salvo la comprobación con las
+imágenes construidas (compose con el profile `replicas`); está probada con procesos locales.
 - `edge` compartido por varias réplicas (`EDGE_REPLICAS`): identifica la réplica de cada conexión
   de salida por su IP de origen, le manda a ella la pregunta y el evento `network`, y deniega lo
   que no venga de una réplica (`unknown_client`).
