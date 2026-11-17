@@ -6,14 +6,16 @@
     "packages/shared",
     "packages/gateway",
     "packages/edge",
-    "packages/extensions"
+    "packages/extensions",
+    "packages/web",
+    "packages/cli"
   ],
   "engines": {
     "node": ">=22.21.0"
   },
   "scripts": {
     "build": "npm run build --workspaces --if-present",
-    "typecheck": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json && tsc -p packages/web/tsconfig.json",
     "lint": "biome check .",
     "format": "biome format --write .",
     "pretest": "npm run build -w @cna/shared",
