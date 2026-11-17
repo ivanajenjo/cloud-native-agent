@@ -1,9 +1,11 @@
 import { isAbsolute } from "node:path";
-import { DEFAULT_PORTS, parsePort } from "@cna/shared";
+import { DEFAULT_PORTS, parsePort, parseReplicaNames } from "@cna/shared";
+import type { ReplicaTarget } from "./replicas.js";
 
 export interface EdgeConfig {
   token: string;
-  gatewayUrl: string; // normalized, no trailing slash
+  /** EDGE_REPLICAS, default "agent-1". Non-empty; the first one is the default replica (ADR-0012). */
+  replicas: ReplicaTarget[];
   dataDir: string;
   apiPort: number;
   proxyPort: number;
@@ -18,7 +20,7 @@ export interface EdgeConfig {
 }
 
 const MIN_TOKEN_LENGTH = 32;
-const DEFAULT_GATEWAY_URL = "http://agent:8090";
+const DEFAULT_REPLICAS = "agent-1";
 const DEFAULT_DATA_DIR = "/edge-data";
 const DEFAULT_PROVIDERS_FILE = "/config/providers.yaml";
 const DEFAULT_NOTIFICATIONS_FILE = "/config/notifications.yaml";
@@ -34,12 +36,15 @@ const FORBIDDEN_TOKEN_CHARS = /[\s\p{Cc}]/u;
 
 /**
  * Reads edge's configuration from `env`. Throws an `Error` with a clear message on any invalid
- * value. No message ever contains the value of `AGENT_API_TOKEN`, not even partially; the
- * `GATEWAY_URL` messages omit the value too, because it may carry credentials.
+ * value. No message ever contains the value of `AGENT_API_TOKEN`, not even partially.
  */
 export function loadConfig(env: Record<string, string | undefined>): EdgeConfig {
   const token = parseToken(env.AGENT_API_TOKEN);
-  const gatewayUrl = parseGatewayUrl(env.GATEWAY_URL ?? DEFAULT_GATEWAY_URL);
+  if (env.GATEWAY_URL !== undefined) {
+    // The value is not echoed: it may carry credentials.
+    throw new Error("GATEWAY_URL is no longer supported: use EDGE_REPLICAS (ADR-0012)");
+  }
+  const replicas = parseReplicas(env.EDGE_REPLICAS);
   const dataDir = parseDataDir(env.EDGE_DATA_DIR ?? DEFAULT_DATA_DIR);
   const apiPort = parsePortVariable("EDGE_API_PORT", env.EDGE_API_PORT, DEFAULT_PORTS.edgeApi);
   const proxyPort = parsePortVariable(
@@ -66,7 +71,7 @@ export function loadConfig(env: Record<string, string | undefined>): EdgeConfig 
 
   return {
     token,
-    gatewayUrl,
+    replicas,
     dataDir,
     apiPort,
     proxyPort,
@@ -90,27 +95,19 @@ function parseToken(value: string | undefined): string {
   return value;
 }
 
-function parseGatewayUrl(value: string): string {
-  let url: URL;
+/** EDGE_REPLICAS: comma-separated replica names; each gateway is http://<name>:8090. */
+function parseReplicas(value: string | undefined): ReplicaTarget[] {
+  let names: string[];
   try {
-    url = new URL(value);
-  } catch {
-    throw new Error("GATEWAY_URL must be a valid URL, for example http://agent:8090");
+    names = parseReplicaNames(value ?? DEFAULT_REPLICAS);
+  } catch (error) {
+    const reason = error instanceof Error ? error.message : String(error);
+    throw new Error(`EDGE_REPLICAS: ${reason}`);
   }
-  if (url.protocol !== "http:") {
-    throw new Error("GATEWAY_URL must use the http: protocol");
-  }
-  if (url.username !== "" || url.password !== "") {
-    throw new Error("GATEWAY_URL must not contain credentials");
-  }
-  if (url.search !== "" || url.hash !== "") {
-    throw new Error("GATEWAY_URL must not contain a query or a fragment");
-  }
-  if (url.pathname !== "/") {
-    throw new Error("GATEWAY_URL must not contain a path");
-  }
-  // origin has no trailing slash, unlike href.
-  return url.origin;
+  return names.map((name) => ({
+    name,
+    gatewayUrl: `http://${name}:${DEFAULT_PORTS.gateway}`,
+  }));
 }
 
 function parseDataDir(value: string): string {
