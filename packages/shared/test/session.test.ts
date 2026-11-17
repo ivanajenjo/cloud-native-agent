@@ -88,3 +88,24 @@ describe("SetModelRequestSchema", () => {
     expect(SetModelRequestSchema.safeParse({}).success).toBe(false);
   });
 });
+
+describe("CreateSessionRequestSchema with pr", () => {
+  it("accepts a PR session without prompt", () => {
+    expect(CreateSessionRequestSchema.safeParse({ repo: "a/b", pr: 12 }).success).toBe(true);
+  });
+
+  it("accepts a PR session with prompt", () => {
+    expect(CreateSessionRequestSchema.safeParse({ repo: "a/b", pr: 12, prompt: "x" }).success).toBe(
+      true,
+    );
+  });
+
+  it.each([
+    ["no prompt and no pr", { repo: "a/b" }],
+    ["pr 0", { repo: "a/b", pr: 0 }],
+    ["pr not an integer", { repo: "a/b", pr: 1.5 }],
+    ["pr as a string", { repo: "a/b", pr: "12" }],
+  ])("rejects %s", (_name, body) => {
+    expect(CreateSessionRequestSchema.safeParse(body).success).toBe(false);
+  });
+});

@@ -25,6 +25,8 @@ const SESSION: SessionInfo = {
   mode: "auto",
   autoPush: false,
   createdAt: TS,
+  pr: null,
+  suspended: false,
   pendingQuestions: [],
 };
 

@@ -34,6 +34,11 @@ export type SessionEvent =
   | { type: "todo"; todos: TodoItem[] }
   /** A checkpoint was created, or the working tree was restored to it. */
   | { type: "checkpoint"; action: "created" | "restored"; checkpoint: Checkpoint }
+  /**
+   * The whole conversation so far, sent once when a session is resumed (gateway restart or history,
+   * ADR-0011). It replaces whatever the client shows; later `message` events follow it.
+   */
+  | { type: "history"; messages: PiMessage[] }
   /** The session mode changed (plan approved → "auto"). */
   | { type: "mode"; mode: SessionMode }
   | {

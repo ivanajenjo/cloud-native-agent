@@ -95,6 +95,10 @@ export class EventPrinter {
             : `restaurado el checkpoint #${id}`;
         return this.line(this.paint(label, "dim"));
       }
+      case "history":
+        return this.line(
+          this.paint(`(sesión reanudada: ${event.messages.length} mensajes anteriores)`, "dim"),
+        );
       case "mode":
         return this.line(this.paint(`modo: ${sanitize(event.mode)}`, "yellow"));
       case "network": {

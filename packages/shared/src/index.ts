@@ -2,6 +2,13 @@ export { parsePort } from "./env.js";
 export type { SessionEvent, SessionEventType, StreamEvent } from "./events.js";
 export type { HealthResponse } from "./health.js";
 export {
+  HISTORY_LIMIT,
+  type HistoryEntry,
+  type HistoryResponse,
+  type ResumeSessionRequest,
+  ResumeSessionRequestSchema,
+} from "./history.js";
+export {
   INTERNAL_PATH_PREFIX,
   INTERNAL_ROUTES,
   type PublishNetworkEntryRequest,
@@ -98,6 +105,7 @@ export {
   type SessionInfo,
   type SessionMode,
   SessionModeSchema,
+  type SessionStats,
   type SessionStatus,
   type SetModelRequest,
   SetModelRequestSchema,

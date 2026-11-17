@@ -40,6 +40,8 @@ const session: SessionInfo = {
   mode: "auto",
   autoPush: false,
   createdAt: "2026-11-17T10:00:00.000Z",
+  pr: null,
+  suspended: false,
   pendingQuestions: [],
 };
 
@@ -838,5 +840,30 @@ describe("slice identity and immutability", () => {
     reduceView(busy, { type: "messages", messages: [{ role: "user", content: "hola" }] });
     reduceView(busy, { type: "networkLog", entries: [netEntry(1)] });
     expect(busy).toEqual(snapshot);
+  });
+});
+
+describe("history event", () => {
+  it("rebuilds the transcript from the resumed conversation", () => {
+    const withNotice = reduceView(initialViewState, {
+      type: "event",
+      event: { id: 1, ts: "2026-11-17T00:00:00.000Z", event: { type: "error", message: "old" } },
+    });
+    const next = reduceView(withNotice, {
+      type: "event",
+      event: {
+        id: 2,
+        ts: "2026-11-17T00:00:00.000Z",
+        event: {
+          type: "history",
+          messages: [
+            { role: "user", content: "hola" },
+            { role: "assistant", content: [{ type: "text", text: "adiós" }] },
+          ],
+        },
+      },
+    });
+    expect(next.transcript.map((item) => item.kind)).toEqual(["user", "assistant"]);
+    expect(next.lastEventId).toBe(2);
   });
 });

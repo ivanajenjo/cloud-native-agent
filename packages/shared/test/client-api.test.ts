@@ -64,6 +64,8 @@ const SESSION = {
   mode: "auto",
   autoPush: false,
   createdAt: "2026-01-01T00:00:00.000Z",
+  pr: null,
+  suspended: false,
   pendingQuestions: [],
 };
 

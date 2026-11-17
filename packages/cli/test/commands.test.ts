@@ -85,6 +85,8 @@ function sessionInfo(overrides: Partial<SessionInfo> = {}): SessionInfo {
     mode: "auto",
     autoPush: false,
     createdAt: "2026-11-17T10:00:00.000Z",
+    pr: null,
+    suspended: false,
     pendingQuestions: [],
     ...overrides,
   };

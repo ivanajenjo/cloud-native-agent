@@ -27,6 +27,8 @@ const SESSION: SessionInfo = {
   mode: "auto",
   autoPush: false,
   createdAt: "2026-11-16T10:00:00.000Z",
+  pr: null,
+  suspended: false,
   pendingQuestions: [],
 };
 

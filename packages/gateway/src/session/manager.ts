@@ -195,6 +195,10 @@ export class SessionManager implements SessionService {
   }
 
   async create(request: CreateSessionRequest): Promise<SessionInfo> {
+    // Temporary until PR sessions land (ADR-0011): a body without pr always has a prompt.
+    if (request.pr !== undefined || request.prompt === undefined) {
+      throw new SessionError("invalid_request", "pr is not supported yet");
+    }
     const previous = this.info;
     if (
       previous !== null &&
@@ -229,6 +233,8 @@ export class SessionManager implements SessionService {
       mode: request.mode ?? "auto",
       autoPush: request.autoPush ?? false,
       createdAt: this.now().toISOString(),
+      pr: request.pr ?? null,
+      suspended: false,
       pendingQuestions: [],
     };
     this.info = info;
@@ -596,7 +602,7 @@ export class SessionManager implements SessionService {
         repo: request.repo,
         baseBranch: request.baseBranch,
         dir: this.options.workspaceDir,
-        slug: slugify(request.prompt),
+        slug: slugify(request.prompt ?? ""),
         userName: this.options.gitIdentity?.name,
         userEmail: this.options.gitIdentity?.email,
         remoteBase: this.options.remoteBase,
@@ -633,7 +639,7 @@ export class SessionManager implements SessionService {
       this.settled = false;
       this.setStatus("running");
 
-      const data = await pi.send({ type: "prompt", message: request.prompt });
+      const data = await pi.send({ type: "prompt", message: request.prompt ?? "" });
       if (this.isCurrent(sessionId) && dispositionOf(data) === "handled") {
         // Handled by an extension: there is no run to wait for.
         this.settled = true;
