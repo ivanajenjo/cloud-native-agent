@@ -75,6 +75,9 @@ ejecutar tests y subir los cambios. Se controla por API REST, una web UI sencill
   lectura en los dos contenedores para que `edge` permita los proveedores sin fiarse del agente.
 - **Servicios auxiliares** (ADR-0009). `notifications.yaml` y `web.yaml` siguen el mismo
   camino: solo lectura en los dos contenedores, y `edge` permite sus hosts.
+- **Web UI y CLI** (ADR-0010). Cliente común en `@cna/shared/client`; web estática sin
+  framework (build con Vite) servida por el gateway en `/ui/` con CSP estricta; el contenido
+  del agente se pinta siempre como texto. El CLI lee el token solo de `CNA_TOKEN`.
 
 ## API REST (borrador v1)
 
@@ -384,6 +387,8 @@ Hecha, salvo la comprobación con las imágenes construidas (como las tareas 1 y
 - Notificaciones push con ntfy/Telegram (5).
 
 ### Fase 3 — CLI y web UI
+Hecha (ADR-0010), salvo la comprobación con las imágenes construidas: la web se ha probado con
+el build de Vite servido por un backend falso, no dentro del contenedor.
 - CLI: `cna run <repo> "<prompt>" [--plan]`, chat interactivo en terminal, responder preguntas,
   `cna status/diff/todos/abort/close`.
 - Web UI: formulario de nueva sesión (modo plan/auto), chat con streaming, tarjetas de tool calls,
