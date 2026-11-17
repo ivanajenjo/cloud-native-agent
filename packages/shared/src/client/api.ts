@@ -10,6 +10,7 @@ import type {
   NetworkPolicyResponse,
   UpdateNetworkPolicyRequest,
 } from "../network-api.js";
+import type { ReplicaSummary, ReplicasResponse } from "../replicas.js";
 import type {
   AnswerRequest,
   ApiErrorCode,
@@ -143,6 +144,16 @@ async function readJson<T>(response: Response): Promise<T> {
   return (await response.json()) as T;
 }
 
+/** Body of a non-2xx answer as an object; {} when it is not JSON or not an object. */
+async function readErrorBody(response: Response): Promise<Record<string, unknown>> {
+  try {
+    const body: unknown = await response.json();
+    return isRecord(body) ? body : {};
+  } catch {
+    return {};
+  }
+}
+
 /** Maps an SSE record to a stream item; undefined when the record is skipped. */
 function toStreamItem(record: SseRecord): EventStreamItem | undefined {
   if (record.kind === "comment") {
@@ -176,12 +187,29 @@ export class ApiClient {
     this.fetchImpl = options.fetch ?? ((input, init) => globalThis.fetch(input, init));
   }
 
-  /** GET /session; 404 → null. */
+  /**
+   * GET /session; 404 → null, except 404 `replica_not_found` (the replica name in the path does
+   * not exist), which throws ApiClientError.
+   */
   async getSession(): Promise<SessionInfo | null> {
     const response = await this.send("GET", "/session");
-    if (response.status === 404) return null;
+    if (response.status === 404) {
+      const body = await readErrorBody(response);
+      if (body.error === "replica_not_found") {
+        const message = typeof body.message === "string" ? body.message : "HTTP 404";
+        throw new ApiClientError(404, "replica_not_found", message);
+      }
+      return null;
+    }
     await assertOk(response);
     return readJson<SessionInfo>(response);
+  }
+
+  /** GET /replicas → `.replicas`. Answered by edge, so it is called without a replica prefix. */
+  async replicas(): Promise<ReplicaSummary[]> {
+    const response = await this.send("GET", "/replicas");
+    await assertOk(response);
+    return (await readJson<ReplicasResponse>(response)).replicas;
   }
 
   /** POST /session (201). */

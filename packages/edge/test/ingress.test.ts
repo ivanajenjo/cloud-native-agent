@@ -1,3 +1,4 @@
+import type { ReplicasResponse } from "@cna/shared";
 import { Hono } from "hono";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { AnswerResult } from "../src/egress/ask.js";
@@ -13,6 +14,8 @@ import {
 const TOKEN = "test-agent-token-0123456789";
 const GATEWAY = "http://gw.test";
 const VERSION = "9.9.9-test";
+const AGENT_1 = "http://agent-1:8090";
+const AGENT_2 = "http://agent-2:8090";
 
 interface FetchCall {
   url: string;
@@ -36,7 +39,7 @@ function setup(
   const gateway = fakeGateway(respond);
   const app = createIngressApp({
     token: TOKEN,
-    gatewayUrl: GATEWAY,
+    replicas: [{ name: "agent-1", gatewayUrl: GATEWAY }],
     version: VERSION,
     fetch: gateway.fetch,
     ...extra,
@@ -539,7 +542,7 @@ describe("network API (/network/*, answered by edge)", () => {
     const gateway = fakeGateway(respond);
     const app = createIngressApp({
       token: TOKEN,
-      gatewayUrl: GATEWAY,
+      replicas: [{ name: "agent-1", gatewayUrl: GATEWAY }],
       version: VERSION,
       fetch: gateway.fetch,
       networkApi: stub.api,
@@ -625,5 +628,244 @@ describe("network API (/network/*, answered by edge)", () => {
     expect(res.status).toBe(404);
     expect(await res.json()).toEqual({ error: "not_found" });
     expect(calls).toHaveLength(0);
+  });
+});
+
+describe("replicas (ADR-0012)", () => {
+  /**
+   * Sends a request whose target is kept as written: `new Request` would resolve "." and ".."
+   * before the app sees them, and a raw HTTP client does not.
+   */
+  function sendRaw(app: Hono, target: string, init: RequestInit = {}) {
+    const request = new Request("http://edge/", init);
+    Object.defineProperty(request, "url", { value: `http://edge${target}` });
+    return app.fetch(request);
+  }
+
+  function setupReplicas(
+    extra: Partial<Pick<IngressOptions, "networkAnswers" | "networkApi" | "listReplicas">> = {},
+  ) {
+    const gateway = fakeGateway();
+    const app = createIngressApp({
+      token: TOKEN,
+      replicas: [
+        { name: "agent-1", gatewayUrl: AGENT_1 },
+        { name: "agent-2", gatewayUrl: AGENT_2 },
+      ],
+      version: VERSION,
+      fetch: gateway.fetch,
+      ...extra,
+    });
+    return { app, calls: gateway.calls };
+  }
+
+  const LIST: ReplicasResponse = {
+    replicas: [
+      { name: "agent-1", reachable: true, session: null },
+      { name: "agent-2", reachable: false, session: null },
+    ],
+  };
+
+  it("a path without prefix goes to the default replica, the first one", async () => {
+    const { app, calls } = setupReplicas();
+    const res = await app.request("/session", { headers: auth });
+    expect(res.status).toBe(200);
+    expect(calls.map((call) => call.url)).toEqual([`${AGENT_1}/session`]);
+  });
+
+  it("/replicas/agent-2/session?x=1 goes to agent-2 without the authorization header", async () => {
+    const { app, calls } = setupReplicas();
+    const res = await app.request("/replicas/agent-2/session?x=1", { headers: auth });
+    expect(res.status).toBe(200);
+    expect(calls).toHaveLength(1);
+    expect(calls[0]?.url).toBe(`${AGENT_2}/session?x=1`);
+    expect(new Headers(calls[0]?.init?.headers).get("authorization")).toBeNull();
+  });
+
+  it("/replicas/agent-2 without rest goes to the root of agent-2", async () => {
+    const { app, calls } = setupReplicas();
+    const res = await app.request("/replicas/agent-2", { headers: auth });
+    expect(res.status).toBe(200);
+    expect(calls.map((call) => call.url)).toEqual([`${AGENT_2}/`]);
+  });
+
+  it("the body of a POST under a replica is forwarded intact", async () => {
+    const { app, calls } = setupReplicas();
+    const body = JSON.stringify({ repo: "owner/name", prompt: "hola" });
+    const res = await app.request("/replicas/agent-2/session", {
+      method: "POST",
+      headers: { ...auth, "content-type": "application/json" },
+      body,
+    });
+    expect(res.status).toBe(200);
+    expect(calls[0]?.url).toBe(`${AGENT_2}/session`);
+    expect(calls[0]?.init?.method).toBe("POST");
+    expect(await new Response(calls[0]?.init?.body).text()).toBe(body);
+  });
+
+  it("GET /replicas and /replicas/ with Bearer answer with listReplicas", async () => {
+    const listReplicas = vi.fn(async () => LIST);
+    const { app, calls } = setupReplicas({ listReplicas });
+    for (const path of ["/replicas", "/replicas/"]) {
+      const res = await app.request(path, { headers: auth });
+      expect(res.status).toBe(200);
+      expect(await res.json()).toEqual(LIST);
+    }
+    expect(listReplicas).toHaveBeenCalledTimes(2);
+    expect(calls).toHaveLength(0);
+  });
+
+  it("the replica listing without Bearer gets 401 and listReplicas is not called", async () => {
+    const listReplicas = vi.fn(async () => LIST);
+    const { app } = setupReplicas({ listReplicas });
+    const res = await app.request("/replicas");
+    expect(res.status).toBe(401);
+    expect(res.headers.get("WWW-Authenticate")).toBe("Bearer");
+    expect(await res.json()).toEqual({ error: "unauthorized" });
+    expect(listReplicas).not.toHaveBeenCalled();
+  });
+
+  it("POST /replicas gets 405 and listReplicas is not called", async () => {
+    const listReplicas = vi.fn(async () => LIST);
+    const { app, calls } = setupReplicas({ listReplicas });
+    const res = await app.request("/replicas", { method: "POST", headers: auth, body: "{}" });
+    expect(res.status).toBe(405);
+    expect(await res.json()).toEqual({ error: "invalid_request", message: "method not allowed" });
+    expect(listReplicas).not.toHaveBeenCalled();
+    expect(calls).toHaveLength(0);
+  });
+
+  it("without listReplicas, /replicas gets 404 not_found", async () => {
+    const { app, calls } = setupReplicas();
+    const res = await app.request("/replicas", { headers: auth });
+    expect(res.status).toBe(404);
+    expect(await res.json()).toEqual({ error: "not_found" });
+    expect(calls).toHaveLength(0);
+  });
+
+  it("a listReplicas that rejects gets 502 bad_gateway without the token in the log", async () => {
+    const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+    const listReplicas = vi.fn(async (): Promise<ReplicasResponse> => {
+      throw new Error("boom");
+    });
+    const { app } = setupReplicas({ listReplicas });
+    const res = await app.request("/replicas", { headers: auth });
+    expect(res.status).toBe(502);
+    expect(await res.json()).toEqual({ error: "bad_gateway" });
+    expect(errorSpy).toHaveBeenCalledTimes(1);
+    expect(JSON.stringify(errorSpy.mock.calls)).not.toContain(TOKEN);
+  });
+
+  it("everything under /replicas needs Bearer, public routes included", async () => {
+    const { app, calls } = setupReplicas();
+    expect((await app.request("/replicas/agent-2/session")).status).toBe(401);
+    expect((await app.request("/replicas/agent-2/ui/")).status).toBe(401);
+    expect((await app.request("/replicas/agent-2/")).status).toBe(401);
+    expect((await app.request("/replicas/agent-2/ui/app.js", { method: "HEAD" })).status).toBe(401);
+    const res = await app.request("/replicas/agent-2/session");
+    expect(await res.json()).toEqual({ error: "unauthorized" });
+    expect(calls).toHaveLength(0);
+  });
+
+  it("with Bearer, the static web UI of a replica is forwarded to that replica", async () => {
+    const { app, calls } = setupReplicas();
+    const res = await app.request("/replicas/agent-2/ui/", { headers: auth });
+    expect(res.status).toBe(200);
+    expect(calls.map((call) => call.url)).toEqual([`${AGENT_2}/ui/`]);
+  });
+
+  it("an unknown replica gets 404 replica_not_found and fetch is not called", async () => {
+    const { app, calls } = setupReplicas();
+    const res = await app.request("/replicas/agent-9/session", { headers: auth });
+    expect(res.status).toBe(404);
+    expect(await res.json()).toEqual({ error: "replica_not_found" });
+    expect(calls).toHaveLength(0);
+  });
+
+  it.each([
+    "/replicas/Agent-2/session",
+    "/replicas/agent%2D2/session",
+    "/replicas/-x/session",
+    "/replicas/agent-2/../agent-1/session",
+    "/replicas/agent-2/./session",
+    "/replicas/agent-2/%2e%2e/session",
+    "/replicas/agent-2/internal/questions",
+    "/replicas/agent-2/%69nternal/questions",
+    "/replicas/agent-2//internal/questions",
+    "/replicas/agent-2/INTERNAL/x",
+    "/replicas/agent-1/../../internal/questions",
+  ])("%s is 404 not_found with and without body, fetch is not called", async (path) => {
+    const { app, calls } = setupReplicas();
+    const get = await sendRaw(app, path, { headers: auth });
+    expect(get.status).toBe(404);
+    expect(await get.json()).toEqual({ error: "not_found" });
+
+    const post = await sendRaw(app, path, { method: "POST", headers: auth, body: "{}" });
+    expect(post.status).toBe(404);
+    expect(await post.json()).toEqual({ error: "not_found" });
+    expect(calls).toHaveLength(0);
+  });
+
+  it("a net- answer under a replica is answered by networkAnswers and never forwarded", async () => {
+    const answer = vi.fn((_id: string, _value: string): AnswerResult => "ok");
+    const { app, calls } = setupReplicas({ networkAnswers: { answer } });
+    const res = await app.request("/replicas/agent-2/session/answers/net-abc", {
+      method: "POST",
+      headers: { ...auth, "content-type": "application/json" },
+      body: JSON.stringify({ value: "allow_once" }),
+    });
+    expect(res.status).toBe(204);
+    expect(answer).toHaveBeenCalledWith("net-abc", "allow_once");
+    expect(calls).toHaveLength(0);
+  });
+
+  it("an answer without the net- prefix under a replica goes to that replica", async () => {
+    const answer = vi.fn((_id: string, _value: string): AnswerResult => "ok");
+    const { app, calls } = setupReplicas({ networkAnswers: { answer } });
+    const res = await app.request("/replicas/agent-2/session/answers/q-1", {
+      method: "POST",
+      headers: { ...auth, "content-type": "application/json" },
+      body: JSON.stringify({ value: "x" }),
+    });
+    expect(res.status).toBe(200);
+    expect(answer).not.toHaveBeenCalled();
+    expect(calls.map((call) => call.url)).toEqual([`${AGENT_2}/session/answers/q-1`]);
+  });
+
+  it("/network under a replica is answered by networkApi, without the token", async () => {
+    const received: Array<{ url: string; authorization: string | null }> = [];
+    const api = new Hono();
+    api.all("*", (c) => {
+      received.push({ url: c.req.url, authorization: c.req.header("authorization") ?? null });
+      return c.json({ path: new URL(c.req.url).pathname });
+    });
+    const { app, calls } = setupReplicas({ networkApi: api });
+    const res = await app.request("/replicas/agent-2/network/policy", { headers: auth });
+    expect(res.status).toBe(200);
+    expect(await res.json()).toEqual({ path: "/network/policy" });
+    expect(received).toHaveLength(1);
+    expect(received[0]?.authorization).toBeNull();
+    expect(calls).toHaveLength(0);
+
+    await app.request("/replicas/agent-2/network/log?limit=5", { headers: auth });
+    expect(received[1]?.url).toBe("http://edge/network/log?limit=5");
+    expect(calls).toHaveLength(0);
+  });
+
+  it("GET /health without prefix is answered by edge, under a replica it is forwarded", async () => {
+    const { app, calls } = setupReplicas();
+    const own = await app.request("/health");
+    expect(await own.json()).toEqual({ status: "ok", service: "edge", version: VERSION });
+    expect(calls).toHaveLength(0);
+
+    const forwarded = await app.request("/replicas/agent-2/health", { headers: auth });
+    expect(forwarded.status).toBe(200);
+    expect(calls.map((call) => call.url)).toEqual([`${AGENT_2}/health`]);
+  });
+
+  it("createIngressApp rejects an empty replica list", () => {
+    expect(() => createIngressApp({ token: TOKEN, replicas: [], version: VERSION })).toThrow(
+      "at least one replica is required",
+    );
   });
 });

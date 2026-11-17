@@ -4,16 +4,21 @@ import {
   type ApiError,
   type HealthResponse,
   INTERNAL_PATH_PREFIX,
+  isReplicaName,
   NETWORK_QUESTION_ID_PREFIX,
+  REPLICA_PATH_PREFIX,
+  REPLICAS_PATH,
+  type ReplicasResponse,
 } from "@cna/shared";
 import { type Context, Hono } from "hono";
 import type { AnswerResult } from "./egress/ask.js";
+import type { ReplicaTarget } from "./replicas.js";
 
 export interface IngressOptions {
   /** AGENT_API_TOKEN. Validated by the caller (non-empty). */
   token: string;
-  /** Base URL of the gateway, e.g. "http://agent:8090". No trailing slash needed. */
-  gatewayUrl: string;
+  /** Replicas behind edge (ADR-0012). Non-empty; the first one is the default replica, used for paths without the /replicas/<name> prefix. */
+  replicas: readonly ReplicaTarget[];
   /** edge version, reported by its own /health. */
   version: string;
   /** Injectable for tests; defaults to globalThis.fetch. */
@@ -22,6 +27,8 @@ export interface IngressOptions {
   networkAnswers?: { answer(id: string, value: string): AnswerResult };
   /** Answers `/network/*` (network policy and log). Never forwarded to the gateway. */
   networkApi?: Hono;
+  /** Answers GET /replicas. Without it, /replicas is 404. */
+  listReplicas?: () => Promise<ReplicasResponse>;
 }
 
 /** Largest accepted body of `POST /session/answers/:id`. */
@@ -31,6 +38,9 @@ const MAX_ANSWER_BODY_BYTES = 64 * 1024;
 const INTERNAL_ROOT = INTERNAL_PATH_PREFIX.slice(0, -1);
 
 const ANSWER_ROUTE = /^\/session\/answers\/([^/]+)\/?$/;
+
+/** `/replicas/<name>` or `/replicas/<name>/<rest>`, matched on the raw path (ADR-0012). */
+const REPLICA_ROUTE = /^\/replicas\/([^/]+)(\/.*)?$/;
 
 /** Hop-by-hop headers (RFC 9110 section 7.6.1), dropped in both directions. */
 const HOP_BY_HOP_HEADERS: ReadonlySet<string> = new Set([
@@ -149,10 +159,26 @@ function apiError(
   return c.json(body, status);
 }
 
+function unauthorized(c: Context): Response {
+  return c.json({ error: "unauthorized" }, 401, { "WWW-Authenticate": "Bearer" });
+}
+
 /** True for `/network` and every path under `/network/` (compared lowercased). */
 function isNetworkPath(effective: string): boolean {
   const lower = effective.toLowerCase();
   return lower === "/network" || lower.startsWith("/network/");
+}
+
+/** True for `/replicas` and every path under `/replicas/` (compared lowercased). */
+function isReplicasPath(effective: string): boolean {
+  const lower = effective.toLowerCase();
+  return lower === REPLICAS_PATH || lower.startsWith(REPLICA_PATH_PREFIX);
+}
+
+/** True for `/replicas` and `/replicas/` (compared lowercased): the replica listing. */
+function isReplicaListPath(effective: string): boolean {
+  const lower = effective.toLowerCase();
+  return lower === REPLICAS_PATH || lower === REPLICA_PATH_PREFIX;
 }
 
 /**
@@ -293,41 +319,74 @@ const NO_EXTRA_DROPPED: ReadonlySet<string> = new Set();
 type ProxyRequestInit = RequestInit & { duplex?: "half" };
 
 export function createIngressApp(options: IngressOptions): Hono {
+  const [defaultReplica] = options.replicas;
+  if (defaultReplica === undefined) {
+    throw new Error("at least one replica is required");
+  }
   const fetchGateway = options.fetch ?? globalThis.fetch;
-  const gatewayBase = options.gatewayUrl.replace(/\/+$/, "");
+  const defaultGatewayBase = defaultReplica.gatewayUrl.replace(/\/+$/, "");
+  const gatewayBases = new Map<string, string>(
+    options.replicas.map((replica): [string, string] => [
+      replica.name,
+      replica.gatewayUrl.replace(/\/+$/, ""),
+    ]),
+  );
   const app = new Hono();
 
-  app.all("*", async (c) => {
+  /** `GET /replicas` (and `/replicas/`), answered by edge with the Bearer already checked. */
+  async function answerReplicaList(c: Context): Promise<Response> {
+    const method = c.req.raw.method;
+    if (method !== "GET" && method !== "HEAD") {
+      return apiError(c, 405, "invalid_request", "method not allowed");
+    }
+    if (options.listReplicas === undefined) {
+      return apiError(c, 404, "not_found");
+    }
+    let body: ReplicasResponse;
+    try {
+      body = await options.listReplicas();
+    } catch (error) {
+      // Log only the error message: never request headers, which carry the token.
+      console.error(
+        "edge: replicas listing failed:",
+        error instanceof Error ? error.message : error,
+      );
+      return c.json({ error: "bad_gateway" }, 502);
+    }
+    return c.json(body);
+  }
+
+  /**
+   * Routes a request to one replica, applying the same rules to the default replica (no prefix)
+   * and to `/replicas/<name>/...`. `inner` is the path the gateway sees (`/` + rest), `query` the
+   * raw query ("" or "?..."). The Bearer check has already been done by the caller.
+   */
+  async function routeToReplica(
+    c: Context,
+    gatewayBase: string,
+    inner: string,
+    query: string,
+  ): Promise<Response> {
     const request = c.req.raw;
     const method = request.method;
-    const target = requestTarget(c.req.url);
-    const path = pathOf(target);
-
-    if (path === "/health" && (method === "GET" || method === "HEAD")) {
-      const body: HealthResponse = { status: "ok", service: "edge", version: options.version };
-      return c.json(body);
-    }
+    const innerTarget = `${inner}${query}`;
 
     // Internal routes are never forwarded, with or without a token (ADR-0008).
-    if (isInternalPath(path)) {
+    if (isInternalPath(inner)) {
       return apiError(c, 404, "not_found");
     }
 
-    if (
-      !isPublicRequest(method, path) &&
-      !isAuthorized(c.req.header("authorization"), options.token)
-    ) {
-      return c.json({ error: "unauthorized" }, 401, { "WWW-Authenticate": "Bearer" });
+    // Network policy and log are answered by edge, never by the gateway.
+    const innerEffective = effectivePath(inner);
+    if (innerEffective === null) {
+      return apiError(c, 404, "not_found");
     }
-
-    // Network policy and log are answered by edge, with the Bearer token already checked.
-    const effective = effectivePath(path);
-    if (effective !== null && isNetworkPath(effective)) {
-      return answerNetworkApi(c, options.networkApi, effective, target);
+    if (isNetworkPath(innerEffective)) {
+      return answerNetworkApi(c, options.networkApi, innerEffective, innerTarget);
     }
 
     // Network answers are decided by edge and never reach the gateway (ADR-0006, ADR-0008).
-    const answerId = ANSWER_ROUTE.exec(path)?.[1];
+    const answerId = ANSWER_ROUTE.exec(inner)?.[1];
     if (method === "POST" && answerId !== undefined) {
       let questionId: string;
       try {
@@ -356,7 +415,7 @@ export function createIngressApp(options: IngressOptions): Hono {
 
     let upstream: Response;
     try {
-      upstream = await fetchGateway(`${gatewayBase}${target}`, init);
+      upstream = await fetchGateway(`${gatewayBase}${innerTarget}`, init);
     } catch (error) {
       // Log only the error message: never request headers, which carry the token.
       console.error(
@@ -372,6 +431,57 @@ export function createIngressApp(options: IngressOptions): Hono {
       statusText: upstream.statusText,
       headers: copyHeaders(upstream.headers, NO_EXTRA_DROPPED),
     });
+  }
+
+  app.all("*", async (c) => {
+    const method = c.req.raw.method;
+    const target = requestTarget(c.req.url);
+    const path = pathOf(target);
+    const query = target.slice(path.length);
+
+    if (path === "/health" && (method === "GET" || method === "HEAD")) {
+      const body: HealthResponse = { status: "ok", service: "edge", version: options.version };
+      return c.json(body);
+    }
+
+    // Internal routes are never forwarded, with or without a token (ADR-0008).
+    if (isInternalPath(path)) {
+      return apiError(c, 404, "not_found");
+    }
+
+    // Unclassifiable paths are internal (isInternalPath above), so effective is not null here.
+    const effective = effectivePath(path);
+    if (effective === null) {
+      return apiError(c, 404, "not_found");
+    }
+
+    if (isReplicasPath(effective)) {
+      // Everything under /replicas needs the Bearer token, public routes included (ADR-0012).
+      if (!isAuthorized(c.req.header("authorization"), options.token)) {
+        return unauthorized(c);
+      }
+      if (isReplicaListPath(effective)) {
+        return answerReplicaList(c);
+      }
+      const match = REPLICA_ROUTE.exec(path);
+      const name = match?.[1];
+      if (name === undefined || hasDotSegment(path) || !isReplicaName(name)) {
+        return apiError(c, 404, "not_found");
+      }
+      const gatewayBase = gatewayBases.get(name);
+      if (gatewayBase === undefined) {
+        return apiError(c, 404, "replica_not_found");
+      }
+      return routeToReplica(c, gatewayBase, match?.[2] ?? "/", query);
+    }
+
+    if (
+      !isPublicRequest(method, path) &&
+      !isAuthorized(c.req.header("authorization"), options.token)
+    ) {
+      return unauthorized(c);
+    }
+    return routeToReplica(c, defaultGatewayBase, path, query);
   });
 
   return app;

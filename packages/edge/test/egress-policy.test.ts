@@ -12,10 +12,13 @@ import {
 const PUBLIC = "93.184.216.34";
 const PRIVATE = "10.0.0.5";
 const PRIVATE_LAN = "192.168.1.50";
+const REPLICA = "agent-1";
 
 interface Fixture {
   policy: ReturnType<typeof createNetworkPolicy>;
-  ask: ReturnType<typeof vi.fn<(host: string, port: number) => Promise<AskResult>>>;
+  ask: ReturnType<
+    typeof vi.fn<(host: string, port: number, replica: string) => Promise<AskResult>>
+  >;
   addAllow: ReturnType<typeof vi.fn<(entry: string) => Promise<void>>>;
   onPersistError: ReturnType<typeof vi.fn<(error: unknown) => void>>;
   setMode: (mode: NetworkMode) => void;
@@ -38,7 +41,7 @@ function fixture(
   const addAllow = vi.fn(async (entry: string): Promise<void> => {
     if (!state.allow.includes(entry)) state.allow.push(entry);
   });
-  const ask = vi.fn(async (_host: string, _port: number): Promise<AskResult> => {
+  const ask = vi.fn(async (_host: string, _port: number, _replica: string): Promise<AskResult> => {
     return options.answer ?? "deny";
   });
   const onPersistError = vi.fn<(error: unknown) => void>();
@@ -69,7 +72,9 @@ function fixture(
 describe("createNetworkPolicy", () => {
   it("denies dns_error without asking when there are no addresses", async () => {
     const f = fixture();
-    await expect(f.policy({ host: "unknown.dev", port: 443, addresses: [] })).resolves.toEqual({
+    await expect(
+      f.policy({ host: "unknown.dev", port: 443, replica: REPLICA, addresses: [] }),
+    ).resolves.toEqual({
       decision: "deny",
       reason: "dns_error",
     });
@@ -80,10 +85,10 @@ describe("createNetworkPolicy", () => {
     const providers: ProviderEndpoint[] = [{ provider: "ollama", host: PRIVATE_LAN, port: 11434 }];
     const f = fixture({ providers });
     await expect(
-      f.policy({ host: PRIVATE_LAN, port: 11434, addresses: [PRIVATE_LAN] }),
+      f.policy({ host: PRIVATE_LAN, port: 11434, replica: REPLICA, addresses: [PRIVATE_LAN] }),
     ).resolves.toEqual({ decision: "allow", reason: "provider" });
     await expect(
-      f.policy({ host: PRIVATE_LAN, port: 443, addresses: [PRIVATE_LAN] }),
+      f.policy({ host: PRIVATE_LAN, port: 443, replica: REPLICA, addresses: [PRIVATE_LAN] }),
     ).resolves.toEqual({
       decision: "deny",
       reason: "internal_destination",
@@ -95,7 +100,7 @@ describe("createNetworkPolicy", () => {
     const providers: ProviderEndpoint[] = [{ provider: "ollama", host: "ollama.lan", port: 11434 }];
     const f = fixture({ providers });
     await expect(
-      f.policy({ host: "ollama.lan", port: 11434, addresses: [PRIVATE] }),
+      f.policy({ host: "ollama.lan", port: 11434, replica: REPLICA, addresses: [PRIVATE] }),
     ).resolves.toEqual({ decision: "allow", reason: "provider" });
     expect(f.ask).not.toHaveBeenCalled();
   });
@@ -104,7 +109,7 @@ describe("createNetworkPolicy", () => {
     const services: ServiceEndpoint[] = [{ service: "web_search", host: "searxng", port: 8080 }];
     const f = fixture({ services });
     await expect(
-      f.policy({ host: "searxng", port: 8080, addresses: ["172.18.0.5"] }),
+      f.policy({ host: "searxng", port: 8080, replica: REPLICA, addresses: ["172.18.0.5"] }),
     ).resolves.toEqual({ decision: "allow", reason: "service" });
     expect(f.ask).not.toHaveBeenCalled();
   });
@@ -113,7 +118,7 @@ describe("createNetworkPolicy", () => {
     const services: ServiceEndpoint[] = [{ service: "web_search", host: "searxng", port: 8080 }];
     const f = fixture({ services });
     await expect(
-      f.policy({ host: "searxng", port: 9090, addresses: ["172.18.0.5"] }),
+      f.policy({ host: "searxng", port: 9090, replica: REPLICA, addresses: ["172.18.0.5"] }),
     ).resolves.toEqual({ decision: "deny", reason: "internal_destination" });
     expect(f.ask).not.toHaveBeenCalled();
   });
@@ -124,7 +129,7 @@ describe("createNetworkPolicy", () => {
     ];
     const f = fixture({ mode: "allowlist", services });
     await expect(
-      f.policy({ host: "api.telegram.org", port: 443, addresses: [PUBLIC] }),
+      f.policy({ host: "api.telegram.org", port: 443, replica: REPLICA, addresses: [PUBLIC] }),
     ).resolves.toEqual({ decision: "allow", reason: "service" });
     expect(f.ask).not.toHaveBeenCalled();
   });
@@ -136,25 +141,25 @@ describe("createNetworkPolicy", () => {
     ];
     const f = fixture({ providers, services });
     await expect(
-      f.policy({ host: PRIVATE_LAN, port: 11434, addresses: [PRIVATE_LAN] }),
+      f.policy({ host: PRIVATE_LAN, port: 11434, replica: REPLICA, addresses: [PRIVATE_LAN] }),
     ).resolves.toEqual({ decision: "allow", reason: "provider" });
   });
 
   it("allows a public allowlisted host without asking", async () => {
     const f = fixture();
-    await expect(f.policy({ host: "github.com", port: 443, addresses: [PUBLIC] })).resolves.toEqual(
-      {
-        decision: "allow",
-        reason: "allowlist",
-      },
-    );
+    await expect(
+      f.policy({ host: "github.com", port: 443, replica: REPLICA, addresses: [PUBLIC] }),
+    ).resolves.toEqual({
+      decision: "allow",
+      reason: "allowlist",
+    });
     expect(f.ask).not.toHaveBeenCalled();
   });
 
   it("denies an allowlisted host that also resolves to a private address", async () => {
     const f = fixture();
     await expect(
-      f.policy({ host: "github.com", port: 443, addresses: [PUBLIC, PRIVATE] }),
+      f.policy({ host: "github.com", port: 443, replica: REPLICA, addresses: [PUBLIC, PRIVATE] }),
     ).resolves.toEqual({ decision: "deny", reason: "internal_destination" });
     expect(f.ask).not.toHaveBeenCalled();
   });
@@ -162,7 +167,7 @@ describe("createNetworkPolicy", () => {
   it("matches a wildcard base entry", async () => {
     const f = fixture();
     await expect(
-      f.policy({ host: "registry.npmjs.org", port: 443, addresses: [PUBLIC] }),
+      f.policy({ host: "registry.npmjs.org", port: 443, replica: REPLICA, addresses: [PUBLIC] }),
     ).resolves.toEqual({ decision: "allow", reason: "allowlist" });
     expect(f.ask).not.toHaveBeenCalled();
   });
@@ -170,14 +175,16 @@ describe("createNetworkPolicy", () => {
   it("matches an entry added with allow always", async () => {
     const f = fixture({ allow: ["example.org"] });
     await expect(
-      f.policy({ host: "example.org", port: 443, addresses: [PUBLIC] }),
+      f.policy({ host: "example.org", port: 443, replica: REPLICA, addresses: [PUBLIC] }),
     ).resolves.toEqual({ decision: "allow", reason: "allowlist" });
     expect(f.ask).not.toHaveBeenCalled();
   });
 
   it("denies a disallowed port without asking", async () => {
     const f = fixture();
-    await expect(f.policy({ host: "github.com", port: 22, addresses: [PUBLIC] })).resolves.toEqual({
+    await expect(
+      f.policy({ host: "github.com", port: 22, replica: REPLICA, addresses: [PUBLIC] }),
+    ).resolves.toEqual({
       decision: "deny",
       reason: "port_not_allowed",
     });
@@ -188,7 +195,7 @@ describe("createNetworkPolicy", () => {
     it("allows an external destination on an allowed port", async () => {
       const f = fixture({ mode: "audit" });
       await expect(
-        f.policy({ host: "unknown.dev", port: 443, addresses: [PUBLIC] }),
+        f.policy({ host: "unknown.dev", port: 443, replica: REPLICA, addresses: [PUBLIC] }),
       ).resolves.toEqual({
         decision: "allow",
         reason: "audit",
@@ -199,14 +206,14 @@ describe("createNetworkPolicy", () => {
     it("denies a disallowed port", async () => {
       const f = fixture({ mode: "audit" });
       await expect(
-        f.policy({ host: "unknown.dev", port: 8080, addresses: [PUBLIC] }),
+        f.policy({ host: "unknown.dev", port: 8080, replica: REPLICA, addresses: [PUBLIC] }),
       ).resolves.toEqual({ decision: "deny", reason: "port_not_allowed" });
     });
 
     it("denies an internal destination", async () => {
       const f = fixture({ mode: "audit" });
       await expect(
-        f.policy({ host: "unknown.dev", port: 443, addresses: [PRIVATE] }),
+        f.policy({ host: "unknown.dev", port: 443, replica: REPLICA, addresses: [PRIVATE] }),
       ).resolves.toEqual({ decision: "deny", reason: "internal_destination" });
     });
   });
@@ -215,26 +222,32 @@ describe("createNetworkPolicy", () => {
     it("denies an unlisted host with not_allowed, without asking", async () => {
       const f = fixture({ mode: "allowlist" });
       await expect(
-        f.policy({ host: "unknown.dev", port: 443, addresses: [PUBLIC] }),
+        f.policy({ host: "unknown.dev", port: 443, replica: REPLICA, addresses: [PUBLIC] }),
       ).resolves.toEqual({ decision: "deny", reason: "not_allowed" });
       expect(f.ask).not.toHaveBeenCalled();
     });
   });
 
   describe("mode ask", () => {
+    it("asks on behalf of the replica of the input", async () => {
+      const f = fixture({ answer: "deny" });
+      await f.policy({ host: "unknown.dev", port: 443, addresses: [PUBLIC], replica: "agent-2" });
+      expect(f.ask).toHaveBeenCalledWith("unknown.dev", 443, "agent-2");
+    });
+
     it("allows once when the user answers allow_once", async () => {
       const f = fixture({ answer: "allow_once" });
       await expect(
-        f.policy({ host: "unknown.dev", port: 443, addresses: [PUBLIC] }),
+        f.policy({ host: "unknown.dev", port: 443, replica: REPLICA, addresses: [PUBLIC] }),
       ).resolves.toEqual({ decision: "allow", reason: "user_once" });
-      expect(f.ask).toHaveBeenCalledWith("unknown.dev", 443);
+      expect(f.ask).toHaveBeenCalledWith("unknown.dev", 443, REPLICA);
       expect(f.addAllow).not.toHaveBeenCalled();
     });
 
     it("persists the host and allows when the user answers allow_always", async () => {
       const f = fixture({ answer: "allow_always" });
       await expect(
-        f.policy({ host: "unknown.dev", port: 443, addresses: [PUBLIC] }),
+        f.policy({ host: "unknown.dev", port: 443, replica: REPLICA, addresses: [PUBLIC] }),
       ).resolves.toEqual({ decision: "allow", reason: "user_always" });
       expect(f.addAllow).toHaveBeenCalledWith("unknown.dev");
       expect(f.onPersistError).not.toHaveBeenCalled();
@@ -245,7 +258,7 @@ describe("createNetworkPolicy", () => {
       const failure = new Error("disk full");
       f.addAllow.mockRejectedValueOnce(failure);
       await expect(
-        f.policy({ host: "unknown.dev", port: 443, addresses: [PUBLIC] }),
+        f.policy({ host: "unknown.dev", port: 443, replica: REPLICA, addresses: [PUBLIC] }),
       ).resolves.toEqual({ decision: "allow", reason: "user_always" });
       expect(f.onPersistError).toHaveBeenCalledWith(failure);
     });
@@ -253,32 +266,32 @@ describe("createNetworkPolicy", () => {
     it("denies when the user answers deny", async () => {
       const f = fixture({ answer: "deny" });
       await expect(
-        f.policy({ host: "unknown.dev", port: 443, addresses: [PUBLIC] }),
+        f.policy({ host: "unknown.dev", port: 443, replica: REPLICA, addresses: [PUBLIC] }),
       ).resolves.toEqual({ decision: "deny", reason: "user_denied" });
     });
 
     it("denies with ask_timeout when nobody answers", async () => {
       const f = fixture({ answer: "timeout" });
       await expect(
-        f.policy({ host: "unknown.dev", port: 443, addresses: [PUBLIC] }),
+        f.policy({ host: "unknown.dev", port: 443, replica: REPLICA, addresses: [PUBLIC] }),
       ).resolves.toEqual({ decision: "deny", reason: "ask_timeout" });
     });
 
     it("denies with no_session when there is no session to ask", async () => {
       const f = fixture({ answer: "no_session" });
       await expect(
-        f.policy({ host: "unknown.dev", port: 443, addresses: [PUBLIC] }),
+        f.policy({ host: "unknown.dev", port: 443, replica: REPLICA, addresses: [PUBLIC] }),
       ).resolves.toEqual({ decision: "deny", reason: "no_session" });
     });
 
     it("reads the mode on every decision", async () => {
       const f = fixture({ mode: "allowlist", answer: "allow_once" });
       await expect(
-        f.policy({ host: "unknown.dev", port: 443, addresses: [PUBLIC] }),
+        f.policy({ host: "unknown.dev", port: 443, replica: REPLICA, addresses: [PUBLIC] }),
       ).resolves.toEqual({ decision: "deny", reason: "not_allowed" });
       f.setMode("ask");
       await expect(
-        f.policy({ host: "unknown.dev", port: 443, addresses: [PUBLIC] }),
+        f.policy({ host: "unknown.dev", port: 443, replica: REPLICA, addresses: [PUBLIC] }),
       ).resolves.toEqual({ decision: "allow", reason: "user_once" });
       expect(f.ask).toHaveBeenCalledTimes(1);
     });
@@ -286,11 +299,11 @@ describe("createNetworkPolicy", () => {
     it("normalizes the host to lowercase without a trailing dot", async () => {
       const f = fixture({ answer: "allow_once" });
       await expect(
-        f.policy({ host: "Unknown.DEV.", port: 443, addresses: [PUBLIC] }),
+        f.policy({ host: "Unknown.DEV.", port: 443, replica: REPLICA, addresses: [PUBLIC] }),
       ).resolves.toEqual({ decision: "allow", reason: "user_once" });
-      expect(f.ask).toHaveBeenCalledWith("unknown.dev", 443);
+      expect(f.ask).toHaveBeenCalledWith("unknown.dev", 443, REPLICA);
       await expect(
-        f.policy({ host: "GitHub.COM.", port: 443, addresses: [PUBLIC] }),
+        f.policy({ host: "GitHub.COM.", port: 443, replica: REPLICA, addresses: [PUBLIC] }),
       ).resolves.toEqual({ decision: "allow", reason: "allowlist" });
     });
   });
@@ -300,28 +313,32 @@ describe("createAuditPolicy", () => {
   const policy = createAuditPolicy();
 
   it("denies a disallowed port first, even when the address is internal", () => {
-    expect(policy({ host: "x", port: 22, addresses: ["10.0.0.1"] })).toEqual({
+    expect(policy({ host: "x", port: 22, replica: REPLICA, addresses: ["10.0.0.1"] })).toEqual({
       decision: "deny",
       reason: "port_not_allowed",
     });
   });
 
   it("denies when there are no addresses", () => {
-    expect(policy({ host: "x", port: 443, addresses: [] })).toEqual({
+    expect(policy({ host: "x", port: 443, replica: REPLICA, addresses: [] })).toEqual({
       decision: "deny",
       reason: "dns_error",
     });
   });
 
   it("denies when any resolved address is internal", () => {
-    expect(policy({ host: "x", port: 443, addresses: ["140.82.112.3", "10.0.0.1"] })).toEqual({
+    expect(
+      policy({ host: "x", port: 443, replica: REPLICA, addresses: ["140.82.112.3", "10.0.0.1"] }),
+    ).toEqual({
       decision: "deny",
       reason: "internal_destination",
     });
   });
 
   it("allows external destinations on an allowed port as audit", () => {
-    expect(policy({ host: "github.com", port: 443, addresses: ["140.82.112.3"] })).toEqual({
+    expect(
+      policy({ host: "github.com", port: 443, replica: REPLICA, addresses: ["140.82.112.3"] }),
+    ).toEqual({
       decision: "allow",
       reason: "audit",
     });
@@ -329,10 +346,12 @@ describe("createAuditPolicy", () => {
 
   it("uses the allowedPorts option instead of the defaults", () => {
     const custom = createAuditPolicy({ allowedPorts: [8443] });
-    expect(custom({ host: "x", port: 443, addresses: ["140.82.112.3"] }).reason).toBe(
-      "port_not_allowed",
-    );
-    expect(custom({ host: "x", port: 8443, addresses: ["140.82.112.3"] })).toEqual({
+    expect(
+      custom({ host: "x", port: 443, replica: REPLICA, addresses: ["140.82.112.3"] }).reason,
+    ).toBe("port_not_allowed");
+    expect(
+      custom({ host: "x", port: 8443, replica: REPLICA, addresses: ["140.82.112.3"] }),
+    ).toEqual({
       decision: "allow",
       reason: "audit",
     });

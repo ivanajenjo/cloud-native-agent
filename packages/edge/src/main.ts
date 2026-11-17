@@ -25,7 +25,7 @@ try {
 // never inherited by anything that might run later.
 delete process.env.AGENT_API_TOKEN;
 
-const { apiPort, proxyPort, gatewayUrl } = config;
+const { apiPort, proxyPort, replicas } = config;
 
 let runtime: EdgeRuntime;
 try {
@@ -42,7 +42,8 @@ const apiServer = serve(
     hostname: "0.0.0.0",
   },
   () => {
-    console.log(`edge api listening on 0.0.0.0:${apiPort} -> ${gatewayUrl}`);
+    const names = replicas.map((replica) => replica.name).join(", ");
+    console.log(`edge api listening on 0.0.0.0:${apiPort} -> replicas: ${names}`);
   },
 );
 

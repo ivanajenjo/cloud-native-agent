@@ -1,6 +1,7 @@
 import type { NetworkLogEntry, Question } from "@cna/shared";
 import { describe, expect, it } from "vitest";
-import { createGatewayClient } from "../src/gateway-client.js";
+import { createGatewayClient, createReplicaGateways } from "../src/gateway-client.js";
+import type { ReplicaTarget } from "../src/replicas.js";
 
 const GATEWAY = "http://gw:8090";
 
@@ -155,5 +156,79 @@ describe("publishNetworkEntry", () => {
       }) as typeof globalThis.fetch,
     });
     await expect(client.publishNetworkEntry(entry)).resolves.toBeUndefined();
+  });
+});
+
+describe("createReplicaGateways", () => {
+  const replicas: ReplicaTarget[] = [
+    { name: "agent-1", gatewayUrl: "http://agent-1:8090" },
+    { name: "agent-2", gatewayUrl: "http://agent-2:8090" },
+  ];
+
+  it("sends each publishQuestion to the gateway of its replica", async () => {
+    const gw = fakeFetch(() => new Response(null, { status: 201 }));
+    const gateways = createReplicaGateways({ replicas, fetch: gw.fetch });
+
+    await expect(gateways.publishQuestion("agent-1", question)).resolves.toBe(true);
+    await expect(gateways.publishQuestion("agent-2", question)).resolves.toBe(true);
+
+    expect(gw.calls.map((call) => call.url)).toEqual([
+      "http://agent-1:8090/internal/questions",
+      "http://agent-2:8090/internal/questions",
+    ]);
+  });
+
+  it("sends resolveQuestion and publishNetworkEntry to the gateway of their replica", async () => {
+    const gw = fakeFetch(() => new Response(null, { status: 204 }));
+    const gateways = createReplicaGateways({ replicas, fetch: gw.fetch });
+
+    await gateways.resolveQuestion("agent-2", "net-1", "timeout");
+    await gateways.publishNetworkEntry("agent-1", entry);
+
+    expect(gw.calls.map((call) => call.url)).toEqual([
+      "http://agent-2:8090/internal/questions/net-1/resolved",
+      "http://agent-1:8090/internal/network",
+    ]);
+  });
+
+  it("publishQuestion for an unknown replica is false and sends nothing", async () => {
+    const gw = fakeFetch(() => new Response(null, { status: 201 }));
+    const gateways = createReplicaGateways({ replicas, fetch: gw.fetch });
+
+    await expect(gateways.publishQuestion("agent-9", question)).resolves.toBe(false);
+    expect(gw.calls).toHaveLength(0);
+  });
+
+  it("resolveQuestion and publishNetworkEntry for an unknown replica are no-ops that never reject", async () => {
+    const gw = fakeFetch(() => new Response(null, { status: 204 }));
+    const gateways = createReplicaGateways({ replicas, fetch: gw.fetch });
+
+    await expect(gateways.resolveQuestion("agent-9", "net-1", "answered")).resolves.toBeUndefined();
+    await expect(gateways.publishNetworkEntry("agent-9", entry)).resolves.toBeUndefined();
+    expect(gw.calls).toHaveLength(0);
+  });
+
+  it("treats __proto__ as an unknown replica", async () => {
+    const gw = fakeFetch(() => new Response(null, { status: 201 }));
+    const gateways = createReplicaGateways({ replicas, fetch: gw.fetch });
+
+    await expect(gateways.publishQuestion("__proto__", question)).resolves.toBe(false);
+    await expect(
+      gateways.resolveQuestion("__proto__", "net-1", "answered"),
+    ).resolves.toBeUndefined();
+    await expect(gateways.publishNetworkEntry("__proto__", entry)).resolves.toBeUndefined();
+    expect(gw.calls).toHaveLength(0);
+  });
+
+  it("returns false, without throwing, when the replica's gateway fails", async () => {
+    const gateways = createReplicaGateways({
+      replicas,
+      fetch: (async () => {
+        throw new TypeError("fetch failed");
+      }) as typeof globalThis.fetch,
+    });
+
+    await expect(gateways.publishQuestion("agent-1", question)).resolves.toBe(false);
+    await expect(gateways.publishNetworkEntry("agent-1", entry)).resolves.toBeUndefined();
   });
 });

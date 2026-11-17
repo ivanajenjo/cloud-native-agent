@@ -27,6 +27,8 @@ export interface EgressProxyOptions {
   connect?: (target: { host: string; port: number }) => Socket;
   /** Upstream connect timeout in ms. Default 10_000. */
   connectTimeoutMs?: number;
+  /** Replica name for the remote address of a client connection, or null when it is not a replica (ADR-0012). */
+  identify: (remoteAddress: string) => Promise<string | null>;
 }
 
 interface ProxyContext {
@@ -35,6 +37,7 @@ interface ProxyContext {
   readonly resolver: Resolver;
   readonly connect: (target: ProxyTarget) => Socket;
   readonly connectTimeoutMs: number;
+  readonly identify: (remoteAddress: string) => Promise<string | null>;
 }
 
 /** Mutable record of one proxied connection or request. Written to the log once, when it ends. */
@@ -49,6 +52,8 @@ interface Exchange {
   bytesOut: number;
   bytesIn: number;
   error?: string;
+  /** Replica that opened the connection (ADR-0012). Undefined for an unknown client. */
+  replica?: string;
 }
 
 const CONNECT_REASONS = { 400: "Bad Request", 403: "Forbidden", 502: "Bad Gateway" } as const;
@@ -87,6 +92,7 @@ export function createEgressProxy(options: EgressProxyOptions): Server {
     resolver: options.resolver ?? systemResolver,
     connect: options.connect ?? ((target) => netConnect({ host: target.host, port: target.port })),
     connectTimeoutMs: options.connectTimeoutMs ?? 10_000,
+    identify: options.identify,
   };
   const server = createServer();
 
@@ -171,6 +177,7 @@ function writeEntry(log: NetworkLog, exchange: Exchange): void {
     durationMs: Date.now() - exchange.startedAt,
   };
   if (exchange.error !== undefined) entry.error = exchange.error;
+  if (exchange.replica !== undefined) entry.replica = exchange.replica;
   // The log handles its own write errors; this only keeps a rejection from becoming unhandled.
   log.append(entry).catch(() => {
     console.error("network log: append failed");
@@ -184,14 +191,44 @@ function errorLabel(error: unknown): string {
   return typeof code === "string" ? code : error.message;
 }
 
-/** Resolves the host and applies the policy, recording the decision in `exchange`. Returns the resolved addresses. */
+/**
+ * Replica that opened the connection from `remoteAddress`, or null if it is not a replica or
+ * identify fails. Never rejects: a failure is an unknown client (fail closed).
+ */
+async function identifyClient(
+  context: ProxyContext,
+  remoteAddress: string | undefined,
+): Promise<string | null> {
+  try {
+    return await context.identify(remoteAddress ?? "");
+  } catch {
+    return null;
+  }
+}
+
+/** Records a connection from an unknown client: denied, and the policy is never asked. */
+function denyUnknownClient(exchange: Exchange, target: ProxyTarget): void {
+  exchange.host = target.host;
+  exchange.port = target.port;
+  exchange.decision = "deny";
+  exchange.reason = "unknown_client";
+}
+
+/** Resolves the host and applies the policy for `replica`, recording the decision in `exchange`. Returns the resolved addresses. */
 async function decide(
   context: ProxyContext,
   exchange: Exchange,
   target: ProxyTarget,
+  replica: string,
 ): Promise<string[]> {
   const addresses = await context.resolver(target.host).catch(() => []);
-  const result = await context.policy({ host: target.host, port: target.port, addresses });
+  exchange.replica = replica;
+  const result = await context.policy({
+    host: target.host,
+    port: target.port,
+    addresses,
+    replica,
+  });
   exchange.host = target.host;
   exchange.port = target.port;
   exchange.decision = result.decision;
@@ -241,7 +278,13 @@ async function handleConnect(
     rejectConnect(client, 400);
     return;
   }
-  const addresses = await decide(context, exchange, target);
+  const replica = await identifyClient(context, client.remoteAddress);
+  if (replica === null) {
+    denyUnknownClient(exchange, target);
+    rejectConnect(client, 403);
+    return;
+  }
+  const addresses = await decide(context, exchange, target, replica);
   if (clientClosed) return;
   if (exchange.decision === "deny") {
     rejectConnect(client, 403);
@@ -318,7 +361,13 @@ async function handleHttp(
     sendText(res, 400);
     return;
   }
-  const addresses = await decide(context, exchange, target);
+  const replica = await identifyClient(context, req.socket.remoteAddress);
+  if (replica === null) {
+    denyUnknownClient(exchange, target);
+    sendText(res, 403);
+    return;
+  }
+  const addresses = await decide(context, exchange, target, replica);
   if (clientGone) return;
   if (exchange.decision === "deny") {
     sendText(res, 403);

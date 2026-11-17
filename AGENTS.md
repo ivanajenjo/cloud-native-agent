@@ -2,7 +2,7 @@
 
 Agente de programación "Claude Code lite" auto-hospedado, basado en Pi
 (`@earendil-works/pi-coding-agent`), que corre en Docker (Raspberry Pi 4 arm64, MacBook)
-y más adelante en k8s local. Uso personal, solo GitHub.
+(varias réplicas detrás de un único `edge`; k8s local queda en el backlog). Uso personal, solo GitHub.
 
 ## Desarrollo con agentes (Claude Code)
 El desarrollo se hace con dos agentes definidos en `.claude/agents/`:

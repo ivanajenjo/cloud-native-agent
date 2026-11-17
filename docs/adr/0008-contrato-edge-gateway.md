@@ -36,3 +36,7 @@ puede depender de lo que diga el contenedor del agente.
   (cuya respuesta no abre nada, porque `edge` no las conoce) u oculta las de verdad (que
   acaban denegadas por timeout). Falla cerrado.
 - (−) Si el gateway no responde, `edge` trata la pregunta como "sin sesión" y deniega.
+
+## Actualización (ADR-0012)
+`edge` usa este contrato con el gateway de la réplica que abrió cada conexión. El cuerpo de
+`POST /internal/network` admite el campo opcional `replica`.

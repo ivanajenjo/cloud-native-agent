@@ -68,6 +68,17 @@ export {
   type QuestionOutcome,
 } from "./questions.js";
 export {
+  isReplicaName,
+  MAX_REPLICAS,
+  parseReplicaNames,
+  REPLICA_NAME_PATTERN,
+  REPLICA_PATH_PREFIX,
+  REPLICAS_PATH,
+  type ReplicaSummary,
+  type ReplicasResponse,
+  replicaBasePath,
+} from "./replicas.js";
+export {
   NOTIFICATION_EVENTS,
   type NotificationEvent,
   type NotificationsConfig,

@@ -5,7 +5,12 @@ import { type AddressInfo, connect, createServer, Socket } from "node:net";
 import type { NetworkLogEntry } from "@cna/shared";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { NetworkLog } from "../src/egress/log.js";
-import { createAuditPolicy, type Policy } from "../src/egress/policy.js";
+import {
+  createAuditPolicy,
+  type Policy,
+  type PolicyInput,
+  type PolicyResult,
+} from "../src/egress/policy.js";
 import { createEgressProxy } from "../src/egress/proxy.js";
 
 type AnyServer = Server | HttpServer;
@@ -92,6 +97,9 @@ const RESOLVED: Record<string, string[]> = {
 const resolver = async (host: string): Promise<string[]> => RESOLVED[host] ?? [];
 
 const allowAll: Policy = () => ({ decision: "allow", reason: "audit" });
+const REPLICA = "agent-1";
+/** Every client is the replica REPLICA unless a test says otherwise. */
+const identifyAsReplica = async (): Promise<string | null> => REPLICA;
 
 interface Harness {
   port: number;
@@ -111,7 +119,14 @@ async function startProxy(
     close: async () => undefined,
   };
   const server = track(
-    createEgressProxy({ policy: allowAll, log, resolver, connectTimeoutMs: 2000, ...options }),
+    createEgressProxy({
+      policy: allowAll,
+      log,
+      resolver,
+      connectTimeoutMs: 2000,
+      identify: identifyAsReplica,
+      ...options,
+    }),
   );
   const port = await listen(server);
   return { port, entries, server };
@@ -486,5 +501,152 @@ describe("egress proxy: HTTP absolute form", () => {
 
     expect(connectSpy).not.toHaveBeenCalled();
     expect(proxy.entries[0]).toMatchObject({ decision: "deny", reason: "internal_destination" });
+  });
+});
+
+describe("egress proxy: client identification (ADR-0012)", () => {
+  const LOCAL_ADDRESSES = ["127.0.0.1", "::ffff:127.0.0.1"];
+
+  it("denies a CONNECT from an unknown client with 403 and unknown_client, without resolving or asking the policy", async () => {
+    const resolve = vi.fn(resolver);
+    const policy = vi.fn(allowAll);
+    const connectSpy = vi.fn((target: { host: string; port: number }) => connect(target));
+    const proxy = await startProxy({
+      identify: async () => null,
+      resolver: resolve,
+      policy,
+      connect: connectSpy,
+    });
+
+    const tunnel = await openTunnel(proxy.port, "example.test:443");
+    expect(tunnel.status).toBe(403);
+    await waitUntil(() => proxy.entries.length === 1);
+
+    expect(proxy.entries[0]).toMatchObject({
+      method: "CONNECT",
+      host: "example.test",
+      port: 443,
+      decision: "deny",
+      reason: "unknown_client",
+    });
+    expect(proxy.entries[0]).not.toHaveProperty("replica");
+    expect(resolve).not.toHaveBeenCalled();
+    expect(policy).not.toHaveBeenCalled();
+    expect(connectSpy).not.toHaveBeenCalled();
+  });
+
+  it("denies an absolute-form HTTP request from an unknown client with 403 and unknown_client", async () => {
+    const resolve = vi.fn(resolver);
+    const policy = vi.fn(allowAll);
+    const proxy = await startProxy({
+      identify: async () => null,
+      resolver: resolve,
+      policy,
+    });
+
+    const res = await rawRequest(proxy.port, "GET", "http://example.test:80/");
+    expect(res.status).toBe(403);
+    expect(res.body).toBe("forbidden by egress policy");
+    await waitUntil(() => proxy.entries.length === 1);
+
+    expect(proxy.entries[0]).toMatchObject({
+      method: "HTTP",
+      host: "example.test",
+      port: 80,
+      decision: "deny",
+      reason: "unknown_client",
+    });
+    expect(proxy.entries[0]).not.toHaveProperty("replica");
+    expect(resolve).not.toHaveBeenCalled();
+    expect(policy).not.toHaveBeenCalled();
+  });
+
+  it("treats an identify that rejects as an unknown client", async () => {
+    const policy = vi.fn(allowAll);
+    const proxy = await startProxy({
+      identify: () => Promise.reject(new Error("lookup failed")),
+      policy,
+    });
+
+    const tunnel = await openTunnel(proxy.port, "example.test:443");
+    expect(tunnel.status).toBe(403);
+    await waitUntil(() => proxy.entries.length === 1);
+
+    expect(proxy.entries[0]).toMatchObject({ decision: "deny", reason: "unknown_client" });
+    expect(proxy.entries[0]).not.toHaveProperty("replica");
+    expect(policy).not.toHaveBeenCalled();
+  });
+
+  it("passes the real remote address of the socket to identify", async () => {
+    const echo = await startEcho();
+    const identify = vi.fn(async (_remoteAddress: string) => REPLICA);
+    const proxy = await startProxy({ identify });
+
+    const tunnel = await openTunnel(proxy.port, `example.test:${echo.port}`);
+    expect(tunnel.status).toBe(200);
+    tunnel.socket.end();
+    await waitUntil(() => proxy.entries.length === 1);
+
+    expect(identify).toHaveBeenCalledTimes(1);
+    expect(LOCAL_ADDRESSES).toContain(identify.mock.calls[0]?.[0]);
+  });
+
+  it("passes the replica to the policy and records it in the log for an identified CONNECT", async () => {
+    const echo = await startEcho();
+    const policy = vi.fn(allowAll);
+    const proxy = await startProxy({ policy });
+
+    const tunnel = await openTunnel(proxy.port, `example.test:${echo.port}`);
+    expect(tunnel.status).toBe(200);
+    tunnel.socket.end();
+    await waitUntil(() => proxy.entries.length === 1);
+
+    expect(policy.mock.calls[0]?.[0]).toMatchObject({ replica: REPLICA });
+    expect(proxy.entries[0]).toMatchObject({ decision: "allow", replica: REPLICA });
+  });
+
+  it("passes the replica to the policy and records it for an identified HTTP request", async () => {
+    const policy = vi.fn(
+      (_input: PolicyInput): PolicyResult => ({ decision: "deny", reason: "user_denied" }),
+    );
+    const identify = vi.fn(async (_remoteAddress: string) => REPLICA);
+    const proxy = await startProxy({ policy, identify });
+
+    const res = await rawRequest(proxy.port, "GET", "http://example.test:80/");
+    expect(res.status).toBe(403);
+    await waitUntil(() => proxy.entries.length === 1);
+
+    expect(LOCAL_ADDRESSES).toContain(identify.mock.calls[0]?.[0]);
+    expect(policy.mock.calls[0]?.[0]).toMatchObject({ replica: REPLICA });
+    expect(proxy.entries[0]).toMatchObject({
+      method: "HTTP",
+      decision: "deny",
+      reason: "user_denied",
+      replica: REPLICA,
+    });
+  });
+
+  it("answers 400 invalid_target without calling identify when the destination is invalid", async () => {
+    const identify = vi.fn(async (_remoteAddress: string) => REPLICA);
+    const proxy = await startProxy({ identify });
+
+    const tunnel = await openTunnel(proxy.port, "nonsense");
+    expect(tunnel.status).toBe(400);
+    await waitUntil(() => proxy.entries.length === 1);
+
+    expect(identify).not.toHaveBeenCalled();
+    expect(proxy.entries[0]).toMatchObject({ decision: "deny", reason: "invalid_target" });
+    expect(proxy.entries[0]).not.toHaveProperty("replica");
+  });
+
+  it("answers 400 invalid_target without calling identify for an origin-form request", async () => {
+    const identify = vi.fn(async (_remoteAddress: string) => REPLICA);
+    const proxy = await startProxy({ identify });
+
+    const res = await rawRequest(proxy.port, "GET", "/");
+    expect(res.status).toBe(400);
+    await waitUntil(() => proxy.entries.length === 1);
+
+    expect(identify).not.toHaveBeenCalled();
   });
 });

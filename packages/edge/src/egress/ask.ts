@@ -5,13 +5,13 @@ import {
   type Question,
   type QuestionOutcome,
 } from "@cna/shared";
-import type { GatewayClient } from "../gateway-client.js";
+import type { ReplicaGateways } from "../gateway-client.js";
 
 /** Final result of asking about host:port. */
 export type AskResult = NetworkAnswerOption | "timeout" | "no_session";
 
 export interface AskCoordinatorOptions {
-  gateway: Pick<GatewayClient, "publishQuestion" | "resolveQuestion">;
+  gateway: Pick<ReplicaGateways, "publishQuestion" | "resolveQuestion">;
   /** Default 120000. Also sent as question.timeoutMs. */
   timeoutMs?: number;
   /** Default () => `net-${randomUUID()}`. */
@@ -27,6 +27,8 @@ const MAX_REMEMBERED_RESOLVED_IDS = 1000;
 
 interface PendingQuestion {
   id: string;
+  /** Replica that opened the connection; the question and its outcome go to its gateway only. */
+  replica: string;
   destination: string;
   settled: boolean;
   timer: ReturnType<typeof setTimeout>;
@@ -34,8 +36,9 @@ interface PendingQuestion {
   resolve: (result: AskResult) => void;
 }
 
-function destinationKey(host: string, port: number): string {
-  return `${host}:${port}`;
+/** Replica names have no spaces, so the space separates them unambiguously from host:port. */
+function destinationKey(replica: string, host: string, port: number): string {
+  return `${replica} ${host}:${port}`;
 }
 
 function isAnswerOption(value: string): value is NetworkAnswerOption {
@@ -49,7 +52,7 @@ function isAnswerOption(value: string): value is NetworkAnswerOption {
  * an active session, the result is a denial.
  */
 export class AskCoordinator {
-  private readonly gateway: Pick<GatewayClient, "publishQuestion" | "resolveQuestion">;
+  private readonly gateway: Pick<ReplicaGateways, "publishQuestion" | "resolveQuestion">;
   private readonly timeoutMs: number;
   private readonly newId: () => string;
   private readonly now: () => Date;
@@ -68,15 +71,15 @@ export class AskCoordinator {
   }
 
   /**
-   * Asks the user about host:port. Concurrent calls for the same host:port (while one is pending) share the SAME
-   * question and promise. Builds the Question { id, kind:"network", method:"select",
+   * Asks the user about host:port on behalf of `replica`. Concurrent calls for the same replica and host:port
+   * (while one is pending) share the SAME question and promise; another replica gets its own question. Builds the Question { id, kind:"network", method:"select",
    * title: `Allow network access to ${host}:${port}?`, options: [...NETWORK_ANSWER_OPTIONS], timeoutMs,
    * createdAt: now().toISOString(), network: { host, port } }.
    * If publishQuestion returns false → resolves "no_session" (no timer left running, nothing pending).
    * If nobody answers within timeoutMs → resolves "timeout" and calls resolveQuestion(id, "timeout").
    */
-  async ask(host: string, port: number): Promise<AskResult> {
-    const destination = destinationKey(host, port);
+  async ask(host: string, port: number, replica: string): Promise<AskResult> {
+    const destination = destinationKey(replica, host, port);
     const existing = this.pendingByDestination.get(destination);
     if (existing) {
       return existing.promise;
@@ -84,7 +87,7 @@ export class AskCoordinator {
 
     // Register before publishing, so an answer that arrives while the gateway is still
     // answering the publish request is accepted.
-    const pending = this.register(this.newId(), destination);
+    const pending = this.register(this.newId(), replica, destination);
     const question: Question = {
       id: pending.id,
       kind: "network",
@@ -98,7 +101,7 @@ export class AskCoordinator {
 
     let published: boolean;
     try {
-      published = await this.gateway.publishQuestion(question);
+      published = await this.gateway.publishQuestion(replica, question);
     } catch {
       published = false;
     }
@@ -139,7 +142,7 @@ export class AskCoordinator {
     return [...this.pendingById.keys()];
   }
 
-  private register(id: string, destination: string): PendingQuestion {
+  private register(id: string, replica: string, destination: string): PendingQuestion {
     let resolve!: (result: AskResult) => void;
     const promise = new Promise<AskResult>((done) => {
       resolve = done;
@@ -149,6 +152,7 @@ export class AskCoordinator {
 
     const pending: PendingQuestion = {
       id,
+      replica,
       destination,
       settled: false,
       timer,
@@ -176,7 +180,7 @@ export class AskCoordinator {
     }
     if (outcome !== undefined) {
       this.rememberResolved(pending.id);
-      void this.gateway.resolveQuestion(pending.id, outcome);
+      void this.gateway.resolveQuestion(pending.replica, pending.id, outcome);
     }
     pending.resolve(result);
   }

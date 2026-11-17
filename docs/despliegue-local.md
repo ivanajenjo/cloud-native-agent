@@ -1,6 +1,7 @@
 # Despliegue local con Docker Compose
 
-Cómo levantar una réplica (`agent` + `edge`) en una máquina con Docker (MacBook,
+Cómo levantar una o varias réplicas (`agent-1`, `agent-2`… detrás de un único `edge`, ADR-0012)
+en una máquina con Docker (MacBook,
 PC con Windows o Raspberry Pi 4) y cómo comprobar que la salida a internet pasa solo por `edge`.
 
 ## Requisitos
@@ -35,23 +36,41 @@ curl -s localhost:8080/health                                   # {"status":"ok"
 curl -s -o /dev/null -w '%{http_code}\n' localhost:8080/session  # 401 sin token
 ```
 
+### Varias réplicas
+
+`agent-1` arranca siempre. `agent-2` y `agent-3` arrancan con el profile `replicas`, y `edge`
+tiene que conocerlas por `CNA_REPLICAS`:
+
+```sh
+# deploy/compose/.env
+CNA_REPLICAS=agent-1,agent-2,agent-3
+docker compose -f deploy/compose/docker-compose.yml --env-file deploy/compose/.env --profile replicas up --build -d
+curl -s -H "Authorization: Bearer $AGENT_API_TOKEN" localhost:8080/replicas
+```
+
+Cada réplica tiene su volumen (`agent-N-data`) y su red interna (`internal-N`), en la que solo
+está `edge`. La política de red, *permitir siempre* y el registro son únicos para todas. Las
+rutas sin prefijo van a la primera réplica (la web UI habla con ella); el CLI elige otra con
+`--replica` o `CNA_REPLICA`. Para una cuarta réplica, copia el bloque de `agent-3` en el compose
+con su red y su volumen, añade la red a `edge` y el nombre a `CNA_REPLICAS`.
+
 ### Variables
 
 | Dónde | Variable | Por defecto | Para qué |
 |---|---|---|---|
 | `edge` | `AGENT_API_TOKEN` | — (obligatoria) | Bearer de la API. Solo existe en `edge`. |
-| `edge` | `GATEWAY_URL` | `http://agent:8090` | Gateway al que se reenvía la API. |
+| `edge` | `EDGE_REPLICAS` (compose: `CNA_REPLICAS`) | `agent-1` | Réplicas, separadas por comas (máx. 16). Cada una es un hostname con su gateway en `:8090`; la primera es la réplica por defecto. `GATEWAY_URL` ya no se admite. |
 | `edge` | `EDGE_DATA_DIR` | `/edge-data` | Volumen de `edge`: `network.jsonl` y `policy.json` (modo y *permitir siempre*). |
 | `edge` | `EDGE_PROVIDERS_FILE` | `/config/providers.yaml` | Proveedores cuyos `baseUrl` se permiten aunque sean internos. |
 | `edge` | `EDGE_ASK_TIMEOUT_MS` | `120000` | Tiempo para responder una pregunta de red antes de denegarla. |
 | `edge` | `EDGE_API_PORT` / `EDGE_PROXY_PORT` | `8080` / `3128` | Entrada de la API y proxy de salida. |
 | compose | `CNA_PUBLISH_ADDR` | `127.0.0.1` | Dirección del host donde se publica el `8080`. |
-| `agent` | `GATEWAY_PORT` | `8090` | Puerto del gateway en la red interna. |
-| `agent` | `CNA_DATA_DIR` | `/data` | Volumen del agente: `workspace/repo`, `sessions/`, `config/pi` (generado), `cache/`. |
-| `agent` | `CNA_PROVIDERS_FILE` | `/config/providers.yaml` | Se traduce a `models.json` de Pi al arrancar. |
-| `agent` | `CNA_EXTENSIONS_DIR` | `/app/packages/extensions` | Extensiones de Pi y prompt de sistema (de root, solo lectura para `agent`). |
-| `agent` | `GITHUB_TOKEN`, `ANTHROPIC_API_KEY`, `OPENAI_API_KEY` | vacías | Credenciales (riesgo aceptado en ADR-0006). |
-| `agent` | `CNA_GIT_USER_NAME`, `CNA_GIT_USER_EMAIL` | vacías | Identidad de los commits del agente. |
+| `agent-N` | `GATEWAY_PORT` | `8090` | Puerto del gateway en la red interna. |
+| `agent-N` | `CNA_DATA_DIR` | `/data` | Volumen del agente: `workspace/repo`, `sessions/`, `config/pi` (generado), `cache/`. |
+| `agent-N` | `CNA_PROVIDERS_FILE` | `/config/providers.yaml` | Se traduce a `models.json` de Pi al arrancar. |
+| `agent-N` | `CNA_EXTENSIONS_DIR` | `/app/packages/extensions` | Extensiones de Pi y prompt de sistema (de root, solo lectura para `agent`). |
+| `agent-N` | `GITHUB_TOKEN`, `ANTHROPIC_API_KEY`, `OPENAI_API_KEY` | vacías | Credenciales (riesgo aceptado en ADR-0006). |
+| `agent-N` | `CNA_GIT_USER_NAME`, `CNA_GIT_USER_EMAIL` | vacías | Identidad de los commits del agente. |
 
 ## Verificar la salida por el proxy (cierre de la fase 0)
 
@@ -61,7 +80,7 @@ Con la réplica levantada:
 scripts/verify-egress.sh
 ```
 
-El script ejecuta dentro de `agent`:
+El script ejecuta dentro de `agent-1`:
 - una conexión directa a `github.com` que **debe fallar** (el agente no tiene ruta de salida);
 - git, gh (si hay `GITHUB_TOKEN`), Pi, `fetch` de Node, npm, pnpm, pip, uv, Maven, Gradle
   (Maven Central y Gradle Plugin Portal), Go, `mise ls-remote` y los hosts de descarga de

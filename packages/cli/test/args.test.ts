@@ -427,10 +427,73 @@ describe("USAGE", () => {
     ["--stat"],
     ["--force"],
     ["--url"],
+    ["--replica"],
     ["--no-color"],
     ["CNA_URL"],
+    ["CNA_REPLICA"],
     ["CNA_TOKEN"],
   ])("mentions %s", (text) => {
     expect(USAGE).toContain(text);
+  });
+
+  it("lists the replicas command", () => {
+    expect(USAGE).toContain("cna replicas");
+  });
+});
+
+describe("parseCliArgs: replicas", () => {
+  it("maps replicas to its own command without arguments", () => {
+    expect(commandOf(["replicas"])).toEqual({ name: "replicas" });
+  });
+
+  it("rejects positionals after replicas", () => {
+    expect(usageMessage(["replicas", "extra"])).toContain("replicas");
+  });
+
+  it("accepts --replica with any command", () => {
+    expect(parse(["status", "--replica", "agent-2"]).options.replica).toBe("agent-2");
+    expect(commandOf(["status", "--replica", "agent-2"])).toEqual({ name: "status" });
+  });
+});
+
+describe("parseCliArgs: --replica and CNA_REPLICA", () => {
+  it("takes the replica from --replica", () => {
+    expect(parse(["status", "--replica", "agent-2"]).options.replica).toBe("agent-2");
+  });
+
+  it("takes the replica from CNA_REPLICA without the flag", () => {
+    expect(parse(["status"], { CNA_REPLICA: "agent-3" }).options.replica).toBe("agent-3");
+  });
+
+  it("prefers --replica over CNA_REPLICA", () => {
+    const options = parse(["status", "--replica", "agent-2"], { CNA_REPLICA: "agent-3" }).options;
+    expect(options.replica).toBe("agent-2");
+  });
+
+  it("treats an empty CNA_REPLICA as unset", () => {
+    expect(parse(["status"], { CNA_REPLICA: "" }).options.replica).toBeUndefined();
+  });
+
+  it("has no replica by default", () => {
+    expect(parse(["status"]).options.replica).toBeUndefined();
+  });
+
+  it.each([["Agent-2"], ["../x"], [""]])(
+    "rejects the invalid name %j without echoing it",
+    (name) => {
+      const message = usageMessage(["status", "--replica", name]);
+      expect(message).toBe("el nombre de la réplica no es válido (p. ej. agent-2)");
+      if (name !== "") expect(message).not.toContain(name);
+    },
+  );
+
+  it("rejects an invalid CNA_REPLICA without echoing it", () => {
+    const message = usageMessage(["status"], { CNA_REPLICA: "Agent-9" });
+    expect(message).toBe("el nombre de la réplica no es válido (p. ej. agent-2)");
+    expect(message).not.toContain("Agent-9");
+  });
+
+  it("requires a value for --replica", () => {
+    expect(usageMessage(["status", "--replica"])).toContain("--replica");
   });
 });

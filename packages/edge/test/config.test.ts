@@ -12,7 +12,7 @@ describe("loadConfig defaults", () => {
   it("uses the default values when only the token is set", () => {
     expect(loadConfig(env())).toEqual({
       token: TOKEN,
-      gatewayUrl: "http://agent:8090",
+      replicas: [{ name: "agent-1", gatewayUrl: "http://agent-1:8090" }],
       dataDir: "/edge-data",
       apiPort: 8080,
       proxyPort: 3128,
@@ -29,7 +29,7 @@ describe("loadConfig overrides", () => {
     expect(
       loadConfig(
         env({
-          GATEWAY_URL: "http://gw:9000",
+          EDGE_REPLICAS: "agent-1,agent-2",
           EDGE_DATA_DIR: "/srv/edge",
           EDGE_API_PORT: "18080",
           EDGE_PROXY_PORT: "13128",
@@ -41,7 +41,10 @@ describe("loadConfig overrides", () => {
       ),
     ).toEqual({
       token: TOKEN,
-      gatewayUrl: "http://gw:9000",
+      replicas: [
+        { name: "agent-1", gatewayUrl: "http://agent-1:8090" },
+        { name: "agent-2", gatewayUrl: "http://agent-2:8090" },
+      ],
       dataDir: "/srv/edge",
       apiPort: 18080,
       proxyPort: 13128,
@@ -51,9 +54,47 @@ describe("loadConfig overrides", () => {
       askTimeoutMs: 5000,
     });
   });
+});
 
-  it("removes the trailing slash from GATEWAY_URL", () => {
-    expect(loadConfig(env({ GATEWAY_URL: "http://gw:9000/" })).gatewayUrl).toBe("http://gw:9000");
+describe("EDGE_REPLICAS", () => {
+  it("keeps the order of the names and builds their gateway URLs", () => {
+    expect(loadConfig(env({ EDGE_REPLICAS: "agent-2,agent-1" })).replicas).toEqual([
+      { name: "agent-2", gatewayUrl: "http://agent-2:8090" },
+      { name: "agent-1", gatewayUrl: "http://agent-1:8090" },
+    ]);
+  });
+
+  it("throws for an invalid name, with a message that starts with EDGE_REPLICAS:", () => {
+    let message = "";
+    try {
+      loadConfig(env({ EDGE_REPLICAS: "agent-1,Agent_2" }));
+    } catch (error) {
+      message = error instanceof Error ? error.message : String(error);
+    }
+    expect(message.startsWith("EDGE_REPLICAS:")).toBe(true);
+  });
+
+  it("throws for an empty value", () => {
+    expect(() => loadConfig(env({ EDGE_REPLICAS: "" }))).toThrow("EDGE_REPLICAS:");
+  });
+});
+
+describe("GATEWAY_URL is removed", () => {
+  it.each(["http://gw:9000", ""])("throws when GATEWAY_URL is set to %j", (gatewayUrl) => {
+    expect(() => loadConfig(env({ GATEWAY_URL: gatewayUrl }))).toThrow(
+      "GATEWAY_URL is no longer supported: use EDGE_REPLICAS (ADR-0012)",
+    );
+  });
+
+  it("does not echo the value of GATEWAY_URL in the message", () => {
+    let message = "";
+    try {
+      loadConfig(env({ GATEWAY_URL: "http://user:s3cret@gw:9000" }));
+    } catch (error) {
+      message = error instanceof Error ? error.message : String(error);
+    }
+    expect(message).not.toBe("");
+    expect(message).not.toContain("s3cret");
   });
 });
 
@@ -87,29 +128,6 @@ describe("AGENT_API_TOKEN", () => {
 
   it("does not trim a token with surrounding whitespace", () => {
     expect(() => loadConfig(env({ AGENT_API_TOKEN: ` ${TOKEN}` }))).toThrow(Error);
-  });
-});
-
-describe("GATEWAY_URL validation", () => {
-  it.each([
-    "https://gw:9000",
-    "http://u:p@gw:9000",
-    "http://gw:9000/api",
-    "http://gw:9000/?a=1",
-    "not a url",
-  ])("throws for %s", (gatewayUrl) => {
-    expect(() => loadConfig(env({ GATEWAY_URL: gatewayUrl }))).toThrow(Error);
-  });
-
-  it("does not echo credentials from GATEWAY_URL in the message", () => {
-    let message = "";
-    try {
-      loadConfig(env({ GATEWAY_URL: "http://user:s3cret@gw:9000" }));
-    } catch (error) {
-      message = error instanceof Error ? error.message : String(error);
-    }
-    expect(message).not.toBe("");
-    expect(message).not.toContain("s3cret");
   });
 });
 

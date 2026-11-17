@@ -21,7 +21,7 @@ checks=0
 failures=0
 
 in_agent() {
-  docker compose -f "$COMPOSE_FILE_PATH" exec -T agent bash -c "$1"
+  docker compose -f "$COMPOSE_FILE_PATH" exec -T agent-1 bash -c "$1"
 }
 
 in_edge() {
@@ -49,7 +49,7 @@ check() {
 
 # 0. Services must be running.
 running="$(docker compose -f "$COMPOSE_FILE_PATH" ps --status running --services 2>/dev/null)"
-for svc in agent edge; do
+for svc in agent-1 edge; do
   if ! printf '%s\n' "$running" | grep -qx "$svc"; then
     echo "Service '$svc' is not running. Start the stack with:" >&2
     echo "  docker compose -f $COMPOSE_FILE_PATH up -d" >&2

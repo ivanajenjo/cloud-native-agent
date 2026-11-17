@@ -19,6 +19,7 @@ export type NetworkDecision = "allow" | "deny";
  * - `port_not_allowed`: the port is not in the allowed set (80 and 443 by default).
  * - `invalid_target`: the request target could not be parsed.
  * - `dns_error`: the host could not be resolved.
+ * - `unknown_client`: the connection does not come from any configured replica (ADR-0012).
  */
 export const NETWORK_DECISION_REASONS = [
   "audit",
@@ -35,6 +36,7 @@ export const NETWORK_DECISION_REASONS = [
   "port_not_allowed",
   "invalid_target",
   "dns_error",
+  "unknown_client",
 ] as const;
 export type NetworkDecisionReason = (typeof NETWORK_DECISION_REASONS)[number];
 
@@ -61,4 +63,6 @@ export interface NetworkLogEntry {
   durationMs: number;
   /** Upstream connection error message, if any. Never contains credentials. */
   error?: string;
+  /** Replica that opened the connection (ADR-0012). Absent when it is `unknown_client`. */
+  replica?: string;
 }
