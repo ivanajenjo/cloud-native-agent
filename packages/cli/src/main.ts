@@ -57,7 +57,9 @@ async function attachChat(ctx: CommandContext): Promise<number> {
       client: ctx.client,
       output: ctx.output,
       color: ctx.color,
-      input: rl,
+      // Created now: readline only buffers lines emitted after its iterator exists, and runChat
+      // starts reading after it has loaded the pending questions.
+      input: rl[Symbol.asyncIterator](),
       signal: abort.signal,
       lastEventId: 0,
     });

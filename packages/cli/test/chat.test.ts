@@ -156,9 +156,12 @@ afterEach(() => {
 });
 
 /** Starts a chat. `eventsStatus` must be set here: the fake fetch runs synchronously at start. */
-function start(options: { eventsStatus?: number } = {}) {
+function start(
+  options: { eventsStatus?: number; respond?: (request: Recorded) => Response | undefined } = {},
+) {
   const edge = new FakeEdge();
   edge.eventsStatus = options.eventsStatus ?? 200;
+  if (options.respond) edge.respond = options.respond;
   const input = lineQueue();
   const stdout: string[] = [];
   const stderr: string[] = [];
@@ -355,6 +358,23 @@ describe("runChat: preguntas", () => {
         },
       ]),
     );
+  });
+
+  it("answers a question already pending at start before the replay arrives", async () => {
+    const chat = start({
+      respond: (request) =>
+        request.method === "GET" && request.path === "/session"
+          ? json({ ...SESSION, status: "waiting_input", pendingQuestions: [SELECT_QUESTION] })
+          : undefined,
+    });
+    chat.input.push("3");
+    await vi.waitFor(() =>
+      expect(chat.edge.requestsTo("POST", "/session/answers/q1")).toEqual([
+        expect.objectContaining({ body: { value: "gamma" } }),
+      ]),
+    );
+    expect(chat.edge.requestsTo("POST", "/session/messages")).toEqual([]);
+    expect(chat.stdout()).toContain("  3) gamma\n");
   });
 
   it("reports an invalid answer and sends nothing", async () => {

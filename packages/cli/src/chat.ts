@@ -74,6 +74,26 @@ class ChatRun {
     }
   }
 
+  /**
+   * Loads the questions already pending (GET /session) before any input is read, so a line typed
+   * before the event replay arrives still answers them. Errors are ignored: `follow` reports them.
+   */
+  async seedPending(): Promise<void> {
+    let session: Awaited<ReturnType<ApiClient["getSession"]>>;
+    try {
+      session = await this.client.getSession();
+    } catch {
+      return;
+    }
+    if (session === null || this.chatSignal.aborted) return;
+    for (const question of session.pendingQuestions) {
+      if (!this.pending.some((pending) => pending.id === question.id)) {
+        this.pending.push(question);
+      }
+    }
+    this.activateNext();
+  }
+
   /** Reads the input line by line, in order. Never rejects. */
   async readInput(input: AsyncIterable<string>): Promise<void> {
     try {
@@ -286,7 +306,7 @@ export async function runChat(options: ChatOptions): Promise<number> {
     output.out(GREETING);
     const run = new ChatRun(client, output, color, chatSignal, finish);
     void run.follow(lastEventId, retryDelayMs);
-    void run.readInput(input);
+    void run.seedPending().then(() => run.readInput(input));
     return await done;
   } finally {
     controller.abort();
