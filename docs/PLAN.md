@@ -14,10 +14,10 @@ ejecutar tests y subir los cambios. Se controla por API REST, una web UI sencill
 | Git | Solo GitHub |
 | Stacks | Java, Node, Python, Go |
 | Interacción | Conversación multi-turno, web UI sencilla + CLI básico |
-| Despliegue | Local: Docker en Raspberry Pi 4 (8 GB, arm64), MacBook y PC con Windows (Docker Desktop; en Windows con WSL2), y k8s local (k3s/kind) |
+| Despliegue | Local: Docker en Raspberry Pi 4 (8 GB, arm64), MacBook y PC con Windows (Docker Desktop; en Windows con WSL2). k8s local (k3s/kind) queda en el backlog (ADR-0012) |
 | Lenguaje | TypeScript |
 | Uso | Personal, mono-usuario |
-| Concurrencia | **1 sesión por réplica**; más sesiones = más réplicas |
+| Concurrencia | **1 sesión por réplica**; más sesiones = más réplicas detrás de un único `edge` (ADR-0012) |
 | Servicios | El agente ejecuta tests, pero **no** levanta servicios (sin Docker-in-Docker) |
 | Push / PR | El agente **pregunta** antes de hacer push/PR, salvo `autoPush: true` |
 | Alcance funcional | Un "Claude Code lite": ver [Funcionalidades tipo Claude Code](#funcionalidades-tipo-claude-code) |
@@ -57,7 +57,8 @@ ejecutar tests y subir los cambios. Se controla por API REST, una web UI sencill
   `@earendil-works/pi-coding-agent`, versión exacta `1.5.2`. Se amplía con extensiones.
 - **Pi en modo RPC como subproceso** del gateway (ADR-0002). Aísla fallos del agente y el
   protocolo RPC ya traduce los diálogos de extensiones a `extension_ui_request`.
-- **Una sesión por réplica** (ADR-0003). Escalar = más réplicas.
+- **Una sesión por réplica** (ADR-0003). Escalar = más réplicas (`agent-1`, `agent-2`…), cada
+  una en su propia red interna y todas detrás de un único `edge` (ADR-0012).
 - **Imagen única multi-arch** (`linux/amd64`, `linux/arm64`) con toolchains vía `mise`.
   Si el repo trae `.tool-versions`/`mise.toml`, se respetan.
 - **GitHub con PAT fine-grained** limitado a los repos propios + `gh` CLI.
@@ -78,6 +79,9 @@ ejecutar tests y subir los cambios. Se controla por API REST, una web UI sencill
 - **Persistencia y reanudación** (ADR-0011). Pi arranca con `--session-id` igual al id de la
   sesión; el gateway guarda su estado en `/data/state`, reanuda tras un reinicio, suspende Pi por
   inactividad y lleva un historial de sesiones. Solo se trabaja sobre PRs propios (`agent/*`).
+- **Varias réplicas con un `edge` compartido** (ADR-0012). `edge` identifica la réplica de cada
+  conexión de salida por su IP de origen y le pregunta a ella; la API de una réplica se alcanza
+  con el prefijo `/replicas/<nombre>` y las rutas sin prefijo van a la primera.
 - **Web UI y CLI** (ADR-0010). Cliente común en `@cna/shared/client`; web estática sin
   framework (build con Vite) servida por el gateway en `/ui/` con CSP estricta; el contenido
   del agente se pinta siempre como texto. El CLI lee el token solo de `CNA_TOKEN`.
@@ -118,6 +122,13 @@ DELETE /session                         cierra y limpia el workspace. 409 si hay
                                         sin subir, salvo ?force=true
 ```
 
+Réplicas (ADR-0012; las atiende `edge`):
+```
+GET    /replicas                        cada réplica de EDGE_REPLICAS: {name, reachable, session}
+*      /replicas/<nombre>/<ruta>        la API de esa réplica (/<ruta>); 404 replica_not_found
+```
+Sin prefijo, la API es la de la réplica por defecto (la primera de `EDGE_REPLICAS`).
+
 Endpoints de red (los atiende `edge`, no el gateway):
 ```
 GET    /network/log?limit=N             últimas conexiones desde que arrancó edge (host, puerto,
@@ -127,8 +138,8 @@ PUT    /network/policy                  {mode?, allow?}: cambiar el modo o reemp
                                         allowlist del usuario
 ```
 
-Como hay una sesión por réplica, la API usa `/session` en singular. Un hub futuro
-expondría `/sessions/:id` y redirigiría a la réplica correspondiente.
+Como hay una sesión por réplica, la API usa `/session` en singular; para hablar con otra réplica
+se antepone `/replicas/<nombre>` (ADR-0012).
 
 **Estados:** `idle → cloning → running ⇄ waiting_input → ready → closed` (+ `error`).
 - `running → ready` ocurre con el evento `agent_settled` de Pi, no con `agent_end` (tras
@@ -262,9 +273,12 @@ ver a dónde se conecta, no resistir a un atacante decidido.
 
 Detalle en ADR-0004.
 
-- **Topología (compose):** red `internal` (`internal: true`, sin salida) con `agent` y
-  `edge`; red `external` solo con `edge`, que publica el `8080` en
-  `${CNA_PUBLISH_ADDR:-127.0.0.1}` (`0.0.0.0` para la LAN). El `3128` no se publica.
+- **Topología (compose):** una red `internal-N` (`internal: true`, sin salida) por réplica, con
+  `agent-N` y `edge`; red `external` solo con `edge`, que publica el `8080` en
+  `${CNA_PUBLISH_ADDR:-127.0.0.1}` (`0.0.0.0` para la LAN). El `3128` no se publica. Un agente no
+  alcanza a los demás (ADR-0012).
+- **Origen:** `edge` identifica qué réplica abre cada conexión por su IP de origen. Lo que no viene
+  de una réplica de `EDGE_REPLICAS` se deniega (`unknown_client`).
 - **Anti DNS rebinding:** `edge` resuelve el nombre, aplica la política a **todas** las
   direcciones (si alguna es interna, deniega) y conecta a una de esas direcciones, sin
   volver a resolver.
@@ -290,12 +304,13 @@ Detalle en ADR-0004.
   el buscador de `web_search` y el servicio de notificaciones. La lista exacta se cierra
   en la fase 0 ejecutando cada stack en modo `audit`.
 - **Flujo `ask`:** `edge` retiene la conexión, crea una pregunta `network` y la envía al
-  gateway para que salga por SSE. La respuesta la recoge `edge` al pasar por la API.
+  gateway de la réplica que abrió la conexión para que salga por SSE. La respuesta la recoge
+  `edge` al pasar por la API.
   *Permitir siempre* se persiste en el volumen de `edge`. Sin respuesta en el timeout
-  (2 min por defecto) o sin sesión activa → **denegar**. Peticiones concurrentes al mismo
-  host y puerto comparten la misma pregunta.
-- **Registro:** cada conexión (timestamp, host, puerto, decisión, bytes, duración) va a
-  `network.jsonl` en el volumen de `edge` y se emite como evento SSE `network`.
+  (2 min por defecto) o sin sesión activa → **denegar**. Peticiones concurrentes de una réplica
+  al mismo host y puerto comparten la misma pregunta.
+- **Registro:** cada conexión (timestamp, réplica, host, puerto, decisión, bytes, duración) va a
+  `network.jsonl` en el volumen de `edge` y se emite como evento SSE `network` en su réplica.
 - **Limitación aceptada:** la resolución DNS la hace Docker; la exfiltración por DNS es
   posible en teoría.
 - **Futuro:** inyección de credenciales en `edge` para que el agente no las vea.
@@ -336,8 +351,8 @@ docker/
   Dockerfile        imagen del agente (gateway + Pi + toolchains)
   Dockerfile.edge   imagen ligera de edge
 deploy/
-  compose/        docker-compose.yml (1..N réplicas; SearXNG opcional con un profile)
-  k8s/            manifiestos / kustomize para k3s/kind
+  compose/        docker-compose.yml (agent-1; agent-2 y agent-3 con el profile replicas;
+                  SearXNG opcional con un profile)
 config/
   providers.example.yaml, notifications.example.yaml, web.example.yaml
 docs/
@@ -410,13 +425,22 @@ compose) y el trabajo sobre PR contra GitHub real (probado con un `gh` falso).
 - Timeouts de inactividad, límites de recursos, limpieza de workspace.
 - Trabajar sobre un PR existente (7), tokens y coste por sesión (9), historial de sesiones (10).
 
-### Fase 5 — Kubernetes y múltiples réplicas
-- Manifiestos para k3s/kind (StatefulSet con PVC por réplica, Secret, Service).
-- `edge` como Deployment aparte + NetworkPolicy que solo permite salida del agente hacia
-  `edge` (como sidecar no sirve: compartiría la red del pod y se podría esquivar).
-- Hub opcional: registro de réplicas, asignación de sesiones a réplicas libres, UI con todas las sesiones.
+### Fase 5 — Varias réplicas en Docker
+Replanteada en ADR-0012: solo Docker; Kubernetes pasa al backlog.
+- `edge` compartido por varias réplicas (`EDGE_REPLICAS`): identifica la réplica de cada conexión
+  de salida por su IP de origen, le manda a ella la pregunta y el evento `network`, y deniega lo
+  que no venga de una réplica (`unknown_client`).
+- Entrada: `GET /replicas` y `/replicas/<nombre>/…`; sin prefijo, la réplica por defecto.
+- Compose con una red interna por réplica (`agent-1`; `agent-2` y `agent-3` con el profile
+  `replicas`).
+- CLI: `--replica`/`CNA_REPLICA` y `cna replicas`.
+- Pendiente para más adelante: selector de réplica en la web UI.
 
 ## Backlog
+- Kubernetes (k3s/kind): manifiestos con PVC por réplica, Secret y Service, y `edge` aparte con
+  una NetworkPolicy que solo deje salir al agente hacia `edge` (ADR-0012).
+- Selector de réplica en la web UI, asignación automática de una réplica libre y vista de todas
+  las sesiones (el antiguo "hub").
 - Procesos en segundo plano con `bash_bg` (8).
 - Comandos y skills en UI/CLI (11).
 - Imágenes en el prompt (12).

@@ -31,3 +31,7 @@ como máximo.
 
 ## Actualización (ADR-0006)
 `edge` valida el Bearer y decide las preguntas de red; el resto sigue en el gateway.
+
+## Actualización (ADR-0012)
+Kubernetes queda en el backlog. Varias réplicas en Docker comparten un único `edge`: una réplica
+vuelve a ser un contenedor (`agent-N`, con su volumen y su red interna).

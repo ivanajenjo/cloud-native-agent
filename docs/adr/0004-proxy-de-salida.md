@@ -47,3 +47,8 @@ eventos SSE, y un proxy `CONNECT` propio es pequeño y queda en el mismo stack.
   no en `/data` (el agente podría editarlos).
 - El proxy atiende también peticiones HTTP sin `CONNECT`, aplica la política por host y
   puerto, y deniega los destinos internos salvo los hosts de `providers.yaml`.
+
+## Actualización (ADR-0012)
+Con varias réplicas hay una red interna por réplica y `edge` está en todas. `edge` identifica la
+réplica de cada conexión por su IP de origen y deniega lo que no venga de una (`unknown_client`).
+Kubernetes queda en el backlog.
