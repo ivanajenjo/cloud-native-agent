@@ -11,7 +11,8 @@ Uso personal, mono-usuario.
 > reinicio del contenedor, Pi se para tras un rato sin uso, hay historial de sesiones con
 > reanudación, tokens y coste por sesión, trabajo sobre un PR existente del agente y límites de
 > recursos. Con la fase 5 hay varias réplicas en Docker detrás de un único `edge` (ADR-0012);
-> Kubernetes queda en el backlog. Quedan pendientes las comprobaciones que necesitan Docker con
+> Kubernetes queda en el backlog. La fase 6 lleva las réplicas a los clientes: selector y vista de
+> réplicas en la web y `cna run --any-replica` (ADR-0013). Quedan pendientes las comprobaciones que necesitan Docker con
 > red normal (tareas 1 y 2 de la fase 1.5).
 > Ver [`docs/PLAN.md`](docs/PLAN.md#fases).
 

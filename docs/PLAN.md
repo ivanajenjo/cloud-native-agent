@@ -440,7 +440,8 @@ imágenes construidas (compose con el profile `replicas`); está probada con pro
 - Pendiente para más adelante: selector de réplica en la web UI (pasa a la fase 6).
 
 ### Fase 6 — Réplicas en los clientes
-ADR-0013. Sin cambios en `edge` ni en el gateway.
+Hecha (ADR-0013). Sin cambios en `edge` ni en el gateway. La web se ha probado con el build de
+Vite servido por un backend falso con cuatro réplicas, no con las imágenes construidas.
 - `@cna/shared`: `isReplicaFree`, `freeReplicaNames` y `createSessionOnFreeReplica` (la asignación
   de una réplica libre la hace el cliente: `GET /replicas` y `POST /replicas/<nombre>/session`,
   pasando a la siguiente si hay `409 session_exists`; sin ninguna libre, `no_free_replica`).
