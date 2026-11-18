@@ -10,7 +10,7 @@ import type {
   NetworkPolicyResponse,
   UpdateNetworkPolicyRequest,
 } from "../network-api.js";
-import type { ReplicaSummary, ReplicasResponse } from "../replicas.js";
+import { freeReplicaNames, type ReplicaSummary, type ReplicasResponse } from "../replicas.js";
 import type {
   AnswerRequest,
   ApiErrorCode,
@@ -43,12 +43,18 @@ export interface ApiClientOptions {
   fetch?: typeof globalThis.fetch;
 }
 
+/**
+ * Codes that only the client produces: "network_error" (status 0), "unknown" (non-JSON error body)
+ * and "no_free_replica" (409 from createSessionOnFreeReplica; the server never sends it, ADR-0013).
+ */
+export type ClientErrorCode = "network_error" | "unknown" | "no_free_replica";
+
 /** Non-2xx answer, or a network failure (status 0, code "network_error"). */
 export class ApiClientError extends Error {
   readonly status: number;
-  readonly code: ApiErrorCode | "network_error" | "unknown";
+  readonly code: ApiErrorCode | ClientErrorCode;
 
-  constructor(status: number, code: ApiErrorCode | "network_error" | "unknown", message: string) {
+  constructor(status: number, code: ApiErrorCode | ClientErrorCode, message: string) {
     super(message);
     this.name = "ApiClientError";
     this.status = status;
@@ -474,4 +480,43 @@ export async function* followEvents(
     await sleep(retryDelayMs, signal);
     reconnected = true;
   }
+}
+
+/** Result of {@link createSessionOnFreeReplica}. */
+export interface FreeReplicaSession {
+  /** Name of the replica that took the session. */
+  replica: string;
+  session: SessionInfo;
+}
+
+/**
+ * Creates a session on the first free replica (ADR-0013). `edge` is a client without a replica
+ * prefix (it calls GET /replicas); `clientFor(name)` returns a client for that replica (baseUrl
+ * ending in replicaBasePath(name)). Tries the free replicas in edge's order with POST /session:
+ * an ApiClientError 409 with code "session_exists" (taken meanwhile) moves on to the next one;
+ * any other error is rethrown at once. When no replica is free, or all of them were taken,
+ * throws ApiClientError(409, "no_free_replica", "No hay ninguna réplica libre").
+ */
+export async function createSessionOnFreeReplica(
+  edge: ApiClient,
+  clientFor: (name: string) => ApiClient,
+  body: CreateSessionRequest,
+): Promise<FreeReplicaSession> {
+  const replicas = await edge.replicas();
+  for (const name of freeReplicaNames(replicas)) {
+    try {
+      const session = await clientFor(name).createSession(body);
+      return { replica: name, session };
+    } catch (error) {
+      if (
+        error instanceof ApiClientError &&
+        error.status === 409 &&
+        error.code === "session_exists"
+      ) {
+        continue;
+      }
+      throw error;
+    }
+  }
+  throw new ApiClientError(409, "no_free_replica", "No hay ninguna réplica libre");
 }

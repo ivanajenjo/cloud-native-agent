@@ -6,12 +6,14 @@ import type {
   SessionInfo,
   SessionStats,
 } from "@cna/shared";
+import { replicaBasePath } from "@cna/shared";
 import { ApiClient, ApiClientError } from "@cna/shared/client";
 import { describe, expect, it } from "vitest";
 import type { Command } from "../src/args.js";
 import {
   type CommandContext,
   createSession,
+  createSessionOnAnyReplica,
   describeError,
   formatDiff,
   formatHistory,
@@ -47,13 +49,11 @@ interface Harness {
   err: string[];
 }
 
-/** A context whose client never touches the network: every request goes to `handler`. */
-function harness(
-  handler: (request: RecordedRequest) => Response | Promise<Response> = () =>
-    new Response(null, { status: 204 }),
-  color = false,
-): Harness {
-  const requests: RecordedRequest[] = [];
+/** A fetch that records every request in `requests` and answers with `handler`. */
+function recordingFetch(
+  requests: RecordedRequest[],
+  handler: (request: RecordedRequest) => Response | Promise<Response>,
+): typeof globalThis.fetch {
   const fetch = async (input: string | URL | Request, init?: RequestInit): Promise<Response> => {
     const headers = new Headers(init?.headers);
     const request: RecordedRequest = {
@@ -65,10 +65,20 @@ function harness(
     requests.push(request);
     return handler(request);
   };
+  return fetch as typeof globalThis.fetch;
+}
+
+/** A context whose client never touches the network: every request goes to `handler`. */
+function harness(
+  handler: (request: RecordedRequest) => Response | Promise<Response> = () =>
+    new Response(null, { status: 204 }),
+  color = false,
+): Harness {
+  const requests: RecordedRequest[] = [];
   const client = new ApiClient({
     baseUrl: "http://edge.test",
     token: TOKEN,
-    fetch: fetch as typeof globalThis.fetch,
+    fetch: recordingFetch(requests, handler),
   });
   const out: string[] = [];
   const err: string[] = [];
@@ -147,6 +157,7 @@ function runCommand(overrides: Partial<Extract<Command, { name: "run" }>> = {}) 
     plan: false,
     autoPush: false,
     detach: false,
+    anyReplica: false,
     ...overrides,
   };
 }
@@ -542,6 +553,94 @@ describe("createSession", () => {
     expect(err).toEqual([
       "cna: Ya hay una sesión en esta réplica (mira cna status o ciérrala con cna close)\n",
     ]);
+  });
+});
+
+/**
+ * Like `harness`, but for `run --any-replica`: `ctx.client` is edge (no prefix) and `clientFor`
+ * builds the clients of `/replicas/<name>`, all of them on the same recording fetch.
+ */
+function anyReplicaHarness(handler: (request: RecordedRequest) => Response | Promise<Response>) {
+  const requests: RecordedRequest[] = [];
+  const fetch = recordingFetch(requests, handler);
+  const clientAt = (baseUrl: string) => new ApiClient({ baseUrl, token: TOKEN, fetch });
+  const out: string[] = [];
+  const err: string[] = [];
+  const ctx: CommandContext = {
+    client: clientAt("http://edge.test"),
+    output: { out: (text) => out.push(text), err: (text) => err.push(text) },
+    color: false,
+  };
+  const clientFor = (name: string) => clientAt(`http://edge.test${replicaBasePath(name)}`);
+  return { ctx, clientFor, requests, out, err };
+}
+
+describe("createSessionOnAnyReplica", () => {
+  it("creates the session on the first free replica and reports it", async () => {
+    const { ctx, clientFor, requests, out, err } = anyReplicaHarness((request) => {
+      if (request.method === "GET" && request.url === "http://edge.test/replicas") {
+        return json({
+          replicas: [
+            replicaSummary({ session: sessionInfo({ status: "running" }) }),
+            replicaSummary({ name: "agent-2" }),
+          ],
+        });
+      }
+      if (request.url === "http://edge.test/replicas/agent-2/session") {
+        return json(sessionInfo({ status: "idle" }), 201);
+      }
+      return json({ error: "session_exists" }, 409);
+    });
+
+    const result = await createSessionOnAnyReplica(
+      ctx,
+      runCommand({ anyReplica: true }),
+      clientFor,
+    );
+
+    expect(result?.replica).toBe("agent-2");
+    expect(result?.session.status).toBe("idle");
+    expect(requests.map((request) => `${request.method} ${request.url}`)).toEqual([
+      "GET http://edge.test/replicas",
+      "POST http://edge.test/replicas/agent-2/session",
+    ]);
+    expect(out.join("")).toBe(
+      "Réplica: agent-2\n" +
+        "Sesión creada: owner/x (estado: idle)\n" +
+        "Para volver a ella: --replica agent-2 o CNA_REPLICA=agent-2\n",
+    );
+    expect(err).toEqual([]);
+  });
+
+  it("writes no_free_replica and returns null when every replica is busy", async () => {
+    const { ctx, clientFor, requests, out, err } = anyReplicaHarness(() =>
+      json({
+        replicas: [
+          replicaSummary({ session: sessionInfo({ status: "running" }) }),
+          replicaSummary({ name: "agent-2", session: sessionInfo({ status: "ready" }) }),
+        ],
+      }),
+    );
+
+    expect(await createSessionOnAnyReplica(ctx, runCommand({ anyReplica: true }), clientFor)).toBe(
+      null,
+    );
+    expect(requests).toHaveLength(1);
+    expect(out).toEqual([]);
+    expect(err).toEqual(["cna: No hay ninguna réplica libre (mira cna replicas)\n"]);
+  });
+
+  it("sends the same body as createSession", async () => {
+    const { ctx, clientFor, requests } = anyReplicaHarness((request) => {
+      if (request.method === "GET")
+        return json({ replicas: [replicaSummary({ name: "agent-1" })] });
+      return json(sessionInfo({ status: "running" }), 201);
+    });
+
+    await createSessionOnAnyReplica(ctx, runCommand({ anyReplica: true }), clientFor);
+
+    const post = requests.find((request) => request.method === "POST");
+    expect(post?.body).toBe('{"repo":"owner/x","prompt":"hola","mode":"auto"}');
   });
 });
 

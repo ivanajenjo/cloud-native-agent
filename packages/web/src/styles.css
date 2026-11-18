@@ -66,6 +66,14 @@ code {
   box-sizing: border-box;
 }
 
+/* The panels under the new session form line up with it (see .new-session). */
+.app-new > .replicas-panel,
+.app-new > .history-panel {
+  max-width: 40rem;
+  margin: 1.5rem auto;
+  padding: 0 1rem;
+}
+
 .app-main {
   flex: 1 1 auto;
   min-height: 0;

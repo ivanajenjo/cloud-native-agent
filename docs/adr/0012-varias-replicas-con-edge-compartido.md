@@ -45,7 +45,7 @@ qué réplica habla.
      funcionando con ella.
 7. **Clientes:** el CLI elige réplica con `--replica <nombre>` o `CNA_REPLICA` y lista las réplicas
    con `cna replicas`. La web UI sigue hablando con la réplica por defecto; un selector de
-   réplica en la web queda pendiente.
+   réplica en la web queda pendiente (hecho después en ADR-0013).
 8. **Compose:** `agent-1` siempre; `agent-2` y `agent-3` con el profile `replicas`. `CNA_REPLICAS`
    en `.env` dice a `edge` cuáles hay (por defecto `agent-1`). Una réplica de `EDGE_REPLICAS` que no
    está levantada sale en `GET /replicas` como `reachable: false`. Más réplicas = copiar el bloque

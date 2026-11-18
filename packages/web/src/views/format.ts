@@ -67,3 +67,15 @@ export function formatTime(iso: string): string {
   const pad = (n: number) => String(n).padStart(2, "0");
   return `${pad(date.getHours())}:${pad(date.getMinutes())}:${pad(date.getSeconds())}`;
 }
+
+/** Document title: "cna", "cna · <status>", "cna · <replica>" or "cna · <replica> · <status>". */
+export function pageTitle(replica: string | null, status: SessionStatus | null): string {
+  const parts = ["cna"];
+  if (replica !== null) {
+    parts.push(replica);
+  }
+  if (status !== null) {
+    parts.push(statusLabel(status));
+  }
+  return parts.join(" · ");
+}

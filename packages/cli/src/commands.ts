@@ -8,7 +8,12 @@ import type {
   TodoItem,
   TodoStatus,
 } from "@cna/shared";
-import { type ApiClient, ApiClientError } from "@cna/shared/client";
+import {
+  type ApiClient,
+  ApiClientError,
+  createSessionOnFreeReplica,
+  type FreeReplicaSession,
+} from "@cna/shared/client";
 import type { Command } from "./args.js";
 import { sanitize, style } from "./style.js";
 
@@ -67,6 +72,8 @@ function describeRaw(error: unknown): string {
         return NOT_IN_HISTORY_MESSAGE;
       case "replica_not_found":
         return "No existe esa réplica (mira cna replicas)";
+      case "no_free_replica":
+        return "No hay ninguna réplica libre (mira cna replicas)";
       default:
         return `${error.message} (${error.code})`;
     }
@@ -374,14 +381,8 @@ export async function runClose(
   }
 }
 
-/**
- * POST /session from a `run` command; writes "Sesión creada: …" and returns the info, or writes the
- * error and returns null.
- */
-export async function createSession(
-  ctx: CommandContext,
-  command: Extract<Command, { name: "run" }>,
-): Promise<SessionInfo | null> {
+/** Body of POST /session for a `run` command. */
+function runRequestBody(command: Extract<Command, { name: "run" }>): CreateSessionRequest {
   const body: CreateSessionRequest = { repo: command.repo };
   if (command.prompt !== undefined) body.prompt = command.prompt;
   if (command.pr !== undefined) body.pr = command.pr;
@@ -390,16 +391,55 @@ export async function createSession(
   if (command.model !== undefined) body.model = command.model;
   if (command.thinking !== undefined) body.thinking = command.thinking;
   if (command.autoPush) body.autoPush = true;
+  return body;
+}
 
+/** "Sesión creada: …" for a session that was just created. */
+function reportCreated(ctx: CommandContext, info: SessionInfo): void {
+  const target = info.pr === null ? sanitize(info.repo) : `${sanitize(info.repo)} PR #${info.pr}`;
+  let text = `Sesión creada: ${target} (estado: ${sanitize(info.status)})\n`;
+  if (info.mode === "plan") {
+    text += "Modo plan: el agente propondrá un plan antes de editar.\n";
+  }
+  ctx.output.out(text);
+}
+
+/**
+ * POST /session from a `run` command; writes "Sesión creada: …" and returns the info, or writes the
+ * error and returns null.
+ */
+export async function createSession(
+  ctx: CommandContext,
+  command: Extract<Command, { name: "run" }>,
+): Promise<SessionInfo | null> {
   try {
-    const info = await ctx.client.createSession(body);
-    const target = info.pr === null ? sanitize(info.repo) : `${sanitize(info.repo)} PR #${info.pr}`;
-    let text = `Sesión creada: ${target} (estado: ${sanitize(info.status)})\n`;
-    if (info.mode === "plan") {
-      text += "Modo plan: el agente propondrá un plan antes de editar.\n";
-    }
-    ctx.output.out(text);
+    const info = await ctx.client.createSession(runRequestBody(command));
+    reportCreated(ctx, info);
     return info;
+  } catch (error) {
+    fail(ctx, error);
+    return null;
+  }
+}
+
+/**
+ * `cna run --any-replica`: POST /session on the first free replica (ADR-0013). `ctx.client` is the
+ * client without replica prefix (edge). Writes "Réplica: <name>\n" before the usual "Sesión creada…"
+ * text, then "Para volver a ella: --replica <name> o CNA_REPLICA=<name>\n". Returns the result, or
+ * writes the error and returns null.
+ */
+export async function createSessionOnAnyReplica(
+  ctx: CommandContext,
+  command: Extract<Command, { name: "run" }>,
+  clientFor: (name: string) => ApiClient,
+): Promise<FreeReplicaSession | null> {
+  try {
+    const result = await createSessionOnFreeReplica(ctx.client, clientFor, runRequestBody(command));
+    const replica = sanitize(result.replica);
+    ctx.output.out(`Réplica: ${replica}\n`);
+    reportCreated(ctx, result.session);
+    ctx.output.out(`Para volver a ella: --replica ${replica} o CNA_REPLICA=${replica}\n`);
+    return result;
   } catch (error) {
     fail(ctx, error);
     return null;

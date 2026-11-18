@@ -10,8 +10,14 @@ export interface HeaderActions {
   logout(): void;
 }
 
-/** Header with the title, the session summary and the session actions. */
-export function createHeader(actions: HeaderActions): Component<SessionInfo | null> {
+/**
+ * Header with the title, the session summary and the session actions. `extra` (e.g. the replica
+ * selector) goes in the top row, between the title and the actions; it is always the same node.
+ */
+export function createHeader(
+  actions: HeaderActions,
+  extra?: HTMLElement,
+): Component<SessionInfo | null> {
   const root = h("header", { class: "header" });
 
   function build(session: SessionInfo | null): HTMLElement[] {
@@ -25,7 +31,13 @@ export function createHeader(actions: HeaderActions): Component<SessionInfo | nu
 
     if (session === null) {
       return [
-        h("div", { class: "header-top" }, title, h("div", { class: "header-actions" }, logout)),
+        h(
+          "div",
+          { class: "header-top" },
+          title,
+          extra,
+          h("div", { class: "header-actions" }, logout),
+        ),
       ];
     }
 
@@ -83,6 +95,7 @@ export function createHeader(actions: HeaderActions): Component<SessionInfo | nu
         "div",
         { class: "header-top" },
         title,
+        extra,
         h("div", { class: "header-actions" }, abort, close, logout),
       ),
       details,

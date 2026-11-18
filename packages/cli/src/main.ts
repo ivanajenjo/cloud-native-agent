@@ -8,6 +8,7 @@ import { runChat } from "./chat.js";
 import {
   type CommandContext,
   createSession,
+  createSessionOnAnyReplica,
   describeError,
   type Output,
   resumeSession,
@@ -112,6 +113,21 @@ async function main(): Promise<number> {
 
   switch (command.name) {
     case "run": {
+      if (command.anyReplica) {
+        // ADR-0013: edge lists the replicas; the session goes to the first free one, and the chat
+        // is attached to that replica. CNA_REPLICA is ignored here.
+        const edge = new ApiClient({ baseUrl: options.url, token });
+        const clientFor = (name: string) =>
+          new ApiClient({ baseUrl: `${options.url}${replicaBasePath(name)}`, token });
+        const result = await createSessionOnAnyReplica(
+          { ...ctx, client: edge },
+          command,
+          clientFor,
+        );
+        if (result === null) return 1;
+        if (command.detach) return 0;
+        return attachChat({ ...ctx, client: clientFor(result.replica) });
+      }
       const info = await createSession(ctx, command);
       if (info === null) return 1;
       if (command.detach) return 0;
