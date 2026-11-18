@@ -2,18 +2,21 @@ import "./styles.css";
 import type { SessionInfo } from "@cna/shared";
 import { ApiClient, ApiClientError, followEvents } from "@cna/shared/client";
 import { h, text } from "./dom.js";
+import { replicaBaseUrl, replicaFromHash, replicaHash } from "./replica.js";
 import { initialViewState, reduceView, type ViewAction, type ViewState } from "./state.js";
 import { Store } from "./store.js";
 import { browserStores, clearToken, loadToken, saveToken } from "./token.js";
 import { createComposer, type SendMode } from "./views/composer.js";
 import { createDiffPanel } from "./views/diff.js";
-import { statusLabel } from "./views/format.js";
+import { pageTitle } from "./views/format.js";
 import { createHeader } from "./views/header.js";
 import { createHistoryPanel } from "./views/history.js";
 import { createLoginView } from "./views/login.js";
 import { createNetworkPanel } from "./views/network.js";
 import { createNewSessionView } from "./views/new-session.js";
 import { createQuestionsPanel } from "./views/questions.js";
+import { createReplicaSelect } from "./views/replica-select.js";
+import { createReplicasPanel } from "./views/replicas.js";
 import { createTodosPanel } from "./views/todos.js";
 import { createTranscript } from "./views/transcript.js";
 import { createUsagePanel } from "./views/usage.js";
@@ -23,13 +26,14 @@ const TOAST_MS = 8000;
 const CLOSE_QUESTION = "¿Cerrar la sesión? Se borrará el workspace.";
 const FORCE_CLOSE_QUESTION = "Hay cambios sin subir. ¿Cerrar igualmente y descartarlos?";
 
-type TabName = "todos" | "diff" | "network" | "usage";
+type TabName = "todos" | "diff" | "network" | "usage" | "replicas";
 
 const TABS: ReadonlyArray<{ name: TabName; label: string }> = [
   { name: "todos", label: "Tareas" },
   { name: "diff", label: "Diff" },
   { name: "network", label: "Red" },
   { name: "usage", label: "Uso" },
+  { name: "replicas", label: "Réplicas" },
 ];
 
 const mountPoint = document.getElementById("app");
@@ -41,6 +45,10 @@ const root: HTMLElement = mountPoint;
 
 /** Stops the running app (event stream, store subscriptions, timers). Set while the app is mounted. */
 let stopApp: (() => void) | undefined;
+/** Token of the current login; null when the login form is shown. Used to restart on hashchange. */
+let currentToken: string | null = null;
+/** Identifies the last start(); a start that finds a newer one running does nothing. */
+let startSeq = 0;
 
 function errorMessage(error: unknown): string {
   return error instanceof Error && error.message !== "" ? error.message : "error desconocido";
@@ -54,6 +62,7 @@ function isUnauthorized(error: unknown): boolean {
 function showLogin(message?: string): void {
   stopApp?.();
   stopApp = undefined;
+  currentToken = null;
   document.title = "cna";
   root.replaceChildren(
     createLoginView((token, remember) => {
@@ -84,16 +93,33 @@ function showConnectionError(token: string, error: unknown): void {
   );
 }
 
-/** Checks the token with GET /session, then mounts the app. */
+/**
+ * Checks the token with GET /session, then mounts the app against the replica in the URL
+ * fragment (ADR-0013). Stops the app that is running, if any.
+ */
 async function start(token: string): Promise<void> {
+  stopApp?.();
+  stopApp = undefined;
+  const seq = ++startSeq;
+  currentToken = token;
   root.replaceChildren(
     h("p", { class: "app-loading", attrs: { role: "status" }, text: "Conectando…" }),
   );
-  const client = new ApiClient({ baseUrl: "", token });
+  const replica = replicaFromHash(window.location.hash);
+  const client = new ApiClient({ baseUrl: replicaBaseUrl(replica), token });
+  const edge = new ApiClient({ baseUrl: "", token });
   let session: SessionInfo | null;
   try {
     session = await client.getSession();
   } catch (error) {
+    if (seq !== startSeq) {
+      return;
+    }
+    if (error instanceof ApiClientError && error.code === "replica_not_found" && replica !== null) {
+      // Unknown replica in the fragment: drop it (no hashchange) and use the default replica.
+      window.history.replaceState(null, "", window.location.pathname + window.location.search);
+      return start(token);
+    }
     if (isUnauthorized(error)) {
       clearToken(browserStores());
       showLogin("Token no válido");
@@ -102,11 +128,29 @@ async function start(token: string): Promise<void> {
     }
     return;
   }
-  mountApp(client, session);
+  if (seq !== startSeq) {
+    return;
+  }
+  mountApp(client, edge, replica, session);
 }
 
-/** Builds the app once per login: layout, store, views and the event stream. */
-function mountApp(client: ApiClient, initial: SessionInfo | null): void {
+// A change of the replica in the fragment restarts the app against the new replica.
+window.addEventListener("hashchange", () => {
+  if (currentToken !== null) {
+    void start(currentToken);
+  }
+});
+
+/**
+ * Builds the app once per login and replica: layout, store, views and the event stream.
+ * `client` talks to `replica` (null = default); `edge` is the client without a replica prefix.
+ */
+function mountApp(
+  client: ApiClient,
+  edge: ApiClient,
+  replica: string | null,
+  initial: SessionInfo | null,
+): void {
   const controller = new AbortController();
   const { signal } = controller;
   const disposers: Array<() => void> = [];
@@ -287,6 +331,7 @@ function mountApp(client: ApiClient, initial: SessionInfo | null): void {
             store.dispatch({ type: "event", event: item.event });
             if (item.event.event.type === "status") {
               refreshSession();
+              replicaSelect.refresh();
             }
             break;
           case "truncated":
@@ -295,6 +340,7 @@ function mountApp(client: ApiClient, initial: SessionInfo | null): void {
           case "reset":
             store.dispatch({ type: "reset" });
             refreshSession();
+            replicaSelect.refresh();
             loadAuxiliary();
             break;
         }
@@ -304,19 +350,33 @@ function mountApp(client: ApiClient, initial: SessionInfo | null): void {
     }
   }
 
+  // Replicas (ADR-0013): changing one is a change of the URL fragment, which restarts the app.
+  const navigate = (name: string): void => {
+    window.location.hash = replicaHash(name);
+  };
+  const loadReplicas = () => edge.replicas();
+
   // Views. Each one owns its element; the connections below feed them.
-  const header = createHeader({
-    abort: () => {
-      void client.abort().catch(reportError);
-    },
-    close: () => {
-      void closeSession();
-    },
-    logout: () => {
-      clearToken(browserStores());
-      showLogin();
-    },
+  const replicaSelect = createReplicaSelect({
+    load: loadReplicas,
+    current: replica,
+    select: navigate,
   });
+  const header = createHeader(
+    {
+      abort: () => {
+        void client.abort().catch(reportError);
+      },
+      close: () => {
+        void closeSession();
+      },
+      logout: () => {
+        clearToken(browserStores());
+        showLogin();
+      },
+    },
+    replicaSelect.element,
+  );
   const transcript = createTranscript(reloadMessages);
   const questions = createQuestionsPanel((id, body) => client.answer(id, body));
   const composer = createComposer(async (message: string, mode: SendMode) => {
@@ -337,12 +397,18 @@ function mountApp(client: ApiClient, initial: SessionInfo | null): void {
     setMode: (mode) => client.updateNetworkPolicy({ mode }),
   });
   const usage = createUsagePanel(() => client.stats());
+  const replicasPanel = createReplicasPanel({
+    load: loadReplicas,
+    open: navigate,
+    current: replica,
+  });
 
   const panels: Record<TabName, HTMLElement> = {
     todos: todos.element,
     diff: diff.element,
     network: network.element,
     usage: usage.element,
+    replicas: replicasPanel.element,
   };
   const tabs = TABS.map((tab) => ({
     name: tab.name,
@@ -391,6 +457,9 @@ function mountApp(client: ApiClient, initial: SessionInfo | null): void {
     if (name === "usage") {
       usage.refresh();
     }
+    if (name === "replicas") {
+      replicasPanel.refresh();
+    }
   }
 
   const newZone = h("div", { class: "app-new" });
@@ -413,11 +482,16 @@ function mountApp(client: ApiClient, initial: SessionInfo | null): void {
   );
   const sessionZone = h("div", { class: "app-main" }, chat, side);
 
-  /** Without a live session: the form and the history, built fresh each time it is entered. */
+  /** Without a live session: form, replicas and history, built fresh each time it is entered. */
   function showZone(newSession: boolean): void {
     newZone.hidden = !newSession;
     sessionZone.hidden = newSession;
     if (newSession) {
+      const screenReplicas = createReplicasPanel({
+        load: loadReplicas,
+        open: navigate,
+        current: replica,
+      });
       const historyPanel = createHistoryPanel({
         loadHistory: () => client.history(),
         resume: async (id) => {
@@ -441,8 +515,10 @@ function mountApp(client: ApiClient, initial: SessionInfo | null): void {
             }
           },
         }),
+        screenReplicas.element,
         historyPanel.element,
       );
+      screenReplicas.refresh();
       historyPanel.refresh();
     } else {
       newZone.replaceChildren();
@@ -497,10 +573,11 @@ function mountApp(client: ApiClient, initial: SessionInfo | null): void {
   connect(
     (s) => s.session?.status ?? null,
     (status) => {
-      document.title = status === null ? "cna" : `cna · ${statusLabel(status)}`;
+      document.title = pageTitle(replica, status);
     },
   );
 
+  replicaSelect.refresh();
   void followLoop();
   loadAuxiliary();
 }
