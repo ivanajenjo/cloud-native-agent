@@ -19,6 +19,7 @@ export type Command =
       thinking?: ThinkingLevel; // --thinking <level>
       autoPush: boolean; // --auto-push
       detach: boolean; // --detach: create the session and exit without attaching
+      anyReplica: boolean; // --any-replica: create it on the first free replica (ADR-0013)
     }
   | { name: "chat" } // alias: "attach"
   | { name: "status" }
@@ -54,7 +55,7 @@ export class UsageError extends Error {}
 export const USAGE: string = `Uso:
   cna run <owner/repo> ["<prompt>"] [--pr <n>] [--plan] [--base <rama>]
                                   [--model <proveedor/modelo>] [--thinking <nivel>]
-                                  [--auto-push] [--detach]
+                                  [--auto-push] [--detach] [--any-replica]
                                   Crea una sesión sobre el repo y abre el chat (o sale con --detach)
   cna chat                        Chat interactivo con la sesión actual (alias: attach)
   cna status                      Estado de la sesión actual
@@ -81,6 +82,7 @@ Opciones de run:
   --thinking <nivel>  Nivel de razonamiento: ${THINKING_LEVELS.join(", ")}
   --auto-push         Hace push y PR sin preguntar
   --detach            Crea la sesión y sale sin conectarse al chat
+  --any-replica       Crea la sesión en la primera réplica libre (mira cna replicas)
 
 Opciones de resume:
   --detach            Reanuda la sesión y sale sin conectarse al chat
@@ -118,7 +120,7 @@ const COMMANDS: Record<string, { min: number; max: number; options: readonly str
   run: {
     min: 1,
     max: 2,
-    options: ["pr", "plan", "base", "model", "thinking", "auto-push", "detach"],
+    options: ["pr", "plan", "base", "model", "thinking", "auto-push", "detach", "any-replica"],
   },
   chat: { min: 0, max: 0, options: [] },
   attach: { min: 0, max: 0, options: [] },
@@ -149,6 +151,7 @@ const OPTIONS = {
   thinking: { type: "string" },
   "auto-push": { type: "boolean" },
   detach: { type: "boolean" },
+  "any-replica": { type: "boolean" },
   checkpoint: { type: "string" },
   stat: { type: "boolean" },
   force: { type: "boolean" },
@@ -175,7 +178,11 @@ export function parseCliArgs(
     url: resolveUrl(values.url, env.CNA_URL),
     // Any non-empty NO_COLOR disables colors, as the no-color.org convention says.
     color: values["no-color"] !== true && !env.NO_COLOR && isTty,
-    replica: resolveReplica(values.replica, env.CNA_REPLICA),
+    // With --any-replica the replica comes from edge's listing: CNA_REPLICA is ignored, even if invalid.
+    replica:
+      values["any-replica"] === true && values.replica === undefined
+        ? undefined
+        : resolveReplica(values.replica, env.CNA_REPLICA),
   };
 
   if (values.help === true) {
@@ -346,6 +353,10 @@ function parseRun(
   if (pr !== undefined && values.base !== undefined) {
     throw new UsageError("con --pr la rama base es la del PR");
   }
+  // CNA_REPLICA is not checked here: with --any-replica the replica is chosen by edge's listing.
+  if (values["any-replica"] === true && values.replica !== undefined) {
+    throw new UsageError("--any-replica y --replica no se pueden usar juntas");
+  }
   if (second !== undefined && second.trim() === "") {
     throw new UsageError("el prompt no puede estar vacío");
   }
@@ -363,6 +374,7 @@ function parseRun(
     thinking,
     autoPush: values["auto-push"] === true,
     detach: values.detach === true,
+    anyReplica: values["any-replica"] === true,
   };
 }
 

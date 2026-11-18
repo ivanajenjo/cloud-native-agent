@@ -49,6 +49,7 @@ describe("parseCliArgs: run", () => {
       plan: false,
       autoPush: false,
       detach: false,
+      anyReplica: false,
     });
   });
 
@@ -78,6 +79,7 @@ describe("parseCliArgs: run", () => {
       thinking: "high",
       autoPush: true,
       detach: true,
+      anyReplica: false,
     });
   });
 
@@ -120,6 +122,43 @@ describe("parseCliArgs: run", () => {
 
   it("rejects options of other commands", () => {
     expect(usageMessage(["run", "owner/repo", "x", "--force"])).toContain("--force");
+  });
+
+  it("takes --any-replica as a flag", () => {
+    expect(commandOf(["run", "owner/repo", "x", "--any-replica"])).toMatchObject({
+      name: "run",
+      anyReplica: true,
+    });
+  });
+
+  it("defaults anyReplica to false", () => {
+    expect(commandOf(["run", "owner/repo", "x"])).toMatchObject({ anyReplica: false });
+  });
+
+  it("rejects --any-replica together with --replica", () => {
+    expect(usageMessage(["run", "owner/repo", "x", "--any-replica", "--replica", "agent-2"])).toBe(
+      "--any-replica y --replica no se pueden usar juntas",
+    );
+  });
+
+  it("ignores CNA_REPLICA with --any-replica", () => {
+    expect(
+      commandOf(["run", "owner/repo", "x", "--any-replica"], { CNA_REPLICA: "agent-2" }),
+    ).toMatchObject({ name: "run", anyReplica: true });
+  });
+
+  it("ignores an invalid CNA_REPLICA with --any-replica", () => {
+    const parsed = parseCliArgs(
+      ["run", "owner/repo", "x", "--any-replica"],
+      { CNA_REPLICA: "Not_Valid" },
+      false,
+    );
+    expect(parsed.command).toMatchObject({ name: "run", anyReplica: true });
+    expect(parsed.options.replica).toBeUndefined();
+  });
+
+  it("rejects --any-replica for other commands", () => {
+    expect(usageMessage(["status", "--any-replica"])).toContain("--any-replica");
   });
 });
 
@@ -278,6 +317,7 @@ describe("parseCliArgs: run --pr", () => {
       plan: false,
       autoPush: false,
       detach: false,
+      anyReplica: false,
     });
   });
 
@@ -438,6 +478,11 @@ describe("USAGE", () => {
 
   it("lists the replicas command", () => {
     expect(USAGE).toContain("cna replicas");
+  });
+
+  it("documents --any-replica in the run options", () => {
+    expect(USAGE).toContain("--any-replica");
+    expect(USAGE).toContain("--any-replica       Crea la sesión en la primera réplica libre");
   });
 });
 
