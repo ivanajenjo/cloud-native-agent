@@ -75,3 +75,20 @@ export interface ReplicaSummary {
 export interface ReplicasResponse {
   replicas: ReplicaSummary[];
 }
+
+/**
+ * True when the replica can take a new session (ADR-0013): reachable, and with no session or
+ * with one whose status is "closed" or "error" (the gateway then accepts `POST /session`).
+ */
+export function isReplicaFree(replica: ReplicaSummary): boolean {
+  if (!replica.reachable) {
+    return false;
+  }
+  const { session } = replica;
+  return session === null || session.status === "closed" || session.status === "error";
+}
+
+/** Names of the free replicas ({@link isReplicaFree}), in edge's order. */
+export function freeReplicaNames(replicas: readonly ReplicaSummary[]): string[] {
+  return replicas.filter(isReplicaFree).map((replica) => replica.name);
+}
