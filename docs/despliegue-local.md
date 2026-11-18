@@ -20,6 +20,10 @@ PC con Windows o Raspberry Pi 4) y cómo comprobar que la salida a internet pasa
 
 ## Levantar la réplica
 
+Lo más corto es `./scripts/up.sh` (`--replicas` para levantar también `agent-2` y `agent-3`):
+crea el `.env` con un `AGENT_API_TOKEN` nuevo si falta, construye, arranca y espera a `edge`
+(ver el README, "Con un comando"). A mano:
+
 ```sh
 cp deploy/compose/.env.example deploy/compose/.env
 # Editar deploy/compose/.env:

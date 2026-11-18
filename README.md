@@ -57,6 +57,50 @@ la nube: ver [la limitación](docs/despliegue-local.md#limitación-entornos-con-
 
 Cada equipo construye su propia imagen (amd64 o arm64 según la máquina).
 
+### Con un comando
+
+```sh
+git clone https://github.com/ivanajenjo/cloud-native-agent.git
+cd cloud-native-agent
+./scripts/up.sh
+```
+
+[`scripts/up.sh`](scripts/up.sh) hace todo lo del apartado siguiente:
+
+1. Comprueba que Docker y `docker compose` están instalados y que Docker está arrancado.
+2. Si no existe `deploy/compose/.env`, lo crea a partir de `.env.example` (con permisos `600`).
+   Si `AGENT_API_TOKEN` está vacío, genera uno con `openssl rand -hex 32`. Nunca lo escribe
+   en pantalla: queda en ese fichero. Si ya tienes un `.env`, no toca nada más.
+3. Construye las imágenes y arranca `edge` y `agent-1`
+   (`docker compose -f deploy/compose/docker-compose.yml up --build -d`).
+4. Espera a que `edge` responda en `/health` (como mucho 120 s, o `CNA_UP_HEALTH_TIMEOUT_S`) y
+   muestra la URL de la web UI.
+
+Abre `http://127.0.0.1:8080/ui/` y pega el token, que está en `deploy/compose/.env`:
+
+```sh
+grep '^AGENT_API_TOKEN=' deploy/compose/.env
+```
+
+Opciones:
+
+```sh
+./scripts/up.sh --replicas   # también agent-2 y agent-3 (profile replicas; CNA_REPLICAS
+                             # vale agent-1,agent-2,agent-3 salvo que .env diga otra cosa)
+./scripts/up.sh --no-build   # arranca con las imágenes ya construidas
+./scripts/up.sh --help
+```
+
+Cualquier otra opción se pasa a `docker compose up`. El script es idempotente: volver a
+ejecutarlo conserva el token y la configuración, y reconstruye lo que haya cambiado. Las claves
+de los modelos (`ANTHROPIC_API_KEY`…), `GITHUB_TOKEN` y el autor de los commits siguen
+rellenándose a mano en `deploy/compose/.env` (ver la tabla de abajo); después, vuelve a ejecutar
+`./scripts/up.sh`. En Windows, ejecútalo dentro de WSL.
+
+### Paso a paso
+
+Lo mismo que hace el script, a mano:
+
 ```sh
 git clone https://github.com/ivanajenjo/cloud-native-agent.git
 cd cloud-native-agent
@@ -140,6 +184,11 @@ red), se ve la lista de tareas, el diff frente a la rama base o a un checkpoint 
 y las conexiones de red con su política. La web no interpreta HTML ni Markdown de lo que llega
 del agente y se sirve con una CSP estricta (ADR-0010).
 
+Con varias réplicas (ADR-0013), la cabecera tiene un selector de réplica y la pestaña
+*Réplicas* muestra todas con su sesión, un botón para abrir cada una y *Nueva sesión en una
+réplica libre*. La réplica va en la URL (`/ui/#replica=agent-2`), así que cada pestaña del
+navegador puede seguir una distinta; sin fragmento, la web habla con la réplica por defecto.
+
 ## CLI
 
 El CLI `cna` se ejecuta en tu máquina, no en el contenedor:
@@ -160,6 +209,7 @@ npx cna stats         # tokens, coste y uso del contexto
 npx cna history       # sesiones de la réplica
 npx cna resume <id>   # reanuda una sesión cerrada (vale el prefijo que muestra history)
 npx cna replicas      # réplicas detrás de edge y la sesión de cada una
+npx cna run owner/repo "…" --any-replica   # la sesión va a la primera réplica libre
 npx cna --replica agent-2 status   # cualquier comando contra otra réplica (o CNA_REPLICA)
 ```
 
