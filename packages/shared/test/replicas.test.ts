@@ -1,5 +1,24 @@
 import { describe, expect, it } from "vitest";
-import { parseReplicaNames, replicaBasePath } from "../src/replicas.js";
+import {
+  freeReplicaNames,
+  isReplicaFree,
+  parseReplicaNames,
+  type ReplicaSummary,
+  replicaBasePath,
+} from "../src/replicas.js";
+import type { SessionInfo } from "../src/session.js";
+
+function withStatus(status: SessionInfo["status"]): SessionInfo {
+  return { status } as SessionInfo;
+}
+
+function replica(
+  name: string,
+  reachable: boolean,
+  session: SessionInfo | null = null,
+): ReplicaSummary {
+  return { name, reachable, session };
+}
 
 describe("parseReplicaNames", () => {
   it("parses one name", () => {
@@ -50,5 +69,42 @@ describe("parseReplicaNames", () => {
 describe("replicaBasePath", () => {
   it("returns the path prefix of one replica", () => {
     expect(replicaBasePath("agent-2")).toBe("/replicas/agent-2");
+  });
+});
+
+describe("isReplicaFree", () => {
+  it("is false when the replica is not reachable, even without session", () => {
+    expect(isReplicaFree(replica("agent-1", false, null))).toBe(false);
+  });
+
+  it("is true when reachable without session", () => {
+    expect(isReplicaFree(replica("agent-1", true, null))).toBe(true);
+  });
+
+  it.each(["closed", "error"] as const)("is true when the session is %s", (status) => {
+    expect(isReplicaFree(replica("agent-1", true, withStatus(status)))).toBe(true);
+  });
+
+  it.each(["running", "ready", "cloning", "waiting_input", "idle"] as const)(
+    "is false when the session is %s",
+    (status) => {
+      expect(isReplicaFree(replica("agent-1", true, withStatus(status)))).toBe(false);
+    },
+  );
+});
+
+describe("freeReplicaNames", () => {
+  it("keeps the order of edge", () => {
+    const replicas = [
+      replica("agent-3", true, null),
+      replica("agent-1", true, withStatus("running")),
+      replica("agent-2", false, null),
+      replica("agent-4", true, withStatus("closed")),
+    ];
+    expect(freeReplicaNames(replicas)).toEqual(["agent-3", "agent-4"]);
+  });
+
+  it("returns an empty list without replicas", () => {
+    expect(freeReplicaNames([])).toEqual([]);
   });
 });

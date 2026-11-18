@@ -2,9 +2,13 @@ import { describe, expect, it } from "vitest";
 import {
   ApiClient,
   ApiClientError,
+  createSessionOnFreeReplica,
   type EventStreamItem,
   followEvents,
+  replicaBasePath,
 } from "../src/client/index.js";
+import type { ReplicaSummary } from "../src/replicas.js";
+import type { SessionInfo } from "../src/session.js";
 
 interface RecordedCall {
   url: string;
@@ -614,5 +618,148 @@ describe("ApiClient replicas", () => {
     });
     await client.getSession();
     expect(fake.calls[0]?.url).toBe("http://e/replicas/agent-2/session");
+  });
+});
+
+describe("createSessionOnFreeReplica", () => {
+  const TOKEN = "secret";
+  const BODY = { repo: "octo/hello", prompt: "hi" };
+  const BUSY = { ...SESSION, status: "running" } as SessionInfo;
+  const CLOSED = { ...SESSION, status: "closed" } as SessionInfo;
+
+  function replica(
+    name: string,
+    reachable: boolean,
+    session: ReplicaSummary["session"] = null,
+  ): ReplicaSummary {
+    return { name, reachable, session };
+  }
+
+  /**
+   * Fake fetch for edge (GET /replicas) and for the replicas (POST /replicas/<name>/session).
+   * `post` answers the POST of one replica name.
+   */
+  function fakeCluster(
+    replicas: ReplicaSummary[],
+    post: (name: string) => Response = () => json(SESSION, 201),
+  ) {
+    return fakeFetch((call) => {
+      if (call.url === "http://e/replicas") return json({ replicas });
+      const match = /^http:\/\/e\/replicas\/([^/]+)\/session$/.exec(call.url);
+      if (match?.[1] !== undefined && call.init?.method === "POST") return post(match[1]);
+      return json({ error: "not_found" }, 404);
+    });
+  }
+
+  function clients(fake: ReturnType<typeof fakeFetch>) {
+    const edge = new ApiClient({ baseUrl: "http://e", token: TOKEN, fetch: fake.fetch });
+    const clientFor = (name: string) =>
+      new ApiClient({
+        baseUrl: `http://e${replicaBasePath(name)}`,
+        token: TOKEN,
+        fetch: fake.fetch,
+      });
+    return { edge, clientFor };
+  }
+
+  function postUrls(fake: ReturnType<typeof fakeFetch>): string[] {
+    return fake.calls.filter((call) => call.init?.method === "POST").map((call) => call.url);
+  }
+
+  it("creates the session on the first free replica", async () => {
+    const fake = fakeCluster([
+      replica("agent-1", true, BUSY),
+      replica("agent-2", false),
+      replica("agent-3", true),
+      replica("agent-4", true),
+    ]);
+    const { edge, clientFor } = clients(fake);
+    const result = await createSessionOnFreeReplica(edge, clientFor, BODY);
+    expect(result).toEqual({ replica: "agent-3", session: SESSION });
+    expect(postUrls(fake)).toEqual(["http://e/replicas/agent-3/session"]);
+    const post = fake.calls.find((call) => call.init?.method === "POST") as RecordedCall;
+    expect(header(post, "authorization")).toBe("Bearer secret");
+    expect(header(post, "content-type")).toBe("application/json");
+    expect(JSON.parse(String(post.init?.body))).toEqual(BODY);
+  });
+
+  it("moves on to the next free replica after session_exists", async () => {
+    const fake = fakeCluster(
+      [replica("agent-1", true), replica("agent-2", true, CLOSED)],
+      (name) =>
+        name === "agent-1"
+          ? json({ error: "session_exists", message: "busy" }, 409)
+          : json(SESSION, 201),
+    );
+    const { edge, clientFor } = clients(fake);
+    await expect(createSessionOnFreeReplica(edge, clientFor, BODY)).resolves.toEqual({
+      replica: "agent-2",
+      session: SESSION,
+    });
+    expect(postUrls(fake)).toEqual([
+      "http://e/replicas/agent-1/session",
+      "http://e/replicas/agent-2/session",
+    ]);
+  });
+
+  it("throws no_free_replica when every free replica answers session_exists", async () => {
+    const fake = fakeCluster([replica("agent-1", true), replica("agent-2", true)], () =>
+      json({ error: "session_exists", message: "busy" }, 409),
+    );
+    const { edge, clientFor } = clients(fake);
+    const error = await createSessionOnFreeReplica(edge, clientFor, BODY).catch(
+      (caught: unknown) => caught,
+    );
+    expect(error).toBeInstanceOf(ApiClientError);
+    expect(error).toMatchObject({ status: 409, code: "no_free_replica" });
+    expect(postUrls(fake)).toHaveLength(2);
+  });
+
+  it.each([
+    ["an empty list", []],
+    [
+      "only busy or unreachable replicas",
+      [replica("agent-1", true, BUSY), replica("agent-2", false)],
+    ],
+  ])("throws no_free_replica without any POST for %s", async (_label, replicas) => {
+    const fake = fakeCluster(replicas);
+    const { edge, clientFor } = clients(fake);
+    const error = await createSessionOnFreeReplica(edge, clientFor, BODY).catch(
+      (caught: unknown) => caught,
+    );
+    expect(error).toBeInstanceOf(ApiClientError);
+    expect(error).toMatchObject({
+      status: 409,
+      code: "no_free_replica",
+      message: "No hay ninguna réplica libre",
+    });
+    expect(postUrls(fake)).toEqual([]);
+  });
+
+  it.each([
+    ["400 invalid_request", { error: "invalid_request", message: "bad" }, 400, "invalid_request"],
+    ["409 invalid_state", { error: "invalid_state", message: "bad" }, 409, "invalid_state"],
+  ])("rethrows %s without trying the next replica", async (_label, body, status, code) => {
+    const fake = fakeCluster([replica("agent-1", true), replica("agent-2", true)], () =>
+      json(body, status),
+    );
+    const { edge, clientFor } = clients(fake);
+    const error = await createSessionOnFreeReplica(edge, clientFor, BODY).catch(
+      (caught: unknown) => caught,
+    );
+    expect(error).toBeInstanceOf(ApiClientError);
+    expect(error).toMatchObject({ status, code });
+    expect(postUrls(fake)).toEqual(["http://e/replicas/agent-1/session"]);
+  });
+
+  it("rethrows the error of GET /replicas", async () => {
+    const fake = fakeFetch(() => json({ error: "internal_error", message: "boom" }, 500));
+    const { edge, clientFor } = clients(fake);
+    const error = await createSessionOnFreeReplica(edge, clientFor, BODY).catch(
+      (caught: unknown) => caught,
+    );
+    expect(error).toBeInstanceOf(ApiClientError);
+    expect(error).toMatchObject({ status: 500, code: "internal_error", message: "boom" });
+    expect(fake.calls).toHaveLength(1);
   });
 });
