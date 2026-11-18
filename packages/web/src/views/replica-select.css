@@ -1,0 +1,24 @@
+.replica-select {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.4rem;
+  max-width: 100%;
+  color: var(--muted);
+  font-size: 0.9rem;
+}
+
+.replica-select[hidden] {
+  display: none;
+}
+
+.replica-select-input {
+  min-width: 0;
+  max-width: 100%;
+  padding: 0.2rem 0.4rem;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--bg);
+  color: var(--fg);
+  font: inherit;
+  box-sizing: border-box;
+}

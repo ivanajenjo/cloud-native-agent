@@ -1,0 +1,99 @@
+.replicas-panel {
+  display: flex;
+  flex-direction: column;
+  gap: 0.75rem;
+  color: var(--fg);
+}
+
+.replicas-title {
+  font-size: 1.1rem;
+  margin: 0;
+}
+
+.replicas-messages p,
+.replicas-free-note {
+  margin: 0;
+}
+
+.replicas-loading,
+.replicas-empty,
+.replicas-free-note {
+  color: var(--muted);
+}
+
+.replicas-error {
+  color: var(--danger);
+}
+
+.replicas-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+}
+
+.replicas-button {
+  padding: 0.25rem 0.75rem;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--bg);
+  color: var(--fg);
+  font: inherit;
+  cursor: pointer;
+}
+
+.replicas-button:disabled {
+  color: var(--muted);
+  cursor: not-allowed;
+}
+
+.replicas-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+}
+
+.replicas-item {
+  display: flex;
+  flex-direction: column;
+  gap: 0.2rem;
+  padding: 0.6rem 0.75rem;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--code-bg);
+}
+
+.replicas-item[aria-current="true"] {
+  border-color: var(--muted);
+}
+
+.replicas-head {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: space-between;
+  align-items: baseline;
+  gap: 0.5rem;
+}
+
+.replicas-name {
+  overflow-wrap: anywhere;
+}
+
+/* Colors come from the status-* classes (header.css). */
+.replicas-state {
+  font-size: 0.9rem;
+}
+
+.replicas-meta,
+.replicas-paused {
+  color: var(--muted);
+  font-size: 0.9rem;
+  overflow-wrap: anywhere;
+}
+
+.replicas-open {
+  align-self: flex-start;
+  margin-top: 0.3rem;
+}
