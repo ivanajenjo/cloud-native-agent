@@ -128,6 +128,8 @@ GET    /replicas                        cada réplica de EDGE_REPLICAS: {name, r
 *      /replicas/<nombre>/<ruta>        la API de esa réplica (/<ruta>); 404 replica_not_found
 ```
 Sin prefijo, la API es la de la réplica por defecto (la primera de `EDGE_REPLICAS`).
+No hay endpoint para pedir "una réplica libre": lo resuelve el cliente con `GET /replicas`
+(ADR-0013).
 
 Endpoints de red (los atiende `edge`, no el gateway):
 ```
@@ -435,13 +437,20 @@ imágenes construidas (compose con el profile `replicas`); está probada con pro
 - Compose con una red interna por réplica (`agent-1`; `agent-2` y `agent-3` con el profile
   `replicas`).
 - CLI: `--replica`/`CNA_REPLICA` y `cna replicas`.
-- Pendiente para más adelante: selector de réplica en la web UI.
+- Pendiente para más adelante: selector de réplica en la web UI (pasa a la fase 6).
+
+### Fase 6 — Réplicas en los clientes
+ADR-0013. Sin cambios en `edge` ni en el gateway.
+- `@cna/shared`: `isReplicaFree`, `freeReplicaNames` y `createSessionOnFreeReplica` (la asignación
+  de una réplica libre la hace el cliente: `GET /replicas` y `POST /replicas/<nombre>/session`,
+  pasando a la siguiente si hay `409 session_exists`; sin ninguna libre, `no_free_replica`).
+- CLI: `cna run --any-replica` crea la sesión en la primera réplica libre.
+- Web UI: réplica en el fragmento de la URL (`#replica=<nombre>`), selector de réplica en la
+  cabecera, pestaña "Réplicas" con todas las sesiones y "Nueva sesión en una réplica libre".
 
 ## Backlog
 - Kubernetes (k3s/kind): manifiestos con PVC por réplica, Secret y Service, y `edge` aparte con
   una NetworkPolicy que solo deje salir al agente hacia `edge` (ADR-0012).
-- Selector de réplica en la web UI, asignación automática de una réplica libre y vista de todas
-  las sesiones (el antiguo "hub").
 - Procesos en segundo plano con `bash_bg` (8).
 - Comandos y skills en UI/CLI (11).
 - Imágenes en el prompt (12).
